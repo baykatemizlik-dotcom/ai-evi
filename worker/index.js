@@ -11,7 +11,8 @@ export default {async fetch(request,env){
  const cors={"Access-Control-Allow-Origin":permitted?origin:"null","Vary":"Origin","Access-Control-Allow-Methods":"GET,POST,OPTIONS","Access-Control-Allow-Headers":"Content-Type,Authorization","Access-Control-Max-Age":"600"};
  if(!permitted)return reply({error:"İzin verilmeyen site.",hint:"AI Evi'ni https://baykatemizlik-dotcom.github.io/ai-evi/ üzerinden açın."},403,cors);
  if(request.method==="OPTIONS")return new Response(null,{status:204,headers:cors});
- if(!env.ACCESS_TOKEN||!env.OPENAI_API_KEY||!env.GEMINI_API_KEY||!env.OPENAI_MODEL||!env.GEMINI_MODEL)return reply({error:"Worker Secrets ve model ENV ayarları eksik."},503,cors);
+ const missing=["ACCESS_TOKEN","OPENAI_API_KEY","GEMINI_API_KEY","OPENAI_MODEL","GEMINI_MODEL"].filter(k=>!env[k]);
+ if(missing.length)return reply({error:"Worker Secrets ve model ENV ayarları eksik.",missing},503,cors);
  const bearer=request.headers.get("Authorization")||"";
  const provided=bearer.startsWith("Bearer ")?bearer.slice(7):"";
  const hash=async s=>new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s)));
