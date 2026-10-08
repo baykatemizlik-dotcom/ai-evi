@@ -55,7 +55,7 @@ export default {async fetch(req,env){
  const row=await env.DB.prepare("SELECT * FROM conversations WHERE id=?").bind(id).first();
  if(!row)return json({error:"Önce start gerekir"},404,cors);
  if(row.status==="DONE"||row.stage==="DONE")return json(history(row),200,cors);
- if(row.status==="RUNNING")return json({error:"Aşama yürütülüyor. Status ile kontrol et.",...history(row)},409,cors);
+ if(!["READY","WAITING"].includes(row.status))return json({error:"Aşama otomatik tekrar çalıştırılamaz; manuel kontrol gerekli.",...history(row)},409,cors);
  const stage=row.stage,isGPT=stage==="GPT_DRAFT"||stage==="GPT_REVISION";
  // Fail-closed atomic conditional budget reservation, shared across all conversations.
  // A reservation is NEVER refunded, even if an API request errors; conservative protection.
