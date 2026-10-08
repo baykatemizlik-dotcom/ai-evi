@@ -1,0 +1,10 @@
+// Separate daily backup Worker. DO NOT deploy until actual D1/R2 resources exist.
+{
+ "name":"ai-evi-v05-backup",
+ "main":"backup-worker.js",
+ "compatibility_date":"2026-10-08",
+ "workers_dev":false,
+ "triggers":{"crons":["0 1 * * *"]},
+ "d1_databases":[{"binding":"DB","database_name":"ai-evi-v05-test","database_id":"REPLACE_WITH_REAL_D1_ID"}],
+ "r2_buckets":[{"binding":"BACKUPS","bucket_name":"ai-evi-v05-backups"}]
+}
