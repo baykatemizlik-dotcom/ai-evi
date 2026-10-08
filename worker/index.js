@@ -9,6 +9,29 @@ const paperLotPlan=(budget,marketPrice,{slippage=0.002,commission=0.002}={})=>{
  const firstTakeProfitLots=lots>=2?Math.floor(lots/2):0;
  return {lots,executedPrice,estimatedEntryCost:lots*executedPrice*(1+commission),firstTakeProfitLots,remainingLots:lots-firstTakeProfitLots,partialExitPossible:firstTakeProfitLots>0,priceCap:null};
 };
+// Internal paper-only SCALP exit rule. Call only after verified, fresh market pricing.
+const scalpExitDecision=(entryPrice,verifiedMarketPrice)=>{
+ const entry=Number(entryPrice),price=Number(verifiedMarketPrice);
+ if(!Number.isFinite(entry)||entry<=0||!Number.isFinite(price)||price<=0)return null;
+ if(price>=entry*1.03)return "TP_FULL_3PCT";
+ if(price<=entry*0.985)return "STOP_FULL_1P5PCT";
+ return null;
+};
+const settleScalpPaperExit=async(db,trade,marketPrice,marketTimestamp)=>{
+ if(!db||trade?.strategy!=="SCALP"||trade.status!=="OPEN"||!marketTimestamp||!Number.isFinite(Date.parse(marketTimestamp)))throw Error("Verified SCALP trade and timestamp required");
+ const reason=scalpExitDecision(trade.executed_price,marketPrice);
+ if(!reason)return {closed:false};
+ const sell=Number(marketPrice)*0.998,qty=Number(trade.lot_count),commission=sell*qty*0.002;
+ if(!Number.isInteger(qty)||qty<=0)throw Error("Invalid lots");
+ const entryFee=Number(trade.commission||0);
+ const pnl=(sell-Number(trade.executed_price))*qty-entryFee-commission;
+ // D1 batch is transactional: either the trade closes and cash is credited together or neither.
+ const results=await db.batch([
+  db.prepare("UPDATE virtual_trades SET status='CLOSED',exit_price=?,exit_time=?,exit_reason=?,pnl_net=? WHERE id=? AND strategy='SCALP' AND status='OPEN'").bind(sell,marketTimestamp,reason,pnl,trade.id),
+  db.prepare("UPDATE paper_cash_accounts SET available_cash=available_cash+?,updated_at=? WHERE strategy='SCALP' AND EXISTS(SELECT 1 FROM virtual_trades WHERE id=? AND status='CLOSED' AND exit_time=?)").bind(sell*qty-commission,marketTimestamp,trade.id,marketTimestamp)
+ ]);
+ return {closed:true,reason,pnl,results:results.map(x=>x.meta?.changes||0)};
+};
 const hash=async s=>new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s)));
 export default {async fetch(request,env){
  const u=new URL(request.url);
@@ -185,7 +208,7 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
    let phase="SKIPPED";
    if(h===23&&m===30)phase="NIGHT_WATCH";
    else if(h===9&&m===15)phase="MORNING_WATCH";
-   else if(weekday&&h*60+m>=615&&h*60+m<=1055)phase="INTRADAY_SCAN";
+   else if(weekday&&h*60+m>=615&&h*60+m<=1035)phase="INTRADAY_SCAN";
    if(phase==="SKIPPED")return;
    const id=new Date(event.scheduledTime||Date.now()).toISOString();
    // Fail closed: no licensed or verified live BIST / KAP feed is configured.
