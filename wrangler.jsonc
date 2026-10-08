@@ -2,5 +2,10 @@
   "name": "ai-evi",
   "main": "worker/index.js",
   "compatibility_date": "2026-10-08",
-  "workers_dev": true
+  "workers_dev": true,
+  "vars": {
+    "OPENAI_MODEL": "gpt-5.4",
+    "GEMINI_MODEL": "gemini-3.8-flash",
+    "ALLOWED_ORIGIN": "https://baykatemizlik-dotcom.github.io"
+  }
 }
