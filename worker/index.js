@@ -8,7 +8,7 @@ export default {async fetch(request,env){
  // GitHub Pages ana alan adı, path veya sondaki / ile kaydedilmiş olsa da doğru origin'e indirgenir.
  let configured="";try{configured=new URL((env.ALLOWED_ORIGIN||"").trim()).origin}catch{}
  const allowed=new Set([configured,"https://baykatemizlik-dotcom.github.io"].filter(Boolean));
- const permitted=allowed.has(origin);
+ const permitted=allowed.has(origin)||(!origin&&u.pathname.startsWith("/bist/"));
  const cors={"Access-Control-Allow-Origin":permitted?origin:"null","Vary":"Origin","Access-Control-Allow-Methods":"GET,POST,OPTIONS","Access-Control-Allow-Headers":"Content-Type,Authorization","Access-Control-Max-Age":"600"};
  if(!permitted)return reply({error:"İzin verilmeyen site.",hint:"AI Evi'ni https://baykatemizlik-dotcom.github.io/ai-evi/ üzerinden açın."},403,cors);
  if(request.method==="OPTIONS")return new Response(null,{status:204,headers:cors});
