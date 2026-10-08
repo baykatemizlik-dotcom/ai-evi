@@ -39,9 +39,10 @@ export default {async fetch(request,env){
        "(SELECT COUNT(*) FROM bist_research_cache WHERE day=? AND status IN ('RESERVED','DONE')) < 5"
      ).bind(day,symbol,stamp,day,day).run();
      if(claim.meta?.changes!==1){
-       const current=await db.prepare("SELECT status,response_json FROM bist_research_cache WHERE day=? AND symbol=?").bind(day,symbol).first();
+       const current=await db.prepare("SELECT status,response_json,attempts FROM bist_research_cache WHERE day=? AND symbol=?").bind(day,symbol).first();
        if(current?.status==="DONE"&&current.response_json)return reply({...JSON.parse(current.response_json),cached:true},200,cors);
        if(current?.status==="RESERVED")return reply({symbol,status:"NEWS_REVIEW_PENDING",technical_score_only:true},202,cors);
+       if(current?.status==="FAILED"&&Number(current.attempts)>=3)return reply({symbol,status:"RETRY_LIMIT",attempts:current.attempts,limit:3,day},429,cors);
        return reply({status:"DAILY_LIMIT",limit:5,day},429,cors);
      }
    }catch{return reply({status:"NEWS_REVIEW_PENDING",error:"Rezervasyon basarisiz"},503,cors)}
