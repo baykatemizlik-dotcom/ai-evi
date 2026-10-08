@@ -3,9 +3,13 @@ const reply=(data,status=200,cors={})=>new Response(JSON.stringify(data),{status
 const policy="Türkçe yanıt ver. Gerçek dış doğrulama veya otomatik finansal, otel, yazılım dağıtım eylemi yapma.";
 const critical=/(\bal\b|\bsat\b|emir|trailing.stop|stop.loss|iade|fiyat değiştir|deploy|canlıya al|havale|para transfer)/i;
 export default {async fetch(request,env){
- const u=new URL(request.url),origin=request.headers.get("Origin")||"",allowed=env.ALLOWED_ORIGIN||"";
- const cors={"Access-Control-Allow-Origin":allowed,"Vary":"Origin","Access-Control-Allow-Methods":"GET,POST,OPTIONS","Access-Control-Allow-Headers":"Content-Type,Authorization","Access-Control-Max-Age":"600"};
- if(!allowed||origin!==allowed)return reply({error:"İzin verilmeyen site."},403);
+ const u=new URL(request.url),origin=request.headers.get("Origin")||"";
+ // GitHub Pages ana alan adı, path veya sondaki / ile kaydedilmiş olsa da doğru origin'e indirgenir.
+ let configured="";try{configured=new URL((env.ALLOWED_ORIGIN||"").trim()).origin}catch{}
+ const allowed=new Set([configured,"https://baykatemizlik-dotcom.github.io"].filter(Boolean));
+ const permitted=allowed.has(origin);
+ const cors={"Access-Control-Allow-Origin":permitted?origin:"null","Vary":"Origin","Access-Control-Allow-Methods":"GET,POST,OPTIONS","Access-Control-Allow-Headers":"Content-Type,Authorization","Access-Control-Max-Age":"600"};
+ if(!permitted)return reply({error:"İzin verilmeyen site.",hint:"AI Evi'ni https://baykatemizlik-dotcom.github.io/ai-evi/ üzerinden açın."},403,cors);
  if(request.method==="OPTIONS")return new Response(null,{status:204,headers:cors});
  if(!env.ACCESS_TOKEN||!env.OPENAI_API_KEY||!env.GEMINI_API_KEY||!env.OPENAI_MODEL||!env.GEMINI_MODEL)return reply({error:"Worker Secrets ve model ENV ayarları eksik."},503,cors);
  const bearer=request.headers.get("Authorization")||"";
