@@ -3,7 +3,7 @@
 const fields={GPT_DRAFT:"gpt_draft",GEMINI_REVIEW:"gemini_review",GPT_REVISION:"gpt_revision",GEMINI_FINAL:"gemini_final"};
 const next={GPT_DRAFT:"GEMINI_REVIEW",GEMINI_REVIEW:"GPT_REVISION",GPT_REVISION:"GEMINI_FINAL",GEMINI_FINAL:"DONE"};
 const json=(v,status=200,h={})=>new Response(JSON.stringify(v),{status,headers:{"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store",...h}});
-function history(row){return{ id:row.id,stage:row.stage,status:row.status,question:row.question,gptDraft:row.gpt_draft,geminiReview:row.gemini_review,gptRevision:row.gpt_revision,geminiFinal:row.gemini_final,result:row.result,error:row.last_error};}
+function history(row){return{ id:row.id,stage:row.stage,status:row.status,question:row.question,gptDraft:row.gpt_draft,geminiReview:row.gemini_review,gptRevision:row.gpt_revision,geminiFinal:row.gemini_final,result:row.result,error:row.last_error,updatedAt:row.updated_at};}
 const now=()=>new Intl.DateTimeFormat("tr-TR",{timeZone:"Europe/Istanbul",dateStyle:"full",timeStyle:"short"}).format(new Date());
 function critical(question){return /(emir ver|alım yap|satış yap|stop.loss|trailing.stop|iade yap|fiyat değiştir|canlıya al|deploy|para transfer)/i.test(question);}
 async function openai(env,row,revision){
@@ -82,7 +82,7 @@ export default {async fetch(req,env){
   // This avoids the second GPT and second Gemini requests altogether.
   const earlyAgreement=stage==="GEMINI_REVIEW" && value.agree===true;
   const destination=earlyAgreement?"DONE":next[stage],done=destination==="DONE";
-  const result=done?(critical(row.question)?"BERKER ONAYI GEREKLİ\n":"")+String(value.result||""):null;
+  const result=done?(critical(row.question)?"BERKER ONAYI GEREKLİ\\n":"")+String(value.result||""):null;
   const field=fields[stage];if(!field)throw new Error("Bilinmeyen aşama");
   await env.DB.batch([
    env.DB.prepare("UPDATE conversations SET "+field+"=?,stage=?,status=?,result=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='RUNNING' AND stage=?").bind(text,destination,done?"DONE":"READY",result,id,stage),
