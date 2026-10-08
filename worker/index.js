@@ -19,6 +19,37 @@ export default {async fetch(request,env){
  const hash=async s=>new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s)));
  const [a,b]=await Promise.all([hash(provided),hash(env.ACCESS_TOKEN)]);let diff=0;for(let i=0;i<a.length;i++)diff|=a[i]^b[i];
  if(!provided||diff!==0)return reply({error:"Yetkisiz erişim."},401,cors);
+
+ // BIST AVCI v0.1 API: same existing Worker secrets, manual calls only.
+ if(u.pathname==="/bist/status"&&request.method==="GET")
+   return reply({service:"BIST AVCI research",ready:!!env.GEMINI_API_KEY,mode:"manual",orders:false,grounding:"search-is-not-KAP-verification"},200,cors);
+ if(u.pathname==="/bist/research"&&request.method==="POST"){
+   if(!(request.headers.get("Content-Type")||"").includes("application/json"))
+     return reply({error:"JSON gerekli"},415,cors);
+   if(Number(request.headers.get("Content-Length")||0)>3000)return reply({error:"Istek cok buyuk"},413,cors);
+   let data;try{data=await request.json()}catch{return reply({error:"JSON gecersiz"},400,cors)}
+   const symbol=String(data.symbol||"").trim().toUpperCase();
+   if(!/^[A-Z0-9]{3,7}$/.test(symbol))return reply({error:"BIST sembolu gecersiz"},422,cors);
+   if(!env.DB)return reply({error:"Kota veritabani yok; arastirma kapali"},503,cors);
+   try{
+     await env.DB.prepare("CREATE TABLE IF NOT EXISTS bist_ai_queries (day TEXT NOT NULL, symbol TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(day,symbol))").run();
+     const day=new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
+     const count=await env.DB.prepare("SELECT COUNT(*) AS n FROM bist_ai_queries WHERE day=?").bind(day).first();
+     const prior=await env.DB.prepare("SELECT 1 AS found FROM bist_ai_queries WHERE day=? AND symbol=?").bind(day,symbol).first();
+     if(prior)return reply({status:"ALREADY_REQUESTED",symbol,day,note:"Tekrar sorgu engellendi; onceki sonucu tekrar kullanin"},409,cors);
+     if(Number(count?.n||0)>=5)return reply({status:"DAILY_LIMIT",limit:5,day},429,cors);
+     await env.DB.prepare("INSERT INTO bist_ai_queries (day,symbol,created_at) VALUES (?,?,?)").bind(day,symbol,new Date().toISOString()).run();
+     const prompt="Turkce yanit ver. BIST sirket sembolu "+symbol+" icin son 24 saatteki finans haberleri ve KAP aciklamalarini ara. Yalniz tarihle ve kaynagiyla desteklenen iddialari belirt. Google Search sonucu tek basina resmi KAP dogrulamasi DEGILDIR. Resmi KAP kaynak URL ve bildirim kimligi olmadan KAP teyit edildi deme. Yatirim tavsiyesi, fiyat tahmini ve emir verme. Kaynak yoksa DOGRULANAMADI de. 1200 karakteri asma.";
+     const url="https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+     const r=await fetch(url,{method:"POST",headers:{"x-goog-api-key":env.GEMINI_API_KEY,"Content-Type":"application/json"},body:JSON.stringify({contents:[{role:"user",parts:[{text:prompt}]}],tools:[{google_search:{}}],generationConfig:{temperature:0.2,maxOutputTokens:600}}),signal:AbortSignal.timeout(20000)});
+     if(!r.ok)return reply({status:"NEWS_REVIEW_PENDING",symbol,providerStatus:r.status},202,cors);
+     const result=await r.json();
+     const candidate=result.candidates?.[0]||{};
+     const answer=(candidate.content?.parts||[]).map(p=>p.text||"").join("").slice(0,4000);
+     const citations=(candidate.groundingMetadata?.groundingChunks||[]).filter(x=>x.web?.uri).slice(0,8).map(x=>({title:x.web.title||"",url:x.web.uri}));
+     return reply({symbol,status:citations.length?"SEARCH_RESULT_UNVERIFIED":"NEWS_REVIEW_PENDING",answer,citations,officialKapVerified:false,orders:false},200,cors);
+   }catch(e){return reply({status:"NEWS_REVIEW_PENDING",symbol,error:"Arastirma tamamlanamadi"},503,cors)}
+ }
  if(u.pathname.startsWith("/v05/"))return v05.fetch(request,env);
  if(u.pathname==="/test"&&request.method==="GET"){
    const check=async(url,headers)=>{try{const r=await fetch(url,{headers,signal:AbortSignal.timeout(9000)});return r.ok?"Aktif":r.status===429?"Kota sınırı":"HTTP "+r.status}catch{return "Bağlantı hatası"}};
