@@ -43,7 +43,7 @@ const yahooOHLCV=async(symbol,interval="15m")=>{
  if(!q||times.length<30)throw Error("INSUFFICIENT_OHLCV");
  const now=Math.floor(Date.now()/1000);
  const seconds=interval==="1d"?86400:900;
- const bars=times.map((t,i)=>({t,o:q.open?.[i],h:q.high?.[i],l:q.low?.[i],c:q.close?.[i],v:q.volume?.[i]})).filter(b=>[b.o,b.h,b.l,b.c,b.v].every(x=>typeof x==="number"&&Number.isFinite(x))&&b.h>=b.l&&b.v>=0&&b.t+seconds<=now-120);
+ const bars=times.map((t,i)=>({t,o:q.open?.[i],h:q.high?.[i],l:q.low?.[i],c:q.close?.[i],v:q.volume?.[i]})).filter(b=>[b.o,b.h,b.l,b.c,b.v].every(x=>typeof x==="number"&&Number.isFinite(x))&&b.h>=b.l&&b.v>=0&&(interval==="1d"?(new Date(b.t*1000).toLocaleDateString("sv-SE",{timeZone:"Europe/Istanbul"})<new Date().toLocaleDateString("sv-SE",{timeZone:"Europe/Istanbul"})||Number(new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/Istanbul",hour:"2-digit",hourCycle:"h23"}).format(new Date()))>=19):b.t+seconds<=now-120));
  if(bars.length<30||now-bars[bars.length-1].t>86400*4)throw Error("STALE_OR_INSUFFICIENT_BARS");
  return bars;
 };
