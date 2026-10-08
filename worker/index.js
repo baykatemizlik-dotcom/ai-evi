@@ -1,3 +1,4 @@
+import v05 from "../v05/worker.js";
 // AI Evi v0.4 - single-user Cloudflare Worker
 const reply=(data,status=200,cors={})=>new Response(JSON.stringify(data),{status,headers:{"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store",...cors}});
 const policy="Türkçe yanıt ver. Gerçek dış doğrulama veya otomatik finansal, otel, yazılım dağıtım eylemi yapma.";
@@ -18,6 +19,7 @@ export default {async fetch(request,env){
  const hash=async s=>new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s)));
  const [a,b]=await Promise.all([hash(provided),hash(env.ACCESS_TOKEN)]);let diff=0;for(let i=0;i<a.length;i++)diff|=a[i]^b[i];
  if(!provided||diff!==0)return reply({error:"Yetkisiz erişim."},401,cors);
+ if(u.pathname.startsWith("/v05/"))return v05.fetch(request,env);
  if(u.pathname==="/test"&&request.method==="GET"){
    const check=async(url,headers)=>{try{const r=await fetch(url,{headers,signal:AbortSignal.timeout(9000)});return r.ok?"Aktif":r.status===429?"Kota sınırı":"HTTP "+r.status}catch{return "Bağlantı hatası"}};
    const [openai,gemini]=await Promise.all([check("https://api.openai.com/v1/models",{Authorization:"Bearer "+env.OPENAI_API_KEY}),check("https://generativelanguage.googleapis.com/v1beta/models",{"x-goog-api-key":env.GEMINI_API_KEY})]);
