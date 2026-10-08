@@ -65,7 +65,31 @@ const kapPreflight=async(env)=>{
  if(!env.KAP_FEED_URL||!/^https:\/\/(?:www\.)?kap\.org\.tr\//i.test(env.KAP_FEED_URL))return {ready:false,reason:"OFFICIAL_KAP_URL_NOT_CONFIGURED"};
  try{const r=await fetch(env.KAP_FEED_URL,{signal:AbortSignal.timeout(7000),headers:{Accept:"application/json, application/rss+xml, application/xml"}});if(!r.ok)return {ready:false,reason:"KAP_HTTP_"+r.status};const txt=await r.text();if(!txt||txt.length<40)return {ready:false,reason:"KAP_EMPTY"};return {ready:true,raw_length:txt.length,source:"kap.org.tr",verified_disclosures:false}}catch{return {ready:false,reason:"KAP_UNREACHABLE"}}
 };
-const scanUniverse=async(env)=>{let raw=[];if(env.BIST_UNIVERSE_URL){const u=new URL(env.BIST_UNIVERSE_URL);if(u.protocol!=="https:")throw Error("UNIVERSE_HTTPS_REQUIRED");const r=await fetch(u.toString(),{signal:AbortSignal.timeout(8000)});if(!r.ok)throw Error("UNIVERSE_HTTP_"+r.status);const j=await r.json();raw=Array.isArray(j)?j:Array.isArray(j.symbols)?j.symbols:[];}else raw=String(env.SCAN_SYMBOLS||"").split(",");return [...new Set(raw.map(x=>String(typeof x==="string"?x:x.symbol||"").trim().toUpperCase()).filter(x=>/^[A-Z0-9]{3,7}$/.test(x)))].slice(0,1000)};
+const scanUniverse=async(env)=>{
+ let raw=[],source="NONE";
+ if(env.BIST_UNIVERSE_URL){
+   const u=new URL(env.BIST_UNIVERSE_URL);if(u.protocol!=="https:")throw Error("UNIVERSE_HTTPS_REQUIRED");
+   const r=await fetch(u.toString(),{signal:AbortSignal.timeout(10000)});if(!r.ok)throw Error("UNIVERSE_HTTP_"+r.status);
+   const j=await r.json();raw=Array.isArray(j)?j:Array.isArray(j.symbols)?j.symbols:[];source=u.hostname;
+ }else if(env.SCAN_SYMBOLS){
+   raw=String(env.SCAN_SYMBOLS).split(",");source="MANUAL_CONFIG";
+ }else{
+   // KAP Pazarlar is a public reference catalogue, NOT market-data or disclosure verification.
+   const r=await fetch("https://www.kap.org.tr/tr/Pazarlar",{headers:{"Accept":"text/html"},signal:AbortSignal.timeout(10000)});
+   if(!r.ok)throw Error("KAP_UNIVERSE_HTTP_"+r.status);
+   const html=await r.text();
+   if(html.length<1000||html.length>4000000)throw Error("KAP_UNIVERSE_INVALID_HTML");
+   const section=html.match(/YILDIZ PAZAR[\s\S]*?ANA PAZAR[\s\S]*?(?:ALT PAZAR|YAKIN İZLEME PAZARI)/i)?.[0];
+   if(!section)throw Error("KAP_UNIVERSE_MARKET_SECTIONS_MISSING");
+   const text=section.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi," ").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi," ").replace(/<[^>]*>/g," ").replace(/&nbsp;|&#160;/gi," ").replace(/\s+/g," ");
+   const matches=[...text.matchAll(/(?:^|\s)([A-Z0-9]{4,6})\s+[A-ZÇĞİÖŞÜ]/g)].map(x=>x[1]);
+   raw=matches;source="KAP_PUBLIC_MARKET_CATALOG";
+   if(raw.length<100||raw.length>1000)throw Error("KAP_UNIVERSE_PARSING_UNVERIFIED_"+raw.length);
+ }
+ const names=[...new Set(raw.map(x=>String(typeof x==="string"?x:x?.symbol||"").trim().toUpperCase()).filter(x=>/^[A-Z][A-Z0-9]{2,6}$/.test(x)))].slice(0,1000);
+ if(!names.length)throw Error("UNIVERSE_EMPTY");
+ return names;
+};
 const nightRadar=async(env)=>{
  const names=await scanUniverse(env);
  const date=new Intl.DateTimeFormat("sv-SE",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
