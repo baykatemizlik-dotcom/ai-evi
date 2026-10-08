@@ -1,0 +1,17 @@
+// v0.5 ONLY. This configuration is NOT production and contains NO real D1 ID.
+// To use: create a SEPARATE D1 database and R2 bucket in Cloudflare first.
+// Replace the placeholder IDs and keep OPENAI_API_KEY/GEMINI_API_KEY/ACCESS_TOKEN as Secrets.
+// Never replace the production wrangler.jsonc automatically.
+{
+  "name": "ai-evi-v05-test",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-08",
+  "workers_dev": true,
+  "vars": {
+    "OPENAI_MODEL": "gpt-5.4",
+    "GEMINI_MODEL": "gemini-3.8-flash"
+  },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "ai-evi-v05-test", "database_id": "REPLACE_WITH_REAL_D1_ID" }
+  ]
+}
