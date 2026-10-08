@@ -1,0 +1,6 @@
+{
+  "name": "ai-evi",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-10-08",
+  "workers_dev": true
+}
