@@ -24,31 +24,51 @@ export default {async fetch(request,env){
  if(u.pathname==="/bist/status"&&request.method==="GET")
    return reply({service:"BIST AVCI research",ready:!!env.GEMINI_API_KEY,mode:"manual",orders:false,grounding:"search-is-not-KAP-verification"},200,cors);
  if(u.pathname==="/bist/research"&&request.method==="POST"){
-   if(!(request.headers.get("Content-Type")||"").includes("application/json"))
-     return reply({error:"JSON gerekli"},415,cors);
-   if(Number(request.headers.get("Content-Length")||0)>3000)return reply({error:"Istek cok buyuk"},413,cors);
+   if(!(request.headers.get("Content-Type")||"").includes("application/json"))return reply({error:"JSON gerekli"},415,cors);
+   if(Number(request.headers.get("Content-Length")||0)>1024)return reply({error:"Istek buyuk"},413,cors);
    let data;try{data=await request.json()}catch{return reply({error:"JSON gecersiz"},400,cors)}
    const symbol=String(data.symbol||"").trim().toUpperCase();
-   if(!/^[A-Z0-9]{3,7}$/.test(symbol))return reply({error:"BIST sembolu gecersiz"},422,cors);
-   if(!env.DB)return reply({error:"Kota veritabani yok; arastirma kapali"},503,cors);
+   if(!/^[A-Z0-9]{3,6}$/.test(symbol))return reply({error:"Sembol gecersiz"},422,cors);
+   if(!env.DB||!env.GEMINI_API_KEY)return reply({error:"Servis hazir degil"},503,cors);
+   const day=new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
+   const stamp=new Date().toISOString();
+   const db=env.DB;
+   // These tables should eventually be installed using a versioned D1 migration.
    try{
-     await env.DB.prepare("CREATE TABLE IF NOT EXISTS bist_ai_queries (day TEXT NOT NULL, symbol TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(day,symbol))").run();
-     const day=new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
-     const count=await env.DB.prepare("SELECT COUNT(*) AS n FROM bist_ai_queries WHERE day=?").bind(day).first();
-     const prior=await env.DB.prepare("SELECT 1 AS found FROM bist_ai_queries WHERE day=? AND symbol=?").bind(day,symbol).first();
-     if(prior)return reply({status:"ALREADY_REQUESTED",symbol,day,note:"Tekrar sorgu engellendi; onceki sonucu tekrar kullanin"},409,cors);
-     if(Number(count?.n||0)>=5)return reply({status:"DAILY_LIMIT",limit:5,day},429,cors);
-     await env.DB.prepare("INSERT INTO bist_ai_queries (day,symbol,created_at) VALUES (?,?,?)").bind(day,symbol,new Date().toISOString()).run();
-     const prompt="Turkce yanit ver. BIST sirket sembolu "+symbol+" icin son 24 saatteki finans haberleri ve KAP aciklamalarini ara. Yalniz tarihle ve kaynagiyla desteklenen iddialari belirt. Google Search sonucu tek basina resmi KAP dogrulamasi DEGILDIR. Resmi KAP kaynak URL ve bildirim kimligi olmadan KAP teyit edildi deme. Yatirim tavsiyesi, fiyat tahmini ve emir verme. Kaynak yoksa DOGRULANAMADI de. 1200 karakteri asma.";
+     await db.prepare("CREATE TABLE IF NOT EXISTS bist_daily_limits (day TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0 CHECK(count>=0 AND count<=5))").run();
+     await db.prepare("CREATE TABLE IF NOT EXISTS bist_research_cache (day TEXT NOT NULL, symbol TEXT NOT NULL, status TEXT NOT NULL, response_json TEXT, created_at TEXT NOT NULL, PRIMARY KEY(day,symbol))").run();
+     const prior=await db.prepare("SELECT status,response_json FROM bist_research_cache WHERE day=? AND symbol=?").bind(day,symbol).first();
+     if(prior?.status==="DONE"&&prior.response_json){return reply({...JSON.parse(prior.response_json),cached:true},200,cors)}
+     if(prior?.status==="RESERVED")return reply({symbol,status:"NEWS_REVIEW_PENDING",technical_score_only:true},202,cors);
+     await db.prepare("INSERT OR IGNORE INTO bist_daily_limits(day,count) VALUES (?,0)").bind(day).run();
+     const reserved=await db.prepare("UPDATE bist_daily_limits SET count=count+1 WHERE day=? AND count<5").bind(day).run();
+     if(reserved.meta?.changes!==1)return reply({status:"DAILY_LIMIT",limit:5,day},429,cors);
+     const claim=await db.prepare("INSERT OR IGNORE INTO bist_research_cache(day,symbol,status,created_at) VALUES (?,?,'RESERVED',?)").bind(day,symbol,stamp).run();
+     if(claim.meta?.changes!==1){
+       await db.prepare("UPDATE bist_daily_limits SET count=MAX(0,count-1) WHERE day=?").bind(day).run();
+       return reply({symbol,status:"NEWS_REVIEW_PENDING",technical_score_only:true},202,cors);
+     }
+   }catch{return reply({status:"NEWS_REVIEW_PENDING",error:"Kota kaydi basarisiz"},503,cors)}
+   const fail=async(reason)=>{
+     // A single request can refund only once, guarded by the claim status transition.
+     try{
+       const x=await db.prepare("UPDATE bist_research_cache SET status='FAILED' WHERE day=? AND symbol=? AND status='RESERVED'").bind(day,symbol).run();
+       if(x.meta?.changes===1)await db.prepare("UPDATE bist_daily_limits SET count=MAX(0,count-1) WHERE day=?").bind(day).run();
+     }catch{}
+     return reply({symbol,status:"NEWS_REVIEW_PENDING",technical_score_only:true,reason},202,cors);
+   };
+   try{
+     const prompt="Turkce yaz. BIST sembolu "+symbol+" icin guncel sirket haberlerini ara. Google sonucu resmi KAP bildirimi degildir. Resmi KAP bildirim kimligi ve tarihi yoksa resmi teyit yapildigini iddia etme. Eski veya farkli sirket haberini yeni haber diye sunma. Kaynak yoksa DOGRULANAMADI yaz. Yatirim tavsiyesi ve emir verme. En fazla 1200 karakter.";
      const url="https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-     const r=await fetch(url,{method:"POST",headers:{"x-goog-api-key":env.GEMINI_API_KEY,"Content-Type":"application/json"},body:JSON.stringify({contents:[{role:"user",parts:[{text:prompt}]}],tools:[{google_search:{}}],generationConfig:{temperature:0.2,maxOutputTokens:600}}),signal:AbortSignal.timeout(20000)});
-     if(!r.ok)return reply({status:"NEWS_REVIEW_PENDING",symbol,providerStatus:r.status},202,cors);
-     const result=await r.json();
-     const candidate=result.candidates?.[0]||{};
+     const r=await fetch(url,{method:"POST",headers:{"x-goog-api-key":env.GEMINI_API_KEY,"Content-Type":"application/json"},body:JSON.stringify({contents:[{role:"user",parts:[{text:prompt}]}],tools:[{google_search:{}}],generationConfig:{temperature:0.2,maxOutputTokens:600}}),signal:AbortSignal.timeout(15000)});
+     if(!r.ok)return await fail("GEMINI_HTTP_"+r.status);
+     const j=await r.json(),candidate=j.candidates?.[0]||{};
      const answer=(candidate.content?.parts||[]).map(p=>p.text||"").join("").slice(0,4000);
      const citations=(candidate.groundingMetadata?.groundingChunks||[]).filter(x=>x.web?.uri).slice(0,8).map(x=>({title:x.web.title||"",url:x.web.uri}));
-     return reply({symbol,status:citations.length?"SEARCH_RESULT_UNVERIFIED":"NEWS_REVIEW_PENDING",answer,citations,officialKapVerified:false,orders:false},200,cors);
-   }catch(e){return reply({status:"NEWS_REVIEW_PENDING",symbol,error:"Arastirma tamamlanamadi"},503,cors)}
+     const result={symbol,status:citations.length?"SEARCH_RESULT_UNVERIFIED":"NEWS_REVIEW_PENDING",answer,citations,officialKapVerified:false,technical_score_only:!citations.length,orders:false};
+     await db.prepare("UPDATE bist_research_cache SET status='DONE',response_json=? WHERE day=? AND symbol=? AND status='RESERVED'").bind(JSON.stringify(result),day,symbol).run();
+     return reply(result,200,cors);
+   }catch{return await fail("TIMEOUT_OR_PROVIDER_ERROR")}
  }
  if(u.pathname.startsWith("/v05/"))return v05.fetch(request,env);
  if(u.pathname==="/test"&&request.method==="GET"){
