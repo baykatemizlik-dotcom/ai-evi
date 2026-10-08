@@ -102,4 +102,26 @@ export default {async fetch(request,env){
  }
 
  return reply({error:"Not found"},404);
+},async scheduled(event,env,ctx){
+ const task=async()=>{
+   const local=new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/Istanbul",hour:"2-digit",minute:"2-digit",weekday:"short",hourCycle:"h23"}).formatToParts(new Date(event.scheduledTime||Date.now()));
+   const get=k=>local.find(x=>x.type===k)?.value||"";
+   const h=Number(get("hour")),m=Number(get("minute")),day=get("weekday");
+   const weekday=!["Sat","Sun"].includes(day);
+   let phase="SKIPPED";
+   if(h===23&&m===30)phase="NIGHT_WATCH";
+   else if(h===9&&m===15)phase="MORNING_WATCH";
+   else if(weekday&&h*60+m>=615&&h*60+m<=1055)phase="INTRADAY_SCAN";
+   if(phase==="SKIPPED")return;
+   const id=new Date(event.scheduledTime||Date.now()).toISOString();
+   // Fail closed: no licensed or verified live BIST / KAP feed is configured.
+   // Never manufacture bars, risk clearances, trading signals or paper fills.
+   const ready=Boolean(env.MARKET_DATA_URL&&env.KAP_FEED_URL&&env.MARKET_DATA_TOKEN);
+   const status=ready?"FEEDS_CONFIGURED_NOT_VALIDATED":"BLOCKED_MISSING_VERIFIED_FEED";
+   try{
+    await env.DB.prepare("INSERT OR IGNORE INTO bist_scan_runs(run_id,phase,status,created_at,details) VALUES(?,?,?,?,?)")
+      .bind(id,phase,status,new Date().toISOString(),JSON.stringify({verified_market_data:false,verified_kap:false,signals_created:0,orders_sent:0})).run();
+   }catch(e){console.error("scan log error",String(e).slice(0,100))}
+ };
+ ctx.waitUntil(task());
 }};
