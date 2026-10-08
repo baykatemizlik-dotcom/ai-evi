@@ -65,6 +65,32 @@ const kapPreflight=async(env)=>{
  if(!env.KAP_FEED_URL||!/^https:\/\/(?:www\.)?kap\.org\.tr\//i.test(env.KAP_FEED_URL))return {ready:false,reason:"OFFICIAL_KAP_URL_NOT_CONFIGURED"};
  try{const r=await fetch(env.KAP_FEED_URL,{signal:AbortSignal.timeout(7000),headers:{Accept:"application/json, application/rss+xml, application/xml"}});if(!r.ok)return {ready:false,reason:"KAP_HTTP_"+r.status};const txt=await r.text();if(!txt||txt.length<40)return {ready:false,reason:"KAP_EMPTY"};return {ready:true,raw_length:txt.length,source:"kap.org.tr",verified_disclosures:false}}catch{return {ready:false,reason:"KAP_UNREACHABLE"}}
 };
+const nightRadar=async(env)=>{
+ const names=String(env.SCAN_SYMBOLS||"THYAO,ASELS,TUPRS,BIMAS,AKBNK,GARAN,SISE,EREGL,KCHOL,SAHOL").split(",").map(x=>x.trim().toUpperCase()).filter(x=>/^[A-Z0-9]{3,7}$/.test(x)).slice(0,20);
+ const date=new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
+ const kap=await kapPreflight(env),candidates=[],errors=[];
+ for(const symbol of names){
+   try{
+     const bars=await yahooOHLCV(symbol,"1d"),last=bars.at(-1),prior=bars.slice(-21,-1);
+     if(!last||prior.length<20)continue;
+     const volAvg=prior.reduce((v,x)=>v+x.v,0)/20;
+     const rvol=volAvg>0?last.v/volAvg:0;
+     const turnover=last.c*last.v;
+     const good=turnover>30000000&&last.c>last.o&&rvol>=1.5;
+     if(!good)continue;
+     candidates.push({symbol,strategy:"SWING",price:last.c,rvol:Number(rvol.toFixed(2)),turnover,bar_timestamp:new Date(last.t*1000).toISOString()});
+   }catch(e){errors.push({symbol,reason:String(e.message||e).slice(0,85)})}
+ }
+ candidates.sort((a,b)=>b.rvol-a.rvol);
+ for(const c of candidates.slice(0,5)){
+   await env.DB.prepare("INSERT INTO watchlist_pool(trade_day,symbol,source,verified,created_at,strategy,metrics_json,radar_status,updated_at) VALUES(?,?,?,0,?,'SWING',?,'RADAR_ONLY',?) ON CONFLICT(trade_day,symbol) DO UPDATE SET metrics_json=excluded.metrics_json,updated_at=excluded.updated_at,radar_status='RADAR_ONLY'")
+    .bind(date,c.symbol,"Yahoo Finance daily / unverified",new Date().toISOString(),JSON.stringify(c),new Date().toISOString()).run();
+ }
+ const status=errors.length===names.length?"BLOCKED_MARKET_DATA_UNAVAILABLE":!kap.ready?"NIGHT_OHLCV_OK_KAP_BLOCKED":"NIGHT_OHLCV_OK_KAP_UNVERIFIED";
+ const summary={status,scanned:names.length,market_data_success:names.length-errors.length,candidates:candidates.slice(0,5),errors,kap,approved_signals:0};
+ await env.DB.prepare("INSERT OR REPLACE INTO bist_scan_runs(run_id,phase,status,created_at,details) VALUES(?,?,?,?,?)").bind("NIGHT:"+date,"NIGHT_WATCH",status,new Date().toISOString(),JSON.stringify(summary)).run();
+ return summary;
+};
 const hash=async s=>new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s)));
 export default {async fetch(request,env){
  const u=new URL(request.url);
@@ -138,6 +164,10 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
   const cap=await env.DB.prepare("SELECT value FROM bist_settings WHERE key='TOTAL_CAPITAL'").first();
   const budget=Number(cap?.value||5000)/2;
   return reply({budget,market_price:price,...paperLotPlan(budget,price),note:"Simulation sizing only; actual orders and live price feeds are not connected."});
+ }
+ if(u.pathname==="/bist/night-test"&&request.method==="POST"){
+  if(!env.DB)return reply({error:"D1 unavailable"},503);
+  try{return reply(await nightRadar(env),200)}catch(e){return reply({error:"Night test failed",reason:String(e.message||e).slice(0,130)},503)}
  }
  if(u.pathname==="/bist/overview"&&request.method==="GET"){
    if(!env.DB)return reply({error:"DB unavailable"},503);
@@ -255,6 +285,7 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
    // Fail closed: no licensed or verified live BIST / KAP feed is configured.
    // Never manufacture bars, risk clearances, trading signals or paper fills.
    let status="BLOCKED_MISSING_VERIFIED_FEED",results=[],kap={ready:false};
+   if(phase==="NIGHT_WATCH"){await nightRadar(env);return}
    if(phase==="INTRADAY_SCAN"){
      const symbols=String(env.SCAN_SYMBOLS||"THYAO,ASELS,TUPRS").split(",").map(x=>x.trim().toUpperCase()).filter(x=>/^[A-Z0-9]{3,7}$/.test(x)).slice(0,12);
      kap=await kapPreflight(env);
