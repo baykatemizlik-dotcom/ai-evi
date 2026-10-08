@@ -41,10 +41,10 @@ export default {async fetch(request,env){
      if(previous?.status==="DONE"&&previous.response_json)return reply({...JSON.parse(previous.response_json),cached:true},200,cors);
      if(previous?.status==="RESERVED")return reply({symbol,status:"NEWS_REVIEW_PENDING",technical_score_only:true},202,cors);
      const claim=await db.prepare(
-       "INSERT INTO bist_research_cache(day,symbol,status,created_at) "+
-       "SELECT ?,?,'RESERVED',? WHERE (SELECT COUNT(*) FROM bist_research_cache WHERE day=? AND status IN ('RESERVED','DONE')) < 5 "+
-       "ON CONFLICT(day,symbol) DO UPDATE SET status='RESERVED',response_json=NULL,created_at=excluded.created_at "+
-       "WHERE bist_research_cache.status='FAILED' AND "+
+       "INSERT INTO bist_research_cache(day,symbol,status,created_at,attempts) "+
+       "SELECT ?,?,'RESERVED',?,1 WHERE (SELECT COUNT(*) FROM bist_research_cache WHERE day=? AND status IN ('RESERVED','DONE')) < 5 "+
+       "ON CONFLICT(day,symbol) DO UPDATE SET status='RESERVED',response_json=NULL,created_at=excluded.created_at,attempts=bist_research_cache.attempts+1 "+
+       "WHERE bist_research_cache.status='FAILED' AND bist_research_cache.attempts<3 AND "+
        "(SELECT COUNT(*) FROM bist_research_cache WHERE day=? AND status IN ('RESERVED','DONE')) < 5"
      ).bind(day,symbol,stamp,day,day).run();
      if(claim.meta?.changes!==1){
