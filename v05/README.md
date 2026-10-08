@@ -32,3 +32,12 @@ Her adımın yanıtı D1 veritabanına kaydedilir. `/v05/start`, `/v05/step`, `/
 5. Gemini kod denetimi ve Berker'in ayrı canlı dağıtım onayı olmadan yayımlama.
 
 Gizli anahtarları GitHub'a veya bu belgeye ekleme.
+
+
+## Ekonomi modu ve yedekler
+- Gemini ilk incelemede GPT taslağına **katılırsa görüşme hemen tamamlanır**; ikinci GPT ve ikinci Gemini çağrıları yapılmaz. İtiraz varsa 4 aşamalı akış devam eder.
+- Gemini 429/503 dönerse otomatik retry yok. 1 saat boyunca o görüşmede yeniden Gemini isteğine izin verilmez; süre dolduğunda yalnız başarısız Gemini adımı manuel devam ettirilir. Bu sabit bekleme, sağlayıcının dinamik Retry-After başlığını henüz okumaz.
+- Her aşama kullanıcı tarafından tetiklenir; arka planda sürekli model tüketimi yok.
+- `memory.sql` proje kararları ve sohbet olaylarını D1'de tutacak şemayı ekler. Bunların otomatik kaydı/okunması Worker'a henüz entegre edilmedi.
+- `backup-worker.js` günde bir kez çalışacak **ayrı, henüz dağıtılmamış** cron Worker iskeletidir. R2'ye JSON tablo ihracı yapar ve yaklaşık 7 günlük dosyaları saklar. **Tutarlı çevrimiçi veritabanı anlık görüntüsü garantisi ve geri yükleme aracı henüz yoktur**. Canlı kurtarma yedeği olduğu iddia edilmez.
+- Google Docs'a periyodik API yazımı yoktur.
