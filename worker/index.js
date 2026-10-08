@@ -1,5 +1,14 @@
 // BIST AVCI research-only Cloudflare Worker. No AI Evi routes.
 const reply=(value,status=200)=>new Response(JSON.stringify(value),{status,headers:{"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store"}});
+// Paper-trading sizing only; does not place trades.
+const paperLotPlan=(budget,marketPrice,{slippage=0.002,commission=0.002}={})=>{
+ const price=Number(marketPrice),cash=Number(budget);
+ if(!Number.isFinite(price)||price<=0||!Number.isFinite(cash)||cash<=0)return {lots:0,firstTakeProfitLots:0,remainingLots:0,reason:"INVALID_PRICE_OR_BUDGET"};
+ const executedPrice=price*(1+slippage);
+ const lots=Math.floor(cash/(executedPrice*(1+commission)));
+ const firstTakeProfitLots=lots>=2?Math.floor(lots/2):0;
+ return {lots,executedPrice,estimatedEntryCost:lots*executedPrice*(1+commission),firstTakeProfitLots,remainingLots:lots-firstTakeProfitLots,partialExitPossible:firstTakeProfitLots>0,priceCap:null};
+};
 const hash=async s=>new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s)));
 export default {async fetch(request,env){
  const u=new URL(request.url);
@@ -59,6 +68,13 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
  if(u.pathname==="/bist/logout"&&request.method==="POST")return new Response(JSON.stringify({ok:true}),{headers:{"Content-Type":"application/json","Set-Cookie":"bist_session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict"}});
  if(!authenticated)return reply({error:"Unauthorized"},401);
  const cors={};
+ if(u.pathname==="/bist/paper-sizing"&&request.method==="GET"){
+  const price=Number(u.searchParams.get("price"));
+  if(!Number.isFinite(price)||price<=0)return reply({error:"Valid positive price required"},422);
+  const cap=await env.DB.prepare("SELECT value FROM bist_settings WHERE key='TOTAL_CAPITAL'").first();
+  const budget=Number(cap?.value||5000)/2;
+  return reply({budget,market_price:price,...paperLotPlan(budget,price),note:"Simulation sizing only; actual orders and live price feeds are not connected."});
+ }
  if(u.pathname==="/bist/overview"&&request.method==="GET"){
    if(!env.DB)return reply({error:"DB unavailable"},503);
    try{
