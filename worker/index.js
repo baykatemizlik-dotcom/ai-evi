@@ -33,28 +33,30 @@ export default {async fetch(request,env){
    const day=new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
    const stamp=new Date().toISOString();
    const db=env.DB;
-   // These tables should eventually be installed using a versioned D1 migration.
+   // One SQLite write statement claims the symbol and available daily slot together.
+   // D1 serializes writes; a same-day UNIQUE(day,symbol) prevents duplicate calls.
+   // FAILED reservations do not count against the five daily slots.
    try{
-     await db.prepare("CREATE TABLE IF NOT EXISTS bist_daily_limits (day TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0 CHECK(count>=0 AND count<=5))").run();
-     await db.prepare("CREATE TABLE IF NOT EXISTS bist_research_cache (day TEXT NOT NULL, symbol TEXT NOT NULL, status TEXT NOT NULL, response_json TEXT, created_at TEXT NOT NULL, PRIMARY KEY(day,symbol))").run();
-     const prior=await db.prepare("SELECT status,response_json FROM bist_research_cache WHERE day=? AND symbol=?").bind(day,symbol).first();
-     if(prior?.status==="DONE"&&prior.response_json){return reply({...JSON.parse(prior.response_json),cached:true},200,cors)}
-     if(prior?.status==="RESERVED")return reply({symbol,status:"NEWS_REVIEW_PENDING",technical_score_only:true},202,cors);
-     await db.prepare("INSERT OR IGNORE INTO bist_daily_limits(day,count) VALUES (?,0)").bind(day).run();
-     const reserved=await db.prepare("UPDATE bist_daily_limits SET count=count+1 WHERE day=? AND count<5").bind(day).run();
-     if(reserved.meta?.changes!==1)return reply({status:"DAILY_LIMIT",limit:5,day},429,cors);
-     const claim=await db.prepare("INSERT OR IGNORE INTO bist_research_cache(day,symbol,status,created_at) VALUES (?,?,'RESERVED',?)").bind(day,symbol,stamp).run();
+     const previous=await db.prepare("SELECT status,response_json FROM bist_research_cache WHERE day=? AND symbol=?").bind(day,symbol).first();
+     if(previous?.status==="DONE"&&previous.response_json)return reply({...JSON.parse(previous.response_json),cached:true},200,cors);
+     if(previous?.status==="RESERVED")return reply({symbol,status:"NEWS_REVIEW_PENDING",technical_score_only:true},202,cors);
+     const claim=await db.prepare(
+       "INSERT INTO bist_research_cache(day,symbol,status,created_at) "+
+       "SELECT ?,?,'RESERVED',? WHERE (SELECT COUNT(*) FROM bist_research_cache WHERE day=? AND status IN ('RESERVED','DONE')) < 5 "+
+       "ON CONFLICT(day,symbol) DO UPDATE SET status='RESERVED',response_json=NULL,created_at=excluded.created_at "+
+       "WHERE bist_research_cache.status='FAILED' AND "+
+       "(SELECT COUNT(*) FROM bist_research_cache WHERE day=? AND status IN ('RESERVED','DONE')) < 5"
+     ).bind(day,symbol,stamp,day,day).run();
      if(claim.meta?.changes!==1){
-       await db.prepare("UPDATE bist_daily_limits SET count=MAX(0,count-1) WHERE day=?").bind(day).run();
-       return reply({symbol,status:"NEWS_REVIEW_PENDING",technical_score_only:true},202,cors);
+       const current=await db.prepare("SELECT status,response_json FROM bist_research_cache WHERE day=? AND symbol=?").bind(day,symbol).first();
+       if(current?.status==="DONE"&&current.response_json)return reply({...JSON.parse(current.response_json),cached:true},200,cors);
+       if(current?.status==="RESERVED")return reply({symbol,status:"NEWS_REVIEW_PENDING",technical_score_only:true},202,cors);
+       return reply({status:"DAILY_LIMIT",limit:5,day},429,cors);
      }
-   }catch{return reply({status:"NEWS_REVIEW_PENDING",error:"Kota kaydi basarisiz"},503,cors)}
+   }catch{return reply({status:"NEWS_REVIEW_PENDING",error:"Rezervasyon basarisiz"},503,cors)}
    const fail=async(reason)=>{
-     // A single request can refund only once, guarded by the claim status transition.
-     try{
-       const x=await db.prepare("UPDATE bist_research_cache SET status='FAILED' WHERE day=? AND symbol=? AND status='RESERVED'").bind(day,symbol).run();
-       if(x.meta?.changes===1)await db.prepare("UPDATE bist_daily_limits SET count=MAX(0,count-1) WHERE day=?").bind(day).run();
-     }catch{}
+     // Failed claims stop occupying a daily slot; no separate counter to refund.
+     try{await db.prepare("UPDATE bist_research_cache SET status='FAILED' WHERE day=? AND symbol=? AND status='RESERVED'").bind(day,symbol).run()}catch{}
      return reply({symbol,status:"NEWS_REVIEW_PENDING",technical_score_only:true,reason},202,cors);
    };
    try{
