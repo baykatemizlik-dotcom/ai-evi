@@ -1,6 +1,5 @@
 // AI Evi v0.5 prototype: separate development branch, NOT the production entrypoint.
 // D1 binding DB is mandatory. No DB = no paid calls. No automatic paid Gemini fallback.
-const LIMIT_CENTS=200, RESERVE_CENTS=25;
 const fields={GPT_DRAFT:"gpt_draft",GEMINI_REVIEW:"gemini_review",GPT_REVISION:"gpt_revision",GEMINI_FINAL:"gemini_final"};
 const next={GPT_DRAFT:"GEMINI_REVIEW",GEMINI_REVIEW:"GPT_REVISION",GPT_REVISION:"GEMINI_FINAL",GEMINI_FINAL:"DONE"};
 const json=(v,status=200,h={})=>new Response(JSON.stringify(v),{status,headers:{"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store",...h}});
@@ -50,6 +49,17 @@ export default {async fetch(req,env){
   const id=url.searchParams.get("id")||"";const row=await env.DB.prepare("SELECT * FROM conversations WHERE id=?").bind(id).first();
   return row?json(history(row),200,cors):json({error:"Kayıt bulunamadı"},404,cors);
  }
+ if(url.pathname==="/v05/decisions"&&req.method==="GET"){
+  const project=String(url.searchParams.get("project")||"genel").slice(0,60);
+  const items=await env.DB.prepare("SELECT id,project,title,body,status,created_at FROM decisions WHERE project=? AND status='active' ORDER BY updated_at DESC LIMIT 50").bind(project).all();
+  return json({decisions:items.results||[]},200,cors);
+ }
+ if(url.pathname==="/v05/decisions"&&req.method==="POST"){
+  const body=await req.json(),id=String(body.id||""),project=String(body.project||"genel").trim(),title=String(body.title||"").trim(),content=String(body.body||"").trim();
+  if(!/^[0-9a-f-]{36}$/i.test(id)||!project||project.length>60||title.length<3||title.length>150||content.length<5||content.length>6000)return json({error:"Karar alanları geçersiz."},400,cors);
+  await env.DB.prepare("INSERT OR IGNORE INTO decisions(id,project,title,body) VALUES(?,?,?,?)").bind(id,project,title,content).run();
+  return json({saved:true,id},200,cors);
+ }
  if(url.pathname!=="/v05/step"||req.method!=="POST")return json({error:"Bulunamadı"},404,cors);
  const body=await req.json(),id=String(body.id||"");
  const row=await env.DB.prepare("SELECT * FROM conversations WHERE id=?").bind(id).first();
@@ -61,14 +71,10 @@ export default {async fetch(req,env){
  }
  if(!["READY","WAITING"].includes(row.status))return json({error:"Aşama otomatik tekrar çalıştırılamaz; manuel kontrol gerekli.",...history(row)},409,cors);
  const stage=row.stage,isGPT=stage==="GPT_DRAFT"||stage==="GPT_REVISION";
- // Fail-closed atomic conditional budget reservation, shared across all conversations.
- // A reservation is NEVER refunded, even if an API request errors; conservative protection.
- if(isGPT){
-  const budget=await env.DB.prepare("UPDATE test_budget SET reserved_cents=reserved_cents+? WHERE id=1 AND limit_cents=? AND reserved_cents+?<=limit_cents RETURNING reserved_cents").bind(RESERVE_CENTS,LIMIT_CENTS,RESERVE_CENTS).first();
-  if(!budget)return json({error:"2 USD test bütçesi kilidi: yeni OpenAI çağrısı engellendi.",status:"BUDGET_BLOCKED",...history(row)},402,cors);
- }
- const claimed=await env.DB.prepare("UPDATE conversations SET status='RUNNING',last_error=NULL,reserved_cents=reserved_cents+?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND stage=? AND status IN ('READY','WAITING') RETURNING id").bind(isGPT?RESERVE_CENTS:0,id,stage).first();
- if(!claimed)return json({error:"Bu aşama zaten işlemde",...history(row)},409,cors);
+ // Claim before calling ANY external model. A duplicate /step cannot win the claim.
+ // Conservative rule: if execution crashes after claim, it remains RUNNING until reviewed.
+ const claimed=await env.DB.prepare("UPDATE conversations SET status='RUNNING',last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND stage=? AND status IN ('READY','WAITING') RETURNING id").bind(id,stage).first();
+ if(!claimed)return json({error:"Aşama zaten yürütülüyor.",...history(row)},409,cors);
  try{
   const value=isGPT?await openai(env,row,stage==="GPT_REVISION"):await gemini(env,row,stage==="GEMINI_FINAL");
   const text=isGPT?value:JSON.stringify(value);
@@ -76,9 +82,12 @@ export default {async fetch(req,env){
   // This avoids the second GPT and second Gemini requests altogether.
   const earlyAgreement=stage==="GEMINI_REVIEW" && value.agree===true;
   const destination=earlyAgreement?"DONE":next[stage],done=destination==="DONE";
-  const result=done?(critical(row.question)?"BERKER ONAYI GEREKLİ\\n":"")+(isGPT?String(value):String(value.result||"")):null;
+  const result=done?(critical(row.question)?"BERKER ONAYI GEREKLİ\n":"")+String(value.result||""):null;
   const field=fields[stage];if(!field)throw new Error("Bilinmeyen aşama");
-  await env.DB.prepare("UPDATE conversations SET "+field+"=?,stage=?,status=?,result=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='RUNNING' AND stage=?").bind(text,destination,done?"DONE":"READY",result,id,stage).run();
+  await env.DB.batch([
+   env.DB.prepare("UPDATE conversations SET "+field+"=?,stage=?,status=?,result=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='RUNNING' AND stage=?").bind(text,destination,done?"DONE":"READY",result,id,stage),
+   env.DB.prepare("INSERT OR IGNORE INTO conversation_events(id,conversation_id,stage,content) VALUES(?,?,?,?)").bind(id+":"+stage,id,stage,text)
+  ]);
  }catch(e){
   // Keep the same stage. A retry of an uncertain OpenAI request is blocked to avoid duplicate billing.
   const status=isGPT?"NEEDS_MANUAL_REVIEW":"WAITING";
