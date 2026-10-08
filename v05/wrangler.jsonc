@@ -12,6 +12,6 @@
     "GEMINI_MODEL": "gemini-3.8-flash"
   },
   "d1_databases": [
-    { "binding": "DB", "database_name": "ai-evi-v05-test", "database_id": "REPLACE_WITH_REAL_D1_ID" }
+    { "binding": "DB", "database_name": "ai-evi-v05-test", "database_id": "08339ed0-2dfc-49d1-a4a4-52552ae25966" }
   ]
 }
