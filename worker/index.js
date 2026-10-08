@@ -23,14 +23,15 @@ export default {async fetch(request,env){
    const [openai,gemini]=await Promise.all([check("https://api.openai.com/v1/models",{Authorization:"Bearer "+env.OPENAI_API_KEY}),check("https://generativelanguage.googleapis.com/v1beta/models",{"x-goog-api-key":env.GEMINI_API_KEY})]);
    return reply({ok:openai==="Aktif"&&gemini==="Aktif",openai,gemini,models:{openai:env.OPENAI_MODEL,gemini:env.GEMINI_MODEL},note:"Seçili modele erişim, kredi bakiyesi veya ücretsiz kota bu testle doğrulanmaz."},200,cors);
  }
- if(u.pathname!=="/api/orchestrate"||request.method!=="POST")return reply({error:"Bulunamadı."},404,cors);
+ const reviewOnly=u.pathname==="/api/review-only";
+ if(!reviewOnly&&u.pathname!=="/api/orchestrate"||request.method!=="POST")return reply({error:"Bulunamadı."},404,cors);
  if(!(request.headers.get("Content-Type")||"").includes("application/json"))return reply({error:"JSON gerekli."},415,cors);
  if(Number(request.headers.get("Content-Length")||0)>12000)return reply({error:"İstek çok büyük."},413,cors);
  let body;try{body=await request.json()}catch{return reply({error:"Geçersiz JSON."},400,cors)}
  const question=typeof body.question==="string"?body.question.trim():"";
  if(question.length<5||question.length>4000)return reply({error:"Soru 5-4000 karakter olmalı."},400,cors);
  let openai;
- try {
+ if(reviewOnly){openai=typeof body.openai==="string"?body.openai.trim():"";if(openai.length<5||openai.length>6000)return reply({error:"Yeniden inceleme için önceki OpenAI yanıtı gerekli."},400,cors)}else try {
  const r=await fetch("https://api.openai.com/v1/chat/completions",{method:"POST",headers:{"Authorization":"Bearer "+env.OPENAI_API_KEY,"Content-Type":"application/json"},body:JSON.stringify({model:env.OPENAI_MODEL,max_completion_tokens:1200,messages:[{role:"system",content:policy},{role:"user",content:question}]}),signal:AbortSignal.timeout(24000)});
  if(!r.ok)return reply({error:"OpenAI HTTP "+r.status+"; model erişimini kontrol et."},r.status===429?429:502,cors);
  const j=await r.json();openai=j.choices?.[0]?.message?.content?.trim();if(!openai)throw Error("OpenAI boş yanıt");
@@ -38,10 +39,10 @@ export default {async fetch(request,env){
  try {
  const instruction='Görev: '+question+'\n\nOpenAI görüşü: '+openai+'\n\nBu görüşü bağımsız denetle. Yalnız geçerli JSON döndür: {"review":"inceleme","result":"sonuç","agree":true}. İtiraz varsa agree=false. Gerçekte yapmadığın kaynak doğrulamasını iddia etme. Türkçe yaz. Kritik eylemler kullanıcı onayı ister.';
  const r=await fetch("https://generativelanguage.googleapis.com/v1beta/models/"+encodeURIComponent(env.GEMINI_MODEL)+":generateContent",{method:"POST",headers:{"x-goog-api-key":env.GEMINI_API_KEY,"Content-Type":"application/json"},body:JSON.stringify({contents:[{role:"user",parts:[{text:instruction}]}],generationConfig:{maxOutputTokens:1700,responseMimeType:"application/json"}}),signal:AbortSignal.timeout(24000)});
- if(!r.ok)return reply({openai,gemini:"İnceleme bekleniyor",result:"Ortak sonuç yok.",status:"PENDING_GEMINI_REVIEW",error:"Gemini HTTP "+r.status+"; tekrar deneme ek OpenAI maliyeti doğurabilir."},r.status===429?429:502,cors);
+ if(!r.ok)return reply({openai,gemini:"İnceleme bekleniyor",result:"Ortak sonuç yok.",status:"PENDING_GEMINI_REVIEW",error:"Gemini HTTP "+r.status+"; yalnız Gemini yeniden denenebilir."},r.status===429?429:502,cors);
  const j=await r.json(),raw=(j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||"").join("\n");
  const parsed=JSON.parse(raw),gemini=String(parsed.review||"İnceleme özeti yok"),agreed=parsed.agree===true&&!!parsed.result;
  const status=critical.test(question)?"NEEDS_BERKER":agreed?"REVIEWED":"DISAGREE";
  return reply({openai,gemini,result:String(parsed.result||"Uzlaşılmış sonuç yok."),status,models:{openai:env.OPENAI_MODEL,gemini:env.GEMINI_MODEL}},200,cors);
- }catch(e){return reply({openai,gemini:"İnceleme tamamlanamadı.",result:"Berker değerlendirmesi gerekiyor.",status:"PENDING_GEMINI_REVIEW",error:"Gemini bağlantı/JSON hatası; yeniden deneme OpenAI maliyeti doğurabilir."},502,cors)}
+ }catch(e){return reply({openai,gemini:"İnceleme tamamlanamadı.",result:"Berker değerlendirmesi gerekiyor.",status:"PENDING_GEMINI_REVIEW",error:"Gemini bağlantı/JSON hatası; yalnız Gemini yeniden denenebilir."},502,cors)}
 }};
