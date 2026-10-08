@@ -2,7 +2,7 @@
 // Bind D1 as DB and R2 as BACKUPS. Runs at most once per day via Cloudflare cron.
 // Snapshot is NOT a native D1 SQLite backup: it is a versioned JSON export
 // of the tables listed below. Verify restore before claiming disaster recovery.
-const TABLES=["test_budget","conversations","decisions","conversation_events"];
+const TABLES=["conversations","decisions","conversation_events"];
 const KEEP_DAYS=7;
 const MAX_ROWS=20000;
 const MAX_BYTES=20*1024*1024;
