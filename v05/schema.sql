@@ -1,11 +1,4 @@
 -- v0.5 only: Cloudflare D1, execute once in a dedicated test database.
-CREATE TABLE IF NOT EXISTS test_budget (
- id INTEGER PRIMARY KEY CHECK(id=1),
- limit_cents INTEGER NOT NULL DEFAULT 200,
- reserved_cents INTEGER NOT NULL DEFAULT 0,
- CHECK(reserved_cents>=0 AND reserved_cents<=limit_cents)
-);
-INSERT OR IGNORE INTO test_budget(id,limit_cents,reserved_cents) VALUES(1,200,0);
 CREATE TABLE IF NOT EXISTS conversations (
  id TEXT PRIMARY KEY,
  question TEXT NOT NULL,
