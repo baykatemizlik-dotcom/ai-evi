@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS bist_research_cache (
  day TEXT NOT NULL,
  symbol TEXT NOT NULL,
  status TEXT NOT NULL CHECK(status IN ('RESERVED','DONE','FAILED')),
+ attempts INTEGER NOT NULL DEFAULT 1 CHECK(attempts BETWEEN 1 AND 3),
  response_json TEXT,
  created_at TEXT NOT NULL,
  PRIMARY KEY(day,symbol)
