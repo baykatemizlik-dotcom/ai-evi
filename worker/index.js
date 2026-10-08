@@ -29,15 +29,17 @@ export default {async fetch(request,env){
  if(Number(request.headers.get("Content-Length")||0)>12000)return reply({error:"İstek çok büyük."},413,cors);
  let body;try{body=await request.json()}catch{return reply({error:"Geçersiz JSON."},400,cors)}
  const question=typeof body.question==="string"?body.question.trim():"";
+ const nowTR=new Intl.DateTimeFormat("tr-TR",{timeZone:"Europe/Istanbul",weekday:"long",year:"numeric",month:"long",day:"numeric",hour:"2-digit",minute:"2-digit"}).format(new Date());
+ const context="Güncel tarih/saat (Türkiye, Europe/Istanbul): "+nowTR+". AI Evi, Berker için ChatGPT ile Gemini\u0027nin ortak çalıştığı yazılım platformudur; eğitim/ajans şirketi değildir. Bu tarihi temel al; doğrulamadığın bilgiyi kesinmiş gibi söyleme.";
  if(question.length<5||question.length>4000)return reply({error:"Soru 5-4000 karakter olmalı."},400,cors);
  let openai;
  if(reviewOnly){openai=typeof body.openai==="string"?body.openai.trim():"";if(openai.length<5||openai.length>6000)return reply({error:"Yeniden inceleme için önceki OpenAI yanıtı gerekli."},400,cors)}else try {
- const r=await fetch("https://api.openai.com/v1/chat/completions",{method:"POST",headers:{"Authorization":"Bearer "+env.OPENAI_API_KEY,"Content-Type":"application/json"},body:JSON.stringify({model:env.OPENAI_MODEL,max_completion_tokens:1200,messages:[{role:"system",content:policy},{role:"user",content:question}]}),signal:AbortSignal.timeout(24000)});
+ const r=await fetch("https://api.openai.com/v1/chat/completions",{method:"POST",headers:{"Authorization":"Bearer "+env.OPENAI_API_KEY,"Content-Type":"application/json"},body:JSON.stringify({model:env.OPENAI_MODEL,max_completion_tokens:1200,messages:[{role:"system",content:policy+" "+context},{role:"user",content:question}]}),signal:AbortSignal.timeout(24000)});
  if(!r.ok)return reply({error:"OpenAI HTTP "+r.status+"; model erişimini kontrol et."},r.status===429?429:502,cors);
  const j=await r.json();openai=j.choices?.[0]?.message?.content?.trim();if(!openai)throw Error("OpenAI boş yanıt");
  }catch(e){return reply({error:"OpenAI bağlantı hatası: "+String(e.message||e).slice(0,100)},502,cors)}
  try {
- const instruction='Görev: '+question+'\n\nOpenAI görüşü: '+openai+'\n\nBu görüşü bağımsız denetle. Yalnız geçerli JSON döndür: {"review":"inceleme","result":"sonuç","agree":true}. İtiraz varsa agree=false. Gerçekte yapmadığın kaynak doğrulamasını iddia etme. Türkçe yaz. Kritik eylemler kullanıcı onayı ister.';
+ const instruction=context+'\n\nGörev: '+question+'\n\nOpenAI görüşü: '+openai+'\n\nBu görüşü bağımsız denetle. Yalnız geçerli JSON döndür: {"review":"inceleme","result":"sonuç","agree":true}. İtiraz varsa agree=false. Gerçekte yapmadığın kaynak doğrulamasını iddia etme. Türkçe yaz. Kritik eylemler kullanıcı onayı ister.';
  const r=await fetch("https://generativelanguage.googleapis.com/v1beta/models/"+encodeURIComponent(env.GEMINI_MODEL)+":generateContent",{method:"POST",headers:{"x-goog-api-key":env.GEMINI_API_KEY,"Content-Type":"application/json"},body:JSON.stringify({contents:[{role:"user",parts:[{text:instruction}]}],generationConfig:{maxOutputTokens:1700,responseMimeType:"application/json"}}),signal:AbortSignal.timeout(24000)});
  if(!r.ok)return reply({openai,gemini:"İnceleme bekleniyor",result:"Ortak sonuç yok.",status:"PENDING_GEMINI_REVIEW",error:"Gemini HTTP "+r.status+"; yalnız Gemini yeniden denenebilir."},r.status===429?429:502,cors);
  const j=await r.json(),raw=(j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||"").join("\n");
