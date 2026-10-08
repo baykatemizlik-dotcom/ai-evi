@@ -32,6 +32,39 @@ const settleScalpPaperExit=async(db,trade,marketPrice,marketTimestamp)=>{
  ]);
  return {closed:true,reason,pnl,results:results.map(x=>x.meta?.changes||0)};
 };
+
+const yahooOHLCV=async(symbol,interval="15m")=>{
+ if(!/^[A-Z0-9]{3,7}$/.test(symbol))throw Error("invalid_symbol");
+ const period=interval==="1d"?"6mo":"1mo";
+ const url="https://query1.finance.yahoo.com/v8/finance/chart/"+encodeURIComponent(symbol+".IS")+"?range="+period+"&interval="+interval;
+ const r=await fetch(url,{headers:{"Accept":"application/json"},signal:AbortSignal.timeout(8500)});
+ if(!r.ok)throw Error("YAHOO_HTTP_"+r.status);
+ const json=await r.json(),d=json.chart?.result?.[0],q=d?.indicators?.quote?.[0],times=d?.timestamp||[];
+ if(!q||times.length<30)throw Error("INSUFFICIENT_OHLCV");
+ const now=Math.floor(Date.now()/1000);
+ const seconds=interval==="1d"?86400:900;
+ const bars=times.map((t,i)=>({t,o:q.open?.[i],h:q.high?.[i],l:q.low?.[i],c:q.close?.[i],v:q.volume?.[i]})).filter(b=>[b.o,b.h,b.l,b.c,b.v].every(x=>typeof x==="number"&&Number.isFinite(x))&&b.h>=b.l&&b.v>=0&&b.t+seconds<=now-120);
+ if(bars.length<30||now-bars[bars.length-1].t>86400*4)throw Error("STALE_OR_INSUFFICIENT_BARS");
+ return bars;
+};
+const technicalCandidate=(bars)=>{
+ const b=bars.at(-1),hist=bars.slice(-21,-1),recent=bars.slice(-6,-1);
+ if(!b||hist.length<20||recent.length<5)return null;
+ const avg=hist.reduce((a,x)=>a+x.v,0)/hist.length;
+ const rvol=avg>0?b.v/avg:0,body=b.c-b.o,range=b.h-b.l;
+ const priorHigh=Math.max(...recent.map(x=>x.h));
+ const baseSize=recent.reduce((a,x)=>a+(x.h-x.l),0)/5;
+ const vwapBars=bars.filter(x=>new Date(x.t*1000).toISOString().slice(0,10)===new Date(b.t*1000).toISOString().slice(0,10));
+ const volume=vwapBars.reduce((a,x)=>a+x.v,0);
+ const vwap=volume>0?vwapBars.reduce((a,x)=>a+((x.h+x.l+x.c)/3)*x.v,0)/volume:0;
+ const passed=rvol>=2.5&&b.c>vwap&&body>0&&range>0&&body/range>=0.6&&(b.h-b.c)<=body&&b.c>priorHigh&&range>=1.5*baseSize;
+ return {passed,price:b.c,rvol:Number(rvol.toFixed(2)),vwap:Number(vwap.toFixed(3)),volumeTL:Number((b.c*b.v).toFixed(2)),bar_timestamp:new Date(b.t*1000).toISOString()};
+};
+// KAP adapter intentionally fails closed until an official feed URL and supported schema are configured.
+const kapPreflight=async(env)=>{
+ if(!env.KAP_FEED_URL||!/^https:\/\/(?:www\.)?kap\.org\.tr\//i.test(env.KAP_FEED_URL))return {ready:false,reason:"OFFICIAL_KAP_URL_NOT_CONFIGURED"};
+ try{const r=await fetch(env.KAP_FEED_URL,{signal:AbortSignal.timeout(7000),headers:{Accept:"application/json, application/rss+xml, application/xml"}});if(!r.ok)return {ready:false,reason:"KAP_HTTP_"+r.status};const txt=await r.text();if(!txt||txt.length<40)return {ready:false,reason:"KAP_EMPTY"};return {ready:true,raw_length:txt.length,source:"kap.org.tr",verified_disclosures:false}}catch{return {ready:false,reason:"KAP_UNREACHABLE"}}
+};
 const hash=async s=>new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s)));
 export default {async fetch(request,env){
  const u=new URL(request.url);
@@ -221,11 +254,25 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
    const id=new Date(event.scheduledTime||Date.now()).toISOString();
    // Fail closed: no licensed or verified live BIST / KAP feed is configured.
    // Never manufacture bars, risk clearances, trading signals or paper fills.
-   const ready=Boolean(env.MARKET_DATA_URL&&env.KAP_FEED_URL&&env.MARKET_DATA_TOKEN);
-   const status=ready?"FEEDS_CONFIGURED_NOT_VALIDATED":"BLOCKED_MISSING_VERIFIED_FEED";
+   let status="BLOCKED_MISSING_VERIFIED_FEED",results=[],kap={ready:false};
+   if(phase==="INTRADAY_SCAN"){
+     const symbols=String(env.SCAN_SYMBOLS||"THYAO,ASELS,TUPRS").split(",").map(x=>x.trim().toUpperCase()).filter(x=>/^[A-Z0-9]{3,7}$/.test(x)).slice(0,12);
+     kap=await kapPreflight(env);
+     for(const symbol of symbols){
+       try{
+         const bars=await yahooOHLCV(symbol);
+         const m=technicalCandidate(bars);
+         if(!m||!m.passed||m.volumeTL<30000000)continue;
+         results.push({symbol,...m});
+         const tradeDay=new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
+         await env.DB.prepare("INSERT INTO watchlist_pool(trade_day,symbol,source,verified,created_at,strategy,metrics_json,radar_status,updated_at) VALUES(?,?,?,0,?,'SCALP',?,'RADAR_ONLY',?) ON CONFLICT(trade_day,symbol) DO UPDATE SET metrics_json=excluded.metrics_json,updated_at=excluded.updated_at,radar_status='RADAR_ONLY'").bind(tradeDay,symbol,"Yahoo Finance / delayed-unverified",new Date().toISOString(),JSON.stringify(m),new Date().toISOString()).run();
+       }catch(e){console.log("FEED_SKIP",symbol,String(e).slice(0,80))}
+     }
+     status=kap.ready?"TECHNICAL_RADAR_KAP_UNVERIFIED":"TECHNICAL_RADAR_KAP_BLOCKED";
+   }else status="BLOCKED_MISSING_VERIFIED_FEED";
    try{
     await env.DB.prepare("INSERT OR IGNORE INTO bist_scan_runs(run_id,phase,status,created_at,details) VALUES(?,?,?,?,?)")
-      .bind(id,phase,status,new Date().toISOString(),JSON.stringify({verified_market_data:false,verified_kap:false,signals_created:0,orders_sent:0})).run();
+      .bind(id,phase,status,new Date().toISOString(),JSON.stringify({market_data_source:"Yahoo unofficial",kap,technical_candidates:results.length,verified_market_data:false,verified_kap:false,signals_created:0,orders_sent:0})).run();
    }catch(e){console.error("scan log error",String(e).slice(0,100))}
  };
  ctx.waitUntil(task());
