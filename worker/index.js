@@ -75,14 +75,14 @@ export default {async fetch(request,env){
      return reply({symbol,status:"NEWS_REVIEW_PENDING",technical_score_only:true,reason},202,cors);
    };
    try{
-     const prompt="Turkce yaz. BIST sembolu "+symbol+" icin guncel sirket haberlerini ara. Google sonucu resmi KAP bildirimi degildir. Resmi KAP bildirim kimligi ve tarihi yoksa resmi teyit yapildigini iddia etme. Eski veya farkli sirket haberini yeni haber diye sunma. Kaynak yoksa DOGRULANAMADI yaz. Yatirim tavsiyesi ve emir verme. En fazla 1200 karakter.";
+     const prompt="Turkce yaz. Web arama kapali; guncel haberlere erisimin yok. BIST sembolu "+symbol+" icin mevcut bilgi sinirlarini belirt. Google sonucu resmi KAP bildirimi degildir. Resmi KAP bildirim kimligi ve tarihi yoksa resmi teyit yapildigini iddia etme. Eski veya farkli sirket haberini yeni haber diye sunma. Kaynak yoksa DOGRULANAMADI yaz. Yatirim tavsiyesi ve emir verme. En fazla 1200 karakter.";
      const url="https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent";
-     const r=await fetch(url,{method:"POST",headers:{"x-goog-api-key":env.GEMINI_API_KEY,"Content-Type":"application/json"},body:JSON.stringify({contents:[{role:"user",parts:[{text:prompt}]}],tools:[{google_search:{}}],generationConfig:{temperature:0.2,maxOutputTokens:600}}),signal:AbortSignal.timeout(15000)});
+     const r=await fetch(url,{method:"POST",headers:{"x-goog-api-key":env.GEMINI_API_KEY,"Content-Type":"application/json"},body:JSON.stringify({contents:[{role:"user",parts:[{text:prompt}]}],generationConfig:{temperature:0.2,maxOutputTokens:600}}),signal:AbortSignal.timeout(15000)});
      if(!r.ok){let detail="";try{const err=await r.json();detail=String(err.error?.message||err.error?.status||"").slice(0,180)}catch{}return await fail("GEMINI_HTTP_"+r.status+(detail?": "+detail:""));}
      const j=await r.json(),candidate=j.candidates?.[0]||{};
      const answer=(candidate.content?.parts||[]).map(p=>p.text||"").join("").slice(0,4000);
      const citations=(candidate.groundingMetadata?.groundingChunks||[]).filter(x=>x.web?.uri).slice(0,8).map(x=>({title:x.web.title||"",url:x.web.uri}));
-     const result={symbol,status:citations.length?"SEARCH_RESULT_UNVERIFIED":"NEWS_REVIEW_PENDING",answer,citations,officialKapVerified:false,technical_score_only:!citations.length,orders:false};
+     const result={symbol,status:"UNVERIFIED_AI_COMMENTARY",answer,citations:[],officialKapVerified:false,technical_score_only:true,grounding_enabled:false,orders:false};
      await db.prepare("UPDATE bist_research_cache SET status='DONE',response_json=? WHERE day=? AND symbol=? AND status='RESERVED'").bind(JSON.stringify(result),day,symbol).run();
      return reply(result,200,cors);
    }catch{return await fail("TIMEOUT_OR_PROVIDER_ERROR")}
