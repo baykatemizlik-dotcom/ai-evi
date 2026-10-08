@@ -55,6 +55,7 @@ export default {async fetch(req,env){
  const row=await env.DB.prepare("SELECT * FROM conversations WHERE id=?").bind(id).first();
  if(!row)return json({error:"Önce start gerekir"},404,cors);
  if(row.status==="DONE"||row.stage==="DONE")return json(history(row),200,cors);
+ if(row.status==="WAITING" && row.last_error && /HTTP (429|503)/.test(row.last_error))return json({error:"Gemini kotası/yük hatası. Otomatik tekrar kapalı; tekrar denemek için ayrı onaylı işlem gerekli.",...history(row)},429,cors);
  if(!["READY","WAITING"].includes(row.status))return json({error:"Aşama otomatik tekrar çalıştırılamaz; manuel kontrol gerekli.",...history(row)},409,cors);
  const stage=row.stage,isGPT=stage==="GPT_DRAFT"||stage==="GPT_REVISION";
  // Fail-closed atomic conditional budget reservation, shared across all conversations.
@@ -67,7 +68,11 @@ export default {async fetch(req,env){
  if(!claimed)return json({error:"Bu aşama zaten işlemde",...history(row)},409,cors);
  try{
   const value=isGPT?await openai(env,row,stage==="GPT_REVISION"):await gemini(env,row,stage==="GEMINI_FINAL");
-  const text=isGPT?value:JSON.stringify(value),destination=next[stage],done=destination==="DONE";
+  const text=isGPT?value:JSON.stringify(value);
+  // ECONOMY MODE: Agreement at first review finishes the conversation early.
+  // This avoids the second GPT and second Gemini requests altogether.
+  const earlyAgreement=stage==="GEMINI_REVIEW" && value.agree===true;
+  const destination=earlyAgreement?"DONE":next[stage],done=destination==="DONE";
   const result=done?(critical(row.question)?"NEEDS_BERKER":value.agree?"REVIEWED":"DISAGREE"):null;
   const field=fields[stage];if(!field)throw new Error("Bilinmeyen aşama");
   await env.DB.prepare("UPDATE conversations SET "+field+"=?,stage=?,status=?,result=?,last_error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='RUNNING' AND stage=?").bind(text,destination,done?"DONE":"READY",result,id,stage).run();
