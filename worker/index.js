@@ -99,7 +99,46 @@ const scanUniverse=async(env)=>{
 };
 const loadBridgeUniverse=async(env)=>{const r=await env.DB.prepare("SELECT symbol FROM bist_universe WHERE active=1 AND market IN ('YILDIZ','ANA') AND liquidity_tl>30000000 ORDER BY liquidity_tl DESC LIMIT 1000").all();return r.results.map(x=>x.symbol)};
 const bridgeBars=async(env,symbol,interval)=>{const r=await env.DB.prepare("SELECT bar_time,open,high,low,close,volume,received_at FROM bist_bridge_bars WHERE symbol=? AND interval=? ORDER BY bar_time DESC LIMIT 90").bind(symbol,interval).all();const rows=r.results.reverse();if(rows.length<30)throw Error("BRIDGE_INSUFFICIENT_BARS");const last=rows.at(-1);if(Date.now()-Date.parse(last.bar_time)>4*86400000||Date.now()-Date.parse(last.received_at)>4*86400000)throw Error("BRIDGE_STALE");return rows.map(x=>({t:Math.floor(Date.parse(x.bar_time)/1000),o:x.open,h:x.high,l:x.low,c:x.close,v:x.volume}))};
+// Optional licensed Twelve Data provider: ingest a bounded number per run, never invent OHLCV.
+const ingestTwelve=async(env,interval="1day",limit=4)=>{
+ if(!env.TWELVE_DATA_API_KEY)return {status:"NOT_CONFIGURED",fetched:0,errors:[]};
+ const q=await env.DB.prepare("SELECT symbol FROM bist_universe WHERE active=1 AND market IN ('YILDIZ','ANA') AND liquidity_tl>30000000 ORDER BY symbol LIMIT 1000").all();
+ const names=(q.results||[]).map(x=>x.symbol);
+ if(!names.length)return {status:"NO_VERIFIED_UNIVERSE",fetched:0,errors:[]};
+ // Rotate through the verified universe over time without exceeding bounded daily provider limits.
+ const day=new Date().toISOString().slice(0,10),cursor=await env.DB.prepare("SELECT value FROM bist_settings WHERE key=?").bind("TWELVE_CURSOR_"+interval).first();
+ const start=Math.max(0,Number(cursor?.value||0))%names.length;
+ const symbols=Array.from({length:Math.min(limit,names.length)},(_,i)=>names[(start+i)%names.length]);
+ let fetched=0;const errors=[];
+ for(const symbol of symbols){
+   try{
+     const url=new URL("https://api.twelvedata.com/time_series");
+     url.searchParams.set("symbol",symbol);url.searchParams.set("exchange","BIST");url.searchParams.set("interval",interval);url.searchParams.set("outputsize","65");url.searchParams.set("timezone","Europe/Istanbul");url.searchParams.set("format","JSON");
+     const resp=await fetch(url,{headers:{"Authorization":"apikey "+env.TWELVE_DATA_API_KEY},signal:AbortSignal.timeout(9000)});
+     if(resp.status===429){errors.push({symbol,error:"TWELVE_429"});break}
+     if(!resp.ok)throw Error("TWELVE_HTTP_"+resp.status);
+     const data=await resp.json();
+     if(data.status==="error")throw Error("TWELVE_"+String(data.code||data.message||"API_ERROR").slice(0,75));
+     if(!Array.isArray(data.values)||data.values.length<30)throw Error("TWELVE_INSUFFICIENT_BARS");
+     const entries=[];
+     for(const b of data.values){
+       const timestamp=Date.parse(b.datetime.replace(" ","T")+"+03:00");
+       const o=Number(b.open),h=Number(b.high),l=Number(b.low),c=Number(b.close),v=Number(b.volume);
+       if(!Number.isFinite(timestamp)||!Number.isFinite(o)||!Number.isFinite(h)||!Number.isFinite(l)||!Number.isFinite(c)||!Number.isFinite(v)||o<=0||l<=0||v<0||h<Math.max(o,c,l)||l>Math.min(o,c))continue;
+       // Exclude incomplete intraday candle; daily candle only after local market close.
+       const duration=interval==="15min"?900000:86400000;
+       if(interval==="15min"&&timestamp+duration>Date.now()-120000)continue;
+       if(interval==="1day"&&new Date(timestamp).toLocaleDateString("sv-SE",{timeZone:"Europe/Istanbul"})===new Date().toLocaleDateString("sv-SE",{timeZone:"Europe/Istanbul"})&&Number(new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/Istanbul",hour:"2-digit",hourCycle:"h23"}).format(new Date()))<19)continue;
+       entries.push(env.DB.prepare("INSERT OR IGNORE INTO bist_bridge_bars(symbol,interval,bar_time,open,high,low,close,volume,source,received_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(symbol,interval==="1day"?"1d":"15m",new Date(timestamp).toISOString(),o,h,l,c,v,"Twelve Data XIST / entitlement unverified",new Date().toISOString()));
+     }
+     if(entries.length){await env.DB.batch(entries);fetched++}
+   }catch(e){errors.push({symbol,error:String(e.message||e).slice(0,100)});if(String(e.message||e).includes("429")||String(e.message||e).includes("API credits"))break}
+ }
+ await env.DB.prepare("INSERT INTO bist_settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind("TWELVE_CURSOR_"+interval,String((start+fetched+errors.length)%names.length),new Date().toISOString()).run();
+ return {status:errors.length?"PARTIAL_OR_BLOCKED":"FETCH_DONE",requested:symbols.length,fetched,errors,day};
+};
 const nightRadar=async(env)=>{
+ const provider=await ingestTwelve(env,"1day",4);
  const names=await loadBridgeUniverse(env);
  const date=new Intl.DateTimeFormat("sv-SE",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
  const kap=await kapPreflight(env),candidates=[],errors=[];
@@ -121,7 +160,7 @@ const nightRadar=async(env)=>{
     .bind(date,c.symbol,"Bridge D1 daily / unverified",new Date().toISOString(),JSON.stringify(c),new Date().toISOString()).run();
  }
  const status=(!names.length||errors.some(x=>x.reason==="YAHOO_HTTP_429"))?"BLOCKED_MARKET_DATA_UNAVAILABLE":!kap.ready?"NIGHT_OHLCV_OK_KAP_BLOCKED":"NIGHT_OHLCV_OK_KAP_UNVERIFIED";
- const summary={status,scanned:Math.min(names.length,errors.length+candidates.length),universe_count:names.length,market_data_success:Math.max(0,Math.min(names.length,errors.length+candidates.length)-errors.length),candidates:candidates.slice(0,5),errors,kap,approved_signals:0};
+ const summary={status,provider,scanned:Math.min(names.length,errors.length+candidates.length),universe_count:names.length,market_data_success:Math.max(0,Math.min(names.length,errors.length+candidates.length)-errors.length),candidates:candidates.slice(0,5),errors,kap,approved_signals:0};
  await env.DB.prepare("INSERT OR REPLACE INTO bist_scan_runs(run_id,phase,status,created_at,details) VALUES(?,?,?,?,?)").bind("NIGHT:"+date,"NIGHT_WATCH",status,new Date().toISOString(),JSON.stringify(summary)).run();
  return summary;
 };
@@ -199,6 +238,10 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
   const cap=await env.DB.prepare("SELECT value FROM bist_settings WHERE key='TOTAL_CAPITAL'").first();
   const budget=Number(cap?.value||5000)/2;
   return reply({budget,market_price:price,...paperLotPlan(budget,price),note:"Simulation sizing only; actual orders and live price feeds are not connected."});
+ }
+ if(u.pathname==="/bist/provider/probe"&&request.method==="POST"){
+   if(!env.TWELVE_DATA_API_KEY)return reply({status:"NOT_CONFIGURED",required_secret:"TWELVE_DATA_API_KEY"},503);
+   try{return reply(await ingestTwelve(env,"1day",1))}catch(e){return reply({status:"PROVIDER_ERROR",detail:String(e.message||e).slice(0,120)},503)}
  }
  if(u.pathname==="/bist/bridge/status"&&request.method==="GET"){const [u,b]=await Promise.all([env.DB.prepare("SELECT COUNT(*) n FROM bist_universe WHERE active=1 AND liquidity_tl>30000000").first(),env.DB.prepare("SELECT COUNT(*) n,MAX(received_at) last_received FROM bist_bridge_bars").first()]);return reply({universe:u?.n||0,bars:b?.n||0,last_received:b?.last_received||null,ready:(u?.n||0)>0&&(b?.n||0)>0})}
  if(u.pathname==="/bist/bridge/import"&&request.method==="POST"){
@@ -336,6 +379,7 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
    let status="BLOCKED_MISSING_VERIFIED_FEED",results=[],kap={ready:false};
    if(phase==="NIGHT_WATCH"){await nightRadar(env);return}
    if(phase==="INTRADAY_SCAN"){
+     const provider=await ingestTwelve(env,"15min",4);
      const symbols=await loadBridgeUniverse(env);
      kap=await kapPreflight(env);
      for(const symbol of symbols){
@@ -352,7 +396,7 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
    }else status="BLOCKED_MISSING_VERIFIED_FEED";
    try{
     await env.DB.prepare("INSERT OR IGNORE INTO bist_scan_runs(run_id,phase,status,created_at,details) VALUES(?,?,?,?,?)")
-      .bind(id,phase,status,new Date().toISOString(),JSON.stringify({market_data_source:"Yahoo unofficial",kap,technical_candidates:results.length,verified_market_data:false,verified_kap:false,signals_created:0,orders_sent:0})).run();
+      .bind(id,phase,status,new Date().toISOString(),JSON.stringify({market_data_source:"D1 bridge / Twelve optional",provider,kap,technical_candidates:results.length,verified_market_data:false,verified_kap:false,signals_created:0,orders_sent:0})).run();
    }catch(e){console.error("scan log error",String(e).slice(0,100))}
  };
  ctx.waitUntil(task());
