@@ -318,7 +318,7 @@ export async function aiVerdict(env,candidate,risk,network=(...args)=>globalThis
  let stage='FETCH';const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),12000);
  try{
   const response=await network('https://api.openai.com/v1/chat/completions',{
-   method:'POST',redirect:'error',signal:controller.signal,
+   method:'POST',redirect:'manual',signal:controller.signal,
    headers:{Authorization:'Bearer '+apiKey,'Content-Type':'application/json'},
    body:JSON.stringify({model:AI_MODEL,temperature:0,max_completion_tokens:200,
     messages:[{role:'system',content:'Sanal BIST scalp teknik tetik hakemisin. Sadece verilen doğrulanmış sayısal veriyi değerlendir. RVOL>=2, yeşil mum, gövde>=0.60, üst fitil<=0.20, 20-bar breakout ve seans VWAP üstü kapanış gereklidir. Resmi VBTS/tedbir listesi güncel ve uygun değilse onay verme. Haber/ceza/mutlak manipülasyon yokluğu için dış araştırma yapılmadı; bunu uydurma, kesin güvence verme. OHLCV wash trade kanıtı değildir. Veriler tutarsız/eksikse veya teknik kırılım zayıfsa onay=false. Diğer durumda teknik sanal takip için onay verebilirsin. Kısa Türkçe neden ve 0-100 arasında guven skoru yaz. Guven bir model değerlendirmesidir, kalibre edilmiş başarı olasılığı değildir. Gerçek emir verme, gelecekteki bar hakkında tahmin uydurma.'},
@@ -342,7 +342,7 @@ export async function judgeCandidate(env,c,now,network) {
  const key=c.symbol+':'+c.bar_time,wallStart=Date.now();
  const claimed=await env.DB.prepare("INSERT OR IGNORE INTO bist_ai_decisions(signal_key,run_id,symbol,bar_time,model,status,reason,created_at) VALUES(?,?,?,?,?,'PENDING','AWAITING_VERDICT',?)")
   .bind(key,c.run_id,c.symbol,c.bar_time,AI_MODEL,new Date(now).toISOString()).run();
- const retry=claimed.meta.changes?null:await env.DB.prepare("UPDATE bist_ai_decisions SET status='PENDING',reason='RETRY_AFTER_FETCH_FIX',attempts=attempts+1 WHERE signal_key=? AND status='ERROR' AND reason IN('OPENAI_NETWORK_OR_INVALID_RESPONSE','OPENAI_FETCH_TYPE_ERROR') AND attempts<3 RETURNING signal_key").bind(key).first();
+ const retry=claimed.meta.changes?null:await env.DB.prepare("UPDATE bist_ai_decisions SET status='PENDING',reason='RETRY_AFTER_FETCH_FIX',attempts=attempts+1 WHERE signal_key=? AND status='ERROR' AND (reason='OPENAI_NETWORK_OR_INVALID_RESPONSE' OR reason LIKE 'OPENAI_FETCH_TYPE_ERROR%') AND attempts<4 RETURNING signal_key").bind(key).first();
  if(claimed.meta.changes||retry){
   let status='ERROR',reason='AI_UNAVAILABLE',input=0,output=0,confidence=null;
   try{

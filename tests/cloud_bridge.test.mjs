@@ -133,11 +133,12 @@ test('AI uses strict schema, fixed endpoint, no redirects and fails closed on ma
  const rows=Array.from({length:20},()=>({...bar,open:99,high:100,low:98,close:99,volume:100}));
  const c={symbol:'TUPRS',bar_time:bar.time,metrics_json:JSON.stringify(technicalSignal([...rows,{...bar,open:100,high:104,low:100,close:103.5,volume:200}]))};
  const risk={eligible:1,source:'official',as_of:bar.time,valid_until:'2026-10-09T21:00:00Z'};
- const mock=async(url,opts)=>{assert.equal(url,'https://api.openai.com/v1/chat/completions');assert.equal(opts.redirect,'error');const b=JSON.parse(opts.body);assert.equal(b.model,'gpt-4o-mini');assert.equal(b.response_format.json_schema.strict,true);assert.equal(b.max_completion_tokens,200);return new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:'{"onay":false,"neden":"Kırılım zayıf.","guven":20}'}}]}));};
+ const mock=async(url,opts)=>{assert.equal(url,'https://api.openai.com/v1/chat/completions');assert.equal(opts.redirect,'manual');const b=JSON.parse(opts.body);assert.equal(b.model,'gpt-4o-mini');assert.equal(b.response_format.json_schema.strict,true);assert.equal(b.max_completion_tokens,200);return new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:'{"onay":false,"neden":"Kırılım zayıf.","guven":20}'}}]}));};
  assert.equal((await aiVerdict({OPENAI_API_KEY:'unit-test-only'},c,risk,mock)).onay,false);
  await assert.rejects(aiVerdict({},c,risk,mock),/OPENAI_KEY_MISSING/);
  await assert.rejects(aiVerdict({OPENAI_API_KEY:'unit-test-only'},c,risk,async()=>new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:'{"onay":"true","neden":"bad"}'}}]}))),/OPENAI_BAD_VERDICT/);
  await assert.rejects(aiVerdict({OPENAI_API_KEY:'unit-test-only'},c,risk,async()=>new Response('error',{status:429})),/OPENAI_HTTP_429/);
+ await assert.rejects(aiVerdict({OPENAI_API_KEY:'unit-test-only'},c,risk,async()=>new Response('',{status:302,headers:{Location:'https://example.test'}})),/OPENAI_HTTP_302/);
 });
 test('entire six-candidate pool reviewed; rejections excluded and retries never call AI again',async()=>{
  const {mkdtempSync,rmSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');const {execFileSync}=await import('node:child_process');

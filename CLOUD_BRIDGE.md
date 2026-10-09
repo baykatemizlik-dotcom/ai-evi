@@ -156,7 +156,7 @@ and balances are never reset.
 Mini output confidence is a model score, not a calibrated win probability.
 The network call uses a bound global fetch wrapper; new failure codes distinguish
 fetch, body reading, parsing, timeout and HTTP errors without exposing API keys.
-Old generic network-error decisions are eligible for one retry after this fix;
+Only known preflight fetch/redirect errors are eligible for a bounded repair retry (four attempts maximum);
 approved/rejected decisions stay cached.
 
 ## External Gemini audit
@@ -173,3 +173,5 @@ Optional variable GEMINI_MODEL defaults to gemini-3.8-flash. No search tools.
 The Demo panel's Karneyi kopyala button copies current trades, AI token usage,
 account cash, standby counts and the latest external audit for sharing with
 Gemini manually. End-of-session reports are also persisted automatically in D1.
+
+Live root cause: Workers rejects redirect=error. OpenAI requests now use redirect=manual; every non-2xx, including 3xx, is rejected without forwarding credentials.

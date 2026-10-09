@@ -22,6 +22,8 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 -m pip install --disable-pip-version-check -r bridge/requirements.txt
+      - name: Allow Worker rollout to settle
+        run: sleep 20
       - name: Verify actual OpenAI reply without creating orders
         env:
           BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
