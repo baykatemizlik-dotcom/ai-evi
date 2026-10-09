@@ -1,4 +1,4 @@
-name: BIST Mini Connection Check
+name: BIST AI Connection Check
 on:
   workflow_dispatch:
   push:
@@ -29,3 +29,43 @@ jobs:
           BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
           BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
         run: python3 bridge/bist_sync.py --probe
+
+      - name: Discover accessible Gemini models and verify strict JSON
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          PYTHONPATH=bridge python3 - <<'PY'
+          import json, os, sys
+          from google import genai
+          import bist_sync
+          key = os.environ.get("GEMINI_API_KEY", "").strip()
+          if not key:
+              print("GEMINI_KEY_MISSING")
+              sys.exit(1)
+          try:
+              with genai.Client(api_key=key, http_options={"timeout": 20000}) as client:
+                  names = sorted(m.name.removeprefix("models/") for m in client.models.list()
+                      if "generateContent" in (m.supported_actions or []))
+              print("GEMINI_AVAILABLE_MODELS", json.dumps(names))
+          except Exception as exc:
+              code = getattr(exc, "code", None)
+              print("GEMINI_LIST_ERROR", code if isinstance(code, int) else type(exc).__name__)
+              sys.exit(1)
+          selected = None
+          for model in ("gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash"):
+              if model not in names:
+                  print("GEMINI_MODEL_UNAVAILABLE", model)
+                  continue
+              bist_sync.GEMINI_MODEL = model
+              verdict, status = bist_sync.evaluate_with_gemini("PROBE", {"purpose": "PROBE"})
+              print("GEMINI_JSON_PROBE", model, status, json.dumps(verdict, ensure_ascii=False))
+              if status != "ERROR" and verdict["approved"] is False:
+                  selected = model
+                  break
+          if not selected:
+              print("GEMINI_NO_VERIFIED_MODEL")
+              sys.exit(1)
+          print("GEMINI_VERIFIED_MODEL", selected)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("Gemini strict JSON probe passed: " + selected + ". No orders or D1 writes.\n")
+          PY
