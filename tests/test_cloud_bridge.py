@@ -47,7 +47,7 @@ class Funnel(unittest.TestCase):
                 model.generate_content.return_value=SimpleNamespace(text=output)
                 verdict,actual=sender.evaluate_with_gemini('TUPRS',{})
                 self.assertEqual(actual,status)
-            self.assertEqual(model.generate_content.call_args.kwargs['model'],'gemini-2.5-flash')
+            self.assertEqual(model.generate_content.call_args.kwargs['model'],'gemini-3.1-flash-lite')
     def candles(self,symbol,last):
         history=[dict(symbol=symbol,interval='15m',time=f'2026-10-08T{10+i//4:02d}:{i%4*15:02d}:00.000Z',open=99,high=100,low=98,close=99,volume=1000000) for i in range(20)]
         return history+[dict(symbol=symbol,interval='15m',time='2026-10-09T07:00:00.000Z',**last)]

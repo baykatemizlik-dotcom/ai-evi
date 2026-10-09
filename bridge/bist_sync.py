@@ -22,7 +22,7 @@ import numpy as np
 UTC = dt.timezone.utc
 TRT = ZoneInfo('Europe/Istanbul')
 MIN_DAILY_TURNOVER_TL = 40_000_000
-GEMINI_MODEL = 'gemini-2.5-flash'
+GEMINI_MODEL = 'gemini-3.1-flash-lite'
 MAX_BYTES = 2_000_000
 
 class FeedError(Exception):
@@ -177,7 +177,7 @@ def evaluate_with_gemini(symbol, metrics):
 def review_gemini(run_id, symbol=None, bar_time=None):
     query={'purpose':'PROBE'} if symbol is None else {'run_id':run_id,'symbol':symbol,'bar_time':bar_time}
     state=worker_call('/bist/feed/gemini?'+urllib.parse.urlencode(query))
-    if state.get('cached',{} ) and state['cached']['status']!='ERROR':
+    if state.get('cached',{} ) and state['cached']['status']!='ERROR' and state['cached'].get('model')==GEMINI_MODEL:
         return state['cached']['status']
     verdict,status=evaluate_with_gemini(symbol or 'PROBE',state.get('candidate') or {'purpose':'PROBE'})
     worker_call('/bist/feed/gemini',{**query,'model':GEMINI_MODEL,'status':status,'verdict':verdict})

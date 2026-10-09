@@ -32,7 +32,7 @@ test('two engines: best standby takes one Sniper slot; replacement waits until e
   await riskIngest(req({symbols:['TUPRS','ASELS'],eligible_symbols:['TUPRS','ASELS'],risk_status:'VERIFIED_OFFICIAL_RESTRICTIONS',risk:{source:'https://www.borsaistanbul.com/erd/menkul_tedbir_listesi.csv',as_of:'2026-10-09T07:00:00Z',valid_until:'2026-10-09T21:00:00Z'}}),env,now);
   for(const [symbol,close] of [['TUPRS',103.5],['ASELS',103.2]]){
    const old=Array.from({length:20},(_,i)=>candle(new Date(Date.parse('2026-10-08T07:00:00Z')+i*900000).toISOString(),99,100,98,99,1000000));
-   histories[symbol]=[...old,candle('2026-10-09T07:00:00Z',100,104,100,close,2000000)];const hot=await (await ingest(req(envelope(symbol,histories[symbol],'HOT_CANDIDATE')),env,now)).json();await geminiDecision(req({run_id:'sniper',symbol,bar_time:hot.bar_time,model:'gemini-2.5-flash',status:'APPROVED',verdict:{approved:true,confidence:85,reason:'OK'}}),env,now);
+   histories[symbol]=[...old,candle('2026-10-09T07:00:00Z',100,104,100,close,2000000)];const hot=await (await ingest(req(envelope(symbol,histories[symbol],'HOT_CANDIDATE')),env,now)).json();await geminiDecision(req({run_id:'sniper',symbol,bar_time:hot.bar_time,model:'gemini-3.1-flash-lite',status:'APPROVED',verdict:{approved:true,confidence:85,reason:'OK'}}),env,now);
   }
   const selection=await (await finalize(req({run_id:'sniper'}),env,now+60000,ai)).json();assert.equal(selection.selected.length,2);
   histories.TUPRS.push(candle('2026-10-09T07:45:00Z',103.4,106.5,103,106));

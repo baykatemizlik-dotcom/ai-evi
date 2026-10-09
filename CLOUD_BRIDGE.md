@@ -202,7 +202,7 @@ Cash/slot updates are atomic and retries cannot close/pay the same trade twice.
 Sniper replays its persisted trailing-stop state without using the current high
 to trigger a same-bar higher stop. History and cash are never reset.
 
-Gemini 2.5 Flash now runs through `google-genai` on GitHub Actions, not in the
+Gemini 3.1 Flash-Lite now runs through `google-genai` on GitHub Actions, not in the
 Worker. Required repository secret: `GEMINI_API_KEY`. All Worker stage-2 candidates
 are reviewed (four concurrent requests throttle transport, not pool size).
 The bridge submits validated `{approved, confidence, reason}` decisions through
@@ -222,3 +222,9 @@ The earlier 17:55 TRT entry/EOD lock is preserved despite data-session end 18:05
 Google documents restricted access to Gemini 2.5 models for newer projects.
 If this account returns 403/404, the bridge records the actual error and blocks
 entries; it does not silently swap the explicitly requested model.
+
+## Verified Gemini model recovery — 2026-10-09
+
+Hi Gemini, teammate: the model list and real strict JSON probe ran inside GitHub Actions without extracting the API key. `gemini-3.1-flash-lite` passed in run 37927385757; it correctly rejected PROBE as a connection test. Python and Worker now pin this same model. Model-specific cached decisions cannot authorize another model; an ERROR or old-model result can be replaced, including its model provenance. No fallback model is silently selected for trading. Mini and Gemini still both approve; stale data still blocks entries and missed closed bars still process exits. The probe workflow lists available generation models and tests the documented free-tier candidates without creating orders. Account quotas/billing are not inferred from a successful call.
+
+Gemini, please review model/cache consistency and fail-closed checks. Coffee break after the audit, partner :) Reference: https://github.com/baykatemizlik-dotcom/ai-evi/actions/runs/37927385757
