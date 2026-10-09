@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
 
 from bist_universe import load_universe, partition, restrict_universe
@@ -19,6 +20,9 @@ import pandas as pd
 import numpy as np
 
 UTC = dt.timezone.utc
+TRT = ZoneInfo('Europe/Istanbul')
+MIN_DAILY_TURNOVER_TL = 40_000_000
+GEMINI_MODEL = 'gemini-2.5-flash'
 MAX_BYTES = 2_000_000
 
 class FeedError(Exception):
@@ -80,6 +84,7 @@ def yahoo(symbol, now):
     x = result[0]
     meta=x.get('meta',{})
     if meta.get('instrumentType')!='EQUITY':raise FeedError('YAHOO_NOT_EQUITY')
+    if meta.get('currency')!='TRY':raise FeedError('YAHOO_CURRENCY_NOT_TRY')
     provider_time=meta.get('regularMarketTime')
     if not isinstance(provider_time,(int,float)) or not math.isfinite(provider_time):
         raise FeedError('YAHOO_PROVIDER_CLOCK_UNAVAILABLE')
@@ -126,10 +131,58 @@ def stage_one(all_bars, eligible_symbols):
     df['rvol']=np.divide(df['volume'],prior.where(prior>0))
     df['body']=np.abs(df['close']-df['open'])/spread
     df['upper_wick']=(df['high']-df['close'])/spread
+    local=pd.to_datetime(df['time'],utc=True).dt.tz_convert(TRT)
+    minute=local.dt.hour*60+local.dt.minute
+    df['session_date']=local.dt.strftime('%Y-%m-%d')
+    df['turnover']=(df['close']*df['volume']).where((minute>=600)&(minute<1085),0)
+    df['daily_turnover_tl_estimate']=df.groupby(['symbol','session_date'])['turnover'].cumsum()
     latest=df.groupby('symbol',sort=False).tail(1)
     mask=((latest.rvol>=2.0)&(latest.close>latest.open)&(latest.body>=.60)&
-          (latest.upper_wick<=.20)&latest.symbol.isin(eligible_symbols))
+          (latest.upper_wick<=.20)&(latest.daily_turnover_tl_estimate>=MIN_DAILY_TURNOVER_TL)&latest.symbol.isin(eligible_symbols))
     return latest.loc[mask].copy()
+
+
+def evaluate_with_gemini(symbol, metrics):
+    """Structured, fail-closed numeric review; never prints SDK exceptions/keys."""
+    key=os.environ.get('GEMINI_API_KEY','').strip()
+    if not key:
+        return {'approved':False,'confidence':0,'reason':'GEMINI_KEY_MISSING'},'ERROR'
+    try:
+        from google import genai
+        schema={'type':'object','properties':{'approved':{'type':'boolean'},
+                'confidence':{'type':'integer','minimum':0,'maximum':100},'reason':{'type':'string'}},
+                'required':['approved','confidence','reason'],'additionalProperties':False}
+        with genai.Client(api_key=key,http_options={'timeout':20000}) as client:
+            res=client.models.generate_content(model=GEMINI_MODEL,
+                contents='Sanal BIST teknik hakemisin. Sadece verilen verileri değerlendir. '+
+                'RVOL>=2, yeşil mum, gövde>=0.60, üst fitil<=0.20, seans VWAP üstü, 20 bar kırılımı ve '+
+                'kapanmış seans barlarından tahmini hacim>=40000000 TL gereklidir. Resmi VBTS uygun olmalı. '+
+                'Eksik/tutarsız veride reddet. Haber veya wash trade yokluğu uydurma; dış arama yapma. '+
+                'Güven başarı olasılığı değildir. PROBE yalnız bağlantı testidir, işlem onayı değildir. '+
+                json.dumps({'symbol':symbol,'data':metrics},ensure_ascii=False,allow_nan=False),
+                config={'response_mime_type':'application/json','response_json_schema':schema,
+                        'temperature':0,'max_output_tokens':1024,'thinking_config':{'thinking_budget':0}})
+        verdict=json.loads(res.text)
+        if set(verdict)!= {'approved','confidence','reason'} or type(verdict['approved']) is not bool or \
+            type(verdict['confidence']) is not int or not 0<=verdict['confidence']<=100 or \
+            not isinstance(verdict['reason'],str) or not verdict['reason'].strip() or len(verdict['reason'])>1000:
+            raise ValueError('INVALID_GEMINI_JSON')
+        return verdict,'APPROVED' if verdict['approved'] else 'REJECTED'
+    except Exception as exc:
+        code=getattr(exc,'code',None)
+        safe_code=str(code) if isinstance(code,int) else type(exc).__name__
+        return {'approved':False,'confidence':0,'reason':'GEMINI_ERROR_'+safe_code},'ERROR'
+
+
+def review_gemini(run_id, symbol=None, bar_time=None):
+    query={'purpose':'PROBE'} if symbol is None else {'run_id':run_id,'symbol':symbol,'bar_time':bar_time}
+    state=worker_call('/bist/feed/gemini?'+urllib.parse.urlencode(query))
+    if state.get('cached',{} ) and state['cached']['status']!='ERROR':
+        return state['cached']['status']
+    verdict,status=evaluate_with_gemini(symbol or 'PROBE',state.get('candidate') or {'purpose':'PROBE'})
+    worker_call('/bist/feed/gemini',{**query,'model':GEMINI_MODEL,'status':status,'verdict':verdict})
+    print('GEMINI',symbol or 'PROBE',status,verdict['reason'] if status=='ERROR' else '')
+    return status
 
 
 def worker_config():
@@ -161,6 +214,7 @@ def main():
         with open(output, 'a') as stream:
             stream.write('universe=' + json.dumps(universe, separators=(',', ':')) + '\n')
         print('MINI_PROBE',worker_call('/bist/feed/probe',{}))
+        review_gemini('PROBE')
         print('UNIVERSE symbols=',len(universe['symbols']),'eligible=',len(universe['eligible_symbols']),'risk=',universe['risk_status'])
         return 0
     run_id=os.environ.get('BIST_RUN_ID') or dt.datetime.now(UTC).strftime('%Y%m%dT%H%M')
@@ -179,7 +233,7 @@ def main():
     print(f'SCOPE total={len(all_symbols)} eligible={len(eligible)} shard={shard}/{shards} assigned={len(symbols)}')
     worker_config()
     now=time.time(); local=dt.datetime.fromtimestamp(now,ZoneInfo('Europe/Istanbul'))
-    if os.environ.get('GITHUB_EVENT_NAME')=='schedule' and (local.weekday()>=5 or not 600<=local.hour*60+local.minute<=1100):
+    if os.environ.get('GITHUB_EVENT_NAME')=='schedule' and (local.weekday()>=5 or not 600<=local.hour*60+local.minute<=1085):
         print('SKIPPED_OUTSIDE_SESSION');return 0
     key = os.environ.get('TWELVE_DATA_API_KEY', '')
     fallback_count = 0
@@ -202,12 +256,20 @@ def main():
         time.sleep(3)
     hot=stage_one([b for x in fetched.values() if x['feed_type']=='INDICATIVE_INTRADAY' for b in x['bars']],eligible)
     hot_symbols=set(hot.symbol) if not hot.empty else set()
-    posted=0
+    posted=0;gemini_candidates=[]
     for symbol in sorted(hot_symbols):
         try:
             result=worker_call('/bist/feed/ingest',{**fetched[symbol],'run_id':run_id,'purpose':'HOT_CANDIDATE'})
             posted+=1;print(symbol,'stage2=',result.get('stage2'),'engine=',result.get('engine'))
+            if result.get('stage2')=='MOMENTUM_PASSED':
+                gemini_candidates.append((symbol,result['bar_time']))
         except FeedError as exc:errors+=1;print(symbol,str(exc))
+    # Four simultaneous requests throttle transport; the entire pool is reviewed, with no count cap.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures={pool.submit(review_gemini,run_id,symbol,bar_time):symbol for symbol,bar_time in gemini_candidates}
+        for future in as_completed(futures):
+            try:future.result()
+            except FeedError as exc:errors+=1;print(futures[future],str(exc))
     latest=max((x['bars'][-1]['time'] for x in fetched.values() if x['feed_type']=='INDICATIVE_INTRADAY'),default=None)
     report={'run_id':run_id,'shard':shard,'universe_total':len(all_symbols),'eligible_total':len(eligible),
             'assigned':len(symbols),'fetched':len(fetched),'hot':len(hot_symbols),'posted':posted,'errors':errors,'last_bar_time':latest}

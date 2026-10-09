@@ -21,23 +21,44 @@ class Bars(unittest.TestCase):
         self.assertIsNone(sender.normalize('TUPRS', 1435, [10,11,9,10,100], 3000))
         self.assertIsNotNone(sender.normalize('TUPRS', 900, [10,11,9,10,100], 1800))
     def test_yahoo_null_bar_not_sent(self):
-        data={'chart':{'result':[{'meta':{'instrumentType':'EQUITY','regularMarketTime':2000},'timestamp':[900,1800], 'indicators':{'quote':[
+        data={'chart':{'result':[{'meta':{'instrumentType':'EQUITY','currency':'TRY','regularMarketTime':2000},'timestamp':[900,1800], 'indicators':{'quote':[
             {'open':[10,None],'high':[11,11],'low':[9,9],'close':[10,10],'volume':[100,100]}]}}]}}
         with patch.object(sender,'request_json',return_value=data):
             self.assertEqual(len(sender.yahoo('TUPRS',2000)),1)
 
 class Funnel(unittest.TestCase):
+    def test_daily_turnover_uses_only_current_session_and_40m_boundary(self):
+        good=dict(open=100,high=104,low=100,close=103.5,volume=400000)
+        bars=self.candles('TUPRS',good)
+        for b in bars[:-1]:b['volume']=100000
+        self.assertEqual(list(sender.stage_one(bars,{'TUPRS'}).symbol),['TUPRS'])
+        bars[-1]['volume']=300000
+        self.assertTrue(sender.stage_one(bars,{'TUPRS'}).empty)
+        # Prior day's large volume may establish RVOL, but cannot satisfy today's turnover.
+        self.assertGreater(sum(b['close']*b['volume'] for b in bars[:-1]),40_000_000)
+    def test_gemini_missing_key_and_invalid_json_fail_closed(self):
+        from types import SimpleNamespace
+        from google import genai
+        with patch.dict(sender.os.environ,{'GEMINI_API_KEY':''}):
+            self.assertEqual(sender.evaluate_with_gemini('TUPRS',{})[1],'ERROR')
+        with patch.dict(sender.os.environ,{'GEMINI_API_KEY':'fake-test-key'}),patch.object(genai,'Client') as client:
+            model=client.return_value.__enter__.return_value.models
+            for output,status in [('bad','ERROR'),('{"approved":"true","confidence":85,"reason":"x"}','ERROR'),('{"approved":true,"confidence":85,"reason":"x"}','APPROVED')]:
+                model.generate_content.return_value=SimpleNamespace(text=output)
+                verdict,actual=sender.evaluate_with_gemini('TUPRS',{})
+                self.assertEqual(actual,status)
+            self.assertEqual(model.generate_content.call_args.kwargs['model'],'gemini-2.5-flash')
     def candles(self,symbol,last):
-        history=[dict(symbol=symbol,interval='15m',time=f'2026-10-08T{10+i//4:02d}:{i%4*15:02d}:00.000Z',open=99,high=100,low=98,close=99,volume=100) for i in range(20)]
+        history=[dict(symbol=symbol,interval='15m',time=f'2026-10-08T{10+i//4:02d}:{i%4*15:02d}:00.000Z',open=99,high=100,low=98,close=99,volume=1000000) for i in range(20)]
         return history+[dict(symbol=symbol,interval='15m',time='2026-10-09T07:00:00.000Z',**last)]
     def test_vectorized_all_conditions_and_risk_exclusion(self):
-        good=dict(open=100,high=104,low=100,close=103.5,volume=200)
+        good=dict(open=100,high=104,low=100,close=103.5,volume=2000000)
         bars=self.candles('TUPRS',good)+self.candles('ASELS',{**good,'close':100.1})+self.candles('THYAO',{**good,'high':110})+self.candles('EREGL',good)
         hot=sender.stage_one(bars,{'TUPRS','ASELS','THYAO'})
         self.assertEqual(list(hot.symbol),['TUPRS'])
         self.assertEqual(hot.iloc[0].rvol,2)
     def test_delayed_provider_clock_rejects_in_progress_aligned_candle(self):
-        data={'chart':{'result':[{'meta':{'instrumentType':'EQUITY','regularMarketTime':2000},
+        data={'chart':{'result':[{'meta':{'instrumentType':'EQUITY','currency':'TRY','regularMarketTime':2000},
          'timestamp':[900,1800], 'indicators':{'quote':[{'open':[10,10],'high':[11,11],'low':[9,9],'close':[10,10],'volume':[100,100]}]}}]}}
         with patch.object(sender,'request_json',return_value=data):
             rows=sender.yahoo('TUPRS',4000)

@@ -13,6 +13,8 @@ on:
       - bridge/requirements.txt
       - worker/cloud_bridge.mjs
       - worker/index.js
+env:
+  TZ: Europe/Istanbul
 permissions:
   contents: read
 concurrency:
@@ -39,6 +41,7 @@ jobs:
         env:
           BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
           BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python3 bridge/bist_sync.py --prepare
   sync:
     needs: prepare
@@ -59,6 +62,7 @@ jobs:
         env:
           BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
           BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           BIST_UNIVERSE_JSON: ${{ needs.prepare.outputs.universe }}
@@ -82,5 +86,6 @@ jobs:
         env:
           BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
           BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           BIST_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: python3 bridge/bist_sync.py --finalize

@@ -1,8 +1,8 @@
 import test from 'node:test';import assert from 'node:assert/strict';
 import {mkdtempSync,rmSync,readFileSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';import {execFileSync} from 'node:child_process';
-import {sniperAdvance,initialSniperState,sniperEntryPlan,entryWindow,ingest,riskIngest,finalize,enforceSessionClose,monitorSymbols,refreshStandby} from '../worker/cloud_bridge.mjs';
+import {sniperAdvance,initialSniperState,sniperEntryPlan,entryWindow,ingest,riskIngest,finalize,enforceSessionClose,monitorSymbols,refreshStandby,geminiDecision} from '../worker/cloud_bridge.mjs';
 const trade={executed_price:100.2,lot_count:24,commission:4.8096,entry_time:'2026-10-09T07:45:00.000Z'};
-const candle=(time,o,h,l,c,v=300)=>({symbol:'TUPRS',interval:'15m',time,bar_time:time,open:o,high:h,low:l,close:c,volume:v});
+const candle=(time,o,h,l,c,v=3000000)=>({symbol:'TUPRS',interval:'15m',time,bar_time:time,open:o,high:h,low:l,close:c,volume:v});
 test('Sniper uses whole own cash, net2% base stop and adverse gap',()=>{
  const p=sniperEntryPlan(2500,100);assert.equal(p.qty,24);assert.ok(p.executed*p.qty+p.commission<=2500);
  const s=initialSniperState(trade),stop=sniperAdvance(trade,s,[candle(trade.entry_time,100,110,90,101)]).exit;
@@ -31,8 +31,8 @@ test('two engines: best standby takes one Sniper slot; replacement waits until e
  try{
   await riskIngest(req({symbols:['TUPRS','ASELS'],eligible_symbols:['TUPRS','ASELS'],risk_status:'VERIFIED_OFFICIAL_RESTRICTIONS',risk:{source:'https://www.borsaistanbul.com/erd/menkul_tedbir_listesi.csv',as_of:'2026-10-09T07:00:00Z',valid_until:'2026-10-09T21:00:00Z'}}),env,now);
   for(const [symbol,close] of [['TUPRS',103.5],['ASELS',103.2]]){
-   const old=Array.from({length:20},(_,i)=>candle(new Date(Date.parse('2026-10-08T07:00:00Z')+i*900000).toISOString(),99,100,98,99,100));
-   histories[symbol]=[...old,candle('2026-10-09T07:00:00Z',100,104,100,close,200)];await ingest(req(envelope(symbol,histories[symbol],'HOT_CANDIDATE')),env,now);
+   const old=Array.from({length:20},(_,i)=>candle(new Date(Date.parse('2026-10-08T07:00:00Z')+i*900000).toISOString(),99,100,98,99,1000000));
+   histories[symbol]=[...old,candle('2026-10-09T07:00:00Z',100,104,100,close,2000000)];const hot=await (await ingest(req(envelope(symbol,histories[symbol],'HOT_CANDIDATE')),env,now)).json();await geminiDecision(req({run_id:'sniper',symbol,bar_time:hot.bar_time,model:'gemini-2.5-flash',status:'APPROVED',verdict:{approved:true,confidence:85,reason:'OK'}}),env,now);
   }
   const selection=await (await finalize(req({run_id:'sniper'}),env,now+60000,ai)).json();assert.equal(selection.selected.length,2);
   histories.TUPRS.push(candle('2026-10-09T07:45:00Z',103.4,106.5,103,106));
@@ -43,7 +43,7 @@ test('two engines: best standby takes one Sniper slot; replacement waits until e
   histories.TUPRS.push(candle('2026-10-09T08:00:00Z',107,115,90,106));await ingest(req(envelope('TUPRS',histories.TUPRS)),env,Date.parse('2026-10-09T08:31:00Z'));
   assert.equal((await db.prepare("SELECT COUNT(*) n FROM virtual_trades WHERE strategy='SWING' AND status='OPEN'").first()).n,0);
   // An already stored old open must never become the replacement's entry.
-  histories.ASELS.push(candle('2026-10-09T07:45:00Z',103,106.5,103,106),candle('2026-10-09T08:00:00Z',106,108.5,106,108,400));await ingest(req(envelope('ASELS',histories.ASELS)),env,Date.parse('2026-10-09T08:31:00Z'));
+  histories.ASELS.push(candle('2026-10-09T07:45:00Z',103,106.5,103,106),candle('2026-10-09T08:00:00Z',106,108.5,106,108,4000000));await ingest(req(envelope('ASELS',histories.ASELS)),env,Date.parse('2026-10-09T08:31:00Z'));
   assert.equal((await db.prepare("SELECT COUNT(*) n FROM virtual_trades WHERE strategy='SWING' AND status='OPEN'").first()).n,0);
   histories.ASELS.push(candle('2026-10-09T08:45:00Z',106,107,105.8,106.8));await ingest(req(envelope('ASELS',histories.ASELS)),env,Date.parse('2026-10-09T09:16:00Z'));
   active=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SWING' AND status='OPEN'").first();assert.ok(active);assert.equal(active.symbol,'ASELS');assert.equal(active.entry_time,'2026-10-09T08:45:00.000Z');

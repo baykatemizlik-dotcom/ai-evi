@@ -1,12 +1,16 @@
 // Market data is ingress-only. The only outbound request is the OpenAI paper referee.
 const validSymbol = symbol => typeof symbol==='string' && /^[A-Z0-9]{3,6}$/.test(symbol);
 const FRESH_MS = 35 * 60000;
+const MIN_DAILY_TURNOVER_TL = 40_000_000;
+const GEMINI_MODEL = 'gemini-2.5-flash';
+const TRT = new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Istanbul',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',weekday:'short',hourCycle:'h23'});
+function trtParts(now){return Object.fromEntries(TRT.formatToParts(new Date(now)).map(x=>[x.type,x.value]));}
 const json = (body, status=200) => new Response(JSON.stringify(body), {
  status, headers: {'Content-Type':'application/json','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}
 });
 function sessionOpen(now) {
- const d = new Date(now+3*3600000), minutes = d.getUTCHours()*60+d.getUTCMinutes();
- return d.getUTCDay()>0 && d.getUTCDay()<6 && minutes>=600 && minutes<=1095;
+ const p=trtParts(now),minutes=Number(p.hour)*60+Number(p.minute);
+ return !['Sat','Sun'].includes(p.weekday) && minutes>=600 && minutes<=1085; // 18:05 TRT
 }
 function fresh(row, now) {
  const end = Date.parse(row.bar_time || row.time)+900000;
@@ -41,15 +45,15 @@ function entryPlan(cash, price) {
 function exitPlan(trade, bars) {
  const cost=trade.executed_price*trade.lot_count+trade.commission;
  const tp=cost*1.03/(trade.lot_count*.998*.998), sl=cost*.985/(trade.lot_count*.998*.998);
- for(const b of bars) {
-  if(b.bar_time<trade.entry_time)continue;
+ for(const b of [...bars].sort((a,b)=>Date.parse(a.bar_time)-Date.parse(b.bar_time))) {
+  if(Date.parse(b.bar_time)<Date.parse(trade.entry_time))continue;
   // Stop wins when both thresholds occur in a candle; gap stops use the worse open.
   let raw,reason;
   if(b.low<=sl){raw=Math.min(b.open,sl);reason='STOP_NET_1_5_PCT';}
   else if(b.high>=tp){raw=tp;reason='TP_NET_3_PCT';}
   else continue;
   const executed=raw*.998;
-  return {executed,reason,time:new Date(Date.parse(b.bar_time)+900000).toISOString(),
+  return {executed,reason,quote_time:b.bar_time,time:new Date(Date.parse(b.bar_time)+900000).toISOString(),
    pnl:executed*trade.lot_count*.998-cost};
  }
  return null;
@@ -59,12 +63,15 @@ function stageOneMetrics(bars) {
  const b=bars.at(-1),prev=bars.slice(-21,-1);
  const avg=prev.reduce((sum,x)=>sum+x.volume,0)/20,spread=b.high-b.low+1e-9;
  const rvol=avg>0?b.volume/avg:0,body=Math.abs(b.close-b.open)/spread,upper_wick=(b.high-b.close)/spread;
- return rvol>=2 && b.close>b.open && body>=.60 && upper_wick<=.20 ? {rvol,body,upper_wick}:null;
+ const daily_turnover_tl_estimate=dailyTurnover(bars);
+ return rvol>=2 && b.close>b.open && body>=.60 && upper_wick<=.20 && daily_turnover_tl_estimate>=MIN_DAILY_TURNOVER_TL ? {rvol,body,upper_wick,daily_turnover_tl_estimate,turnover_source:'CLOSED_SESSION_CLOSE_X_VOLUME'}:null;
 }
+function sameSession(bars){const last=bars.at(-1);if(!last)return [];const date=trtDate(Date.parse(last.bar_time||last.time));return bars.filter(b=>{const t=Date.parse(b.bar_time||b.time),p=trtParts(t),minute=Number(p.hour)*60+Number(p.minute);return t<=Date.parse(last.bar_time||last.time)&&trtDate(t)===date&&minute>=600&&minute<1085;});}
+function dailyTurnover(bars){return sameSession(bars).reduce((sum,b)=>sum+b.close*b.volume,0);}
 function technicalSignal(bars) {
  const metrics=stageOneMetrics(bars);if(!metrics)return null;
  const b=bars.at(-1),prev=bars.slice(-21,-1);
- const sessionBars=bars.filter(x=>(x.bar_time||x.time).slice(0,10)===(b.bar_time||b.time).slice(0,10));
+ const sessionBars=sameSession(bars);
  const total=sessionBars.reduce((sum,x)=>sum+x.volume,0);
  const vwap=total>0?sessionBars.reduce((sum,x)=>sum+(x.high+x.low+x.close)/3*x.volume,0)/total:0;
  const resistance=Math.max(...prev.map(x=>x.high));
@@ -84,18 +91,16 @@ function eligibleEntryBar(signal, bars) {
  return bars.find(b=>{const t=Date.parse(b.bar_time);return t%900000===0 && t>=earliest && t<=expiry;})||null;
 }
 async function runPaper(db, symbol, now) {
- const rows=await db.prepare("SELECT * FROM bist_bridge_bars WHERE symbol=? AND interval='15m' AND source='YAHOO_INDICATIVE' AND CAST(strftime('%s',bar_time) AS INTEGER)%900=0 ORDER BY bar_time DESC LIMIT 100").bind(symbol).all();
- const bars=(rows.results||[]).reverse(), last=bars.at(-1);
+ const bars=await symbolBars(db,symbol,now),last=bars.at(-1);
  const result={signals_created:0,opened:0,closed:0,mode:'PAPER_ONLY',risk_verified:false};
- if(!last || !fresh({...last,feed_type:'INDICATIVE_INTRADAY'},now))return {...result,blocked:'STALE_OR_EOD'};
  const positions=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN' AND symbol=? AND feed_entry_key IS NOT NULL").bind(symbol).all();
  for(const trade of positions.results||[]) {
   const exit=exitPlan(trade,bars);
-  if(exit){const r=await db.prepare("UPDATE virtual_trades SET status='CLOSED',exit_price=?,exit_time=?,pnl_net=?,exit_reason=? WHERE id=? AND status='OPEN' RETURNING id")
-   .bind(exit.executed,exit.time,exit.pnl,exit.reason,trade.id).first();result.closed+=r?1:0;}
+  if(exit)result.closed+=await closePaper(db,trade,exit,now)?1:0;
  }
+ if(!last || !fresh({...last,feed_type:'INDICATIVE_INTRADAY'},now))return {...result,blocked:'STALE_OR_EOD'};
  const pending=await db.prepare("SELECT * FROM bist_feed_signals WHERE symbol=? AND status='PENDING' AND expires_at>=? ORDER BY observed_at DESC LIMIT 1").bind(symbol,new Date(now).toISOString()).first();
- if(entryWindow(now) && !await db.prepare('SELECT trt_date FROM bist_session_lock WHERE trt_date=?').bind(trtDate(now)).first() && pending && await restrictionClear(db,symbol,now) && await db.prepare("SELECT signal_key FROM bist_ai_decisions WHERE signal_key=? AND status='APPROVED' AND model='gpt-4o-mini'").bind(pending.signal_key).first()){
+ if(entryWindow(now) && !await db.prepare('SELECT trt_date FROM bist_session_lock WHERE trt_date=?').bind(trtDate(now)).first() && pending && await entryApproved(db,pending.signal_key,bars,now) && await restrictionClear(db,symbol,now) && await db.prepare("SELECT signal_key FROM bist_ai_decisions WHERE signal_key=? AND status='APPROVED' AND model='gpt-4o-mini'").bind(pending.signal_key).first()){
   const next=eligibleEntryBar(pending,bars);
   // Never fill a signal at a price observed before it was generated.
   if(next){
@@ -110,8 +115,7 @@ async function runPaper(db, symbol, now) {
      if(r){result.opened=1;
       const trade=await db.prepare("SELECT * FROM virtual_trades WHERE feed_entry_key=?").bind(pending.signal_key).first();
       const exit=exitPlan(trade,bars);
-      if(exit){const x=await db.prepare("UPDATE virtual_trades SET status='CLOSED',exit_price=?,exit_time=?,pnl_net=?,exit_reason=? WHERE id=? AND status='OPEN' RETURNING id")
-       .bind(exit.executed,exit.time,exit.pnl,exit.reason,trade.id).first();result.closed+=x?1:0;}
+      if(exit)result.closed+=await closePaper(db,trade,exit,now)?1:0;
      }
     }catch(e){if(!/PAPER_SLOT_BUSY|PAPER_INSUFFICIENT_CASH|PAPER_SIGNAL_NOT_ELIGIBLE/.test(String(e)))throw e;result.entry_deferred='CONCURRENT_OR_EXPIRED';}
    }
@@ -120,10 +124,10 @@ async function runPaper(db, symbol, now) {
  return result;
 }
 function entryWindow(now) {
- const trt=new Date(now+10800000),minute=trt.getUTCHours()*60+trt.getUTCMinutes();
+ const p=trtParts(now),minute=Number(p.hour)*60+Number(p.minute);
  return sessionOpen(now)&&minute<1075; // 17:55 TRT
 }
-function trtDate(now){return new Date(now+10800000).toISOString().slice(0,10);}
+function trtDate(now){const p=trtParts(now);return `${p.year}-${p.month}-${p.day}`;}
 function sniperEntryPlan(cash,price){const executed=price*1.002,qty=Math.floor(cash/(executed*1.002));return {qty,executed,commission:executed*qty*.002};}
 function initialSniperState(trade){
  const cost=trade.executed_price*trade.lot_count+trade.commission;
@@ -147,13 +151,27 @@ function sniperAdvance(trade,state,bars){
  }
  return {state:next,exit:null};
 }
-async function symbolBars(db,symbol){return (await db.prepare("SELECT * FROM bist_bridge_bars WHERE symbol=? AND interval='15m' AND source='YAHOO_INDICATIVE' AND CAST(strftime('%s',bar_time) AS INTEGER)%900=0 ORDER BY bar_time DESC LIMIT 100").bind(symbol).all()).results.reverse();}
-async function closePaper(db,trade,exit){return !!await db.prepare("UPDATE virtual_trades SET status='CLOSED',exit_price=?,exit_time=?,pnl_net=?,exit_reason=? WHERE id=? AND status='OPEN' RETURNING id").bind(exit.executed,exit.time,exit.pnl,exit.reason,trade.id).first();}
+async function symbolBars(db,symbol,now=Date.now()){
+ // Keep ALL persisted intervening bars from the earliest open position, not only the latest 100.
+ const rows=await db.prepare(`SELECT * FROM bist_bridge_bars WHERE symbol=? AND interval='15m' AND source='YAHOO_INDICATIVE'
+ AND CAST(strftime('%s',bar_time) AS INTEGER)%900=0 AND julianday(bar_time)+15.0/1440<=julianday(?)
+ AND bar_time>=MIN(?,COALESCE((SELECT MIN(entry_time) FROM virtual_trades WHERE symbol=? AND status='OPEN'),?)) ORDER BY bar_time`)
+ .bind(symbol,new Date(now).toISOString(),new Date(now-7*86400000).toISOString(),symbol,new Date(now-7*86400000).toISOString()).all();return rows.results||[];
+}
+async function closePaper(db,trade,exit,now=Date.now()){
+ const r=await db.batch([db.prepare("UPDATE virtual_trades SET status='CLOSED',exit_price=?,exit_time=?,pnl_net=?,exit_reason=? WHERE id=? AND status='OPEN'").bind(exit.executed,exit.time,exit.pnl,exit.reason,trade.id),
+ db.prepare(`INSERT OR IGNORE INTO bist_exit_audit(trade_id,exit_bar_time,exit_observed_at,exit_reason) SELECT id,?,?,? FROM virtual_trades WHERE id=? AND status='CLOSED' AND exit_time=? AND exit_reason=?`).bind(exit.quote_time||null,new Date(now).toISOString(),exit.reason,trade.id,exit.time,exit.reason)]);
+ return r[0].meta.changes>0;
+}
+async function entryApproved(db,key,bars,now){
+ if(dailyTurnover(bars)<MIN_DAILY_TURNOVER_TL)return false;
+ return !!await db.prepare("SELECT signal_key FROM bist_gemini_decisions WHERE signal_key=? AND status='APPROVED' AND model=? AND completed_at<=?").bind(key,GEMINI_MODEL,new Date(now).toISOString()).first();
+}
 async function processSniper(db,trade,bars,now){
  let state=await db.prepare('SELECT * FROM bist_sniper_state WHERE trade_id=?').bind(trade.id).first();
  if(!state){const initial=initialSniperState(trade);await db.prepare('INSERT OR IGNORE INTO bist_sniper_state(trade_id,peak_price,stop_price,last_peak_at,breakeven) VALUES(?,?,?,?,0)').bind(trade.id,initial.peak_price,initial.stop_price,initial.last_peak_at).run();state=await db.prepare('SELECT * FROM bist_sniper_state WHERE trade_id=?').bind(trade.id).first();}
  const outcome=sniperAdvance(trade,state,bars),s=outcome.state;
- if(outcome.exit&&await closePaper(db,trade,outcome.exit)){
+ if(outcome.exit&&await closePaper(db,trade,outcome.exit,now)){
   await db.prepare('UPDATE bist_sniper_state SET quote_time=?,last_exit_note=?,exit_observed_at=? WHERE trade_id=?').bind(outcome.exit.quote_time,outcome.exit.reason,new Date(now).toISOString(),trade.id).run();return 1;
  }
  // A concurrent retry with an older bar must not roll back the high-water mark.
@@ -163,7 +181,7 @@ async function processSniper(db,trade,bars,now){
 async function refreshStandby(db,symbol,bars,now){
  const ready=await db.prepare("SELECT * FROM bist_sniper_queue WHERE symbol=? AND status='READY'").bind(symbol).all();
  const last=bars.at(-1);if(!last)return;
- const metrics=stageOneMetrics(bars),session=bars.filter(b=>b.bar_time.slice(0,10)===last.bar_time.slice(0,10));
+ const metrics=stageOneMetrics(bars),session=sameSession(bars);
  const volume=session.reduce((n,b)=>n+b.volume,0),vwap=volume?session.reduce((n,b)=>n+(b.high+b.low+b.close)/3*b.volume,0)/volume:0;
  for(const q of ready.results||[]){
   if(last.bar_time<=q.last_checked_bar)continue;
@@ -175,7 +193,7 @@ async function refreshStandby(db,symbol,bars,now){
 async function runSniper(db,now){
  const result={opened:0,closed:0};
  const positions=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SWING' AND status='OPEN' AND feed_entry_key LIKE 'SNIPER:%'").all();
- for(const trade of positions.results||[]){const bars=await symbolBars(db,trade.symbol);if(bars.length&&fresh({...bars.at(-1),feed_type:'INDICATIVE_INTRADAY'},now))result.closed+=await processSniper(db,trade,bars,now);}
+ for(const trade of positions.results||[]){const bars=await symbolBars(db,trade.symbol,now);if(bars.length)result.closed+=await processSniper(db,trade,bars,now);}
  if(!entryWindow(now)||await db.prepare('SELECT trt_date FROM bist_session_lock WHERE trt_date=?').bind(trtDate(now)).first())return result;
  if(await db.prepare("SELECT id FROM virtual_trades WHERE strategy='SWING' AND status='OPEN' LIMIT 1").first())return result;
  const queue=await db.prepare(`SELECT q.* FROM bist_sniper_queue q JOIN bist_funnel_risk r ON r.symbol=q.symbol
@@ -185,7 +203,8 @@ async function runSniper(db,now){
  for(const q of queue.results||[]){
   if(!await db.prepare("SELECT signal_key FROM bist_ai_decisions WHERE signal_key=? AND status='APPROVED'").bind(q.signal_key).first())continue;
   const latestExit=await db.prepare('SELECT MAX(exit_observed_at) t FROM bist_sniper_state').first();
-  const bars=await symbolBars(db,q.symbol),observed=new Date(Math.max(Date.parse(q.observed_at),Date.parse(q.last_checked_at),Date.parse(latestExit?.t)||0)).toISOString();
+  const bars=await symbolBars(db,q.symbol,now),observed=new Date(Math.max(Date.parse(q.observed_at),Date.parse(q.last_checked_at),Date.parse(latestExit?.t)||0)).toISOString();
+  if(!await entryApproved(db,q.signal_key,bars,now))continue;
   const next=eligibleEntryBar({...q,observed_at:observed},bars);
   if(!next||!entryWindow(Date.parse(next.bar_time)))break;
   if(!fresh({bar_time:q.last_checked_bar,feed_type:'INDICATIVE_INTRADAY'},Date.parse(next.bar_time)))continue;
@@ -201,16 +220,20 @@ async function runSniper(db,now){
  return result;
 }
 async function enforceSessionClose(db,now=Date.now()){
- if(new Date(now+10800000).getUTCHours()*60+new Date(now+10800000).getUTCMinutes()<1075)return {closed:0};
+ const p=trtParts(now);if(Number(p.hour)*60+Number(p.minute)<1075)return {closed:0};
  const stamp=new Date(now).toISOString();
  await db.batch([db.prepare('INSERT OR IGNORE INTO bist_session_lock(trt_date,locked_at) VALUES(?,?)').bind(trtDate(now),stamp),
   db.prepare("UPDATE bist_feed_signals SET status='EXPIRED' WHERE status='PENDING'"),db.prepare("UPDATE bist_sniper_queue SET status='EXPIRED',reason='SESSION_1755_LOCK' WHERE status='READY'")]);
  const positions=await db.prepare("SELECT * FROM virtual_trades WHERE status='OPEN' AND feed_entry_key IS NOT NULL").all();let closed=0;
  for(const trade of positions.results||[]){
-  const rows=await symbolBars(db,trade.symbol),bar=rows.filter(b=>Date.parse(b.bar_time)+900000<=now).at(-1);if(!bar)continue;
+  const rows=await symbolBars(db,trade.symbol,now);
+  const historical=trade.strategy==='SCALP'?exitPlan(trade,rows):null;
+  if(historical&&await closePaper(db,trade,historical,now)){closed++;continue;}
+  if(trade.strategy==='SWING'&&await processSniper(db,trade,rows,now)){closed++;continue;}
+  const bar=rows.at(-1);if(!bar)continue;
   const executed=bar.close*.998,cost=trade.executed_price*trade.lot_count+trade.commission;
   const reason='SESSION_1755_INDICATIVE_LAST_CLOSED_BAR';
-  if(await closePaper(db,trade,{executed,time:stamp,pnl:executed*trade.lot_count*.998-cost,reason})){closed++;
+  if(await closePaper(db,trade,{executed,time:stamp,pnl:executed*trade.lot_count*.998-cost,reason,quote_time:bar.bar_time},now)){closed++;
    if(trade.strategy==='SWING')await db.prepare('UPDATE bist_sniper_state SET quote_time=?,last_exit_note=? WHERE trade_id=?').bind(bar.bar_time,reason,trade.id).run();}
  }
  await dailyReport(db,now);return {closed,price_mode:'INDICATIVE_LAST_CLOSED_BAR'};
@@ -256,20 +279,20 @@ async function ingest(request, env, now=Date.now()) {
  ]);
  const active=fresh({...latest,feed_type:data.feed_type},now);
  // Run on retries too: a storage success + engine failure can recover safely.
+ const sniper=await runSniper(env.DB,now);
+ const engine=await runPaper(env.DB,symbol,now);
  const session=await enforceSessionClose(env.DB,now);
- const sniper=active?await runSniper(env.DB,now):{opened:0,closed:0};
- if(active)await refreshStandby(env.DB,symbol,await symbolBars(env.DB,symbol),now);
- const engine=active?await runPaper(env.DB,symbol,now):{blocked:'STALE_OR_EOD',opened:0,closed:0,signals_created:0};
+ await refreshStandby(env.DB,symbol,await symbolBars(env.DB,symbol,now),now);
  let stage2='NOT_HOT';
  if(active && data.purpose==='HOT_CANDIDATE' && validRunId(data.run_id)) {
-  const rows=await env.DB.prepare("SELECT * FROM bist_bridge_bars WHERE symbol=? AND source='YAHOO_INDICATIVE' AND interval='15m' AND CAST(strftime('%s',bar_time) AS INTEGER)%900=0 ORDER BY bar_time DESC LIMIT 100").bind(symbol).all();
+  const rows=await env.DB.prepare("SELECT * FROM bist_bridge_bars WHERE symbol=? AND source='YAHOO_INDICATIVE' AND interval='15m' AND bar_time<=? AND CAST(strftime('%s',bar_time) AS INTEGER)%900=0 ORDER BY bar_time DESC LIMIT 100").bind(symbol,latest.time).all();
   const metrics=technicalSignal((rows.results||[]).reverse());
   if(!await restrictionClear(env.DB,symbol,now))stage2='BLOCKED_RESTRICTIONS';
   else if(metrics){await env.DB.prepare('INSERT OR IGNORE INTO bist_funnel_candidates(run_id,symbol,bar_time,observed_at,score,metrics_json) VALUES(?,?,?,?,?,?)')
    .bind(data.run_id,symbol,latest.time,received,metrics.score,JSON.stringify(metrics)).run();stage2='MOMENTUM_PASSED';}
   else stage2='MOMENTUM_REJECTED';
  }
- return json({ok:true,status:active?'ACTIVE':'BLOCKED_MARKET_DATA_UNAVAILABLE',
+ return json({ok:true,status:active?'ACTIVE':'BLOCKED_MARKET_DATA_UNAVAILABLE',bar_time:latest.time,
   source:data.source,market_feed_verified:false,bar_rows:data.bars.length,new_bars:inserted[0].meta.changes,
   engine,sniper,session,stage2,orders_sent:0});
 }
@@ -308,12 +331,38 @@ async function reportIngest(request,env,now=Date.now()) {
   .bind(b.run_id,...fields.map(k=>b[k]),b.last_bar_time,new Date(now).toISOString()).run();return json({ok:true});
 }
 const AI_MODEL='gpt-4o-mini';
+async function geminiDecision(request,env,now=Date.now()){
+ const query=new URL(request.url).searchParams;
+ const b=request.method==='GET'?Object.fromEntries(query):await readBody(request);
+ const probe=b.purpose==='PROBE',key=probe?'PROBE:'+trtDate(now):b.symbol+':'+b.bar_time;
+ let c,r;
+ if(!probe){
+  if(!validRunId(b.run_id)||!validSymbol(b.symbol)||!Number.isFinite(Date.parse(b.bar_time)))return json({error:'INVALID_GEMINI_CANDIDATE'},422);
+  c=await env.DB.prepare('SELECT * FROM bist_funnel_candidates WHERE run_id=? AND symbol=? AND bar_time=?').bind(b.run_id,b.symbol,b.bar_time).first();
+  r=await env.DB.prepare('SELECT * FROM bist_funnel_risk WHERE symbol=?').bind(b.symbol).first();
+  if(!c||!fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now)||!await restrictionClear(env.DB,b.symbol,now)||JSON.parse(c.metrics_json).daily_turnover_tl_estimate<MIN_DAILY_TURNOVER_TL)return json({error:'GEMINI_CANDIDATE_NOT_ELIGIBLE'},409);
+ }
+ const cached=await env.DB.prepare('SELECT * FROM bist_gemini_decisions WHERE signal_key=?').bind(key).first();
+ if(request.method==='GET')return json({cached:cached||null,candidate:c?{symbol:c.symbol,bar_time:c.bar_time,metrics:JSON.parse(c.metrics_json),vbts:r}:null,model:GEMINI_MODEL});
+ if(cached&&cached.status!=='ERROR')return json({ok:true,cached:true,status:cached.status});
+ const v=b.verdict;
+ if(b.model!==GEMINI_MODEL||!['APPROVED','REJECTED','ERROR'].includes(b.status)||
+  !v||typeof v.approved!=='boolean'||!Number.isInteger(v.confidence)||v.confidence<0||v.confidence>100||typeof v.reason!=='string'||!v.reason.trim()||v.reason.length>1000||
+  Object.keys(v).sort().join(',')!=='approved,confidence,reason'||(b.status==='APPROVED')!==v.approved||b.status==='ERROR'&&v.confidence!==0)return json({error:'INVALID_GEMINI_VERDICT'},422);
+ await env.DB.prepare(`INSERT INTO bist_gemini_decisions VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(signal_key) DO UPDATE SET status=excluded.status,confidence=excluded.confidence,reason=excluded.reason,completed_at=excluded.completed_at WHERE bist_gemini_decisions.status='ERROR'`)
+  .bind(key,probe?'PROBE':b.run_id,probe?'PROBE':c.symbol,probe?new Date(now).toISOString():c.bar_time,GEMINI_MODEL,b.status,v.confidence,v.reason,new Date(now).toISOString()).run();
+ return json({ok:true,status:b.status});
+}
+async function geminiStatus(env){
+ const last=await env.DB.prepare('SELECT symbol,status,reason,model,completed_at FROM bist_gemini_decisions ORDER BY completed_at DESC LIMIT 1').first();
+ return {model:GEMINI_MODEL,execution:'GITHUB_ACTIONS',connection:last?last.status==='ERROR'?'ERROR':'CONNECTED':'AWAITING_CLOUD_PROBE',last_decision:last||null};
+}
 async function aiVerdict(env,candidate,risk,network=(...args)=>globalThis.fetch(...args)) {
  const apiKey=typeof env.OPENAI_API_KEY==='string'?env.OPENAI_API_KEY.trim():'';
  if(!apiKey)throw Error('OPENAI_KEY_MISSING');
  if(/[^\x21-\x7e]/.test(apiKey))throw Error('OPENAI_KEY_FORMAT_ERROR');
  const m=JSON.parse(candidate.metrics_json);
- if(!Number.isFinite(m.rvol)||m.rvol<2||!Number.isFinite(m.body)||m.body<.6||!Number.isFinite(m.upper_wick)||m.upper_wick>.2||risk?.eligible!==1||!m.last_candle||!(m.last_candle.close>m.last_candle.open&&m.last_candle.close>m.vwap&&m.last_candle.close>m.resistance))
+ if(!Number.isFinite(m.daily_turnover_tl_estimate)||m.daily_turnover_tl_estimate<MIN_DAILY_TURNOVER_TL||!Number.isFinite(m.rvol)||m.rvol<2||!Number.isFinite(m.body)||m.body<.6||!Number.isFinite(m.upper_wick)||m.upper_wick>.2||risk?.eligible!==1||!m.last_candle||!(m.last_candle.close>m.last_candle.open&&m.last_candle.close>m.vwap&&m.last_candle.close>m.resistance))
   throw Error('AI_INPUT_NOT_ELIGIBLE');
  let stage='FETCH';const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),12000);
  try{
@@ -363,7 +412,8 @@ async function finalize(request,env,now=Date.now(),network=(...args)=>globalThis
   WHERE c.run_id=? AND r.eligible=1 AND r.valid_until>? AND c.bar_time>=?
   ORDER BY c.score DESC,c.symbol ASC`).bind(b.run_id,new Date(now).toISOString(),new Date(now-50*60000).toISOString()).all();
  // No candidate-count cap: five concurrent calls are transport throttling only.
- const candidates=(rows.results||[]).filter(c=>fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now));
+ const candidates=[];
+ for(const c of rows.results||[]){const m=JSON.parse(c.metrics_json);if(fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now)&&Number.isFinite(m.daily_turnover_tl_estimate)&&m.daily_turnover_tl_estimate>=MIN_DAILY_TURNOVER_TL&&await env.DB.prepare("SELECT signal_key FROM bist_gemini_decisions WHERE signal_key=? AND status='APPROVED' AND model=?").bind(c.symbol+':'+c.bar_time,GEMINI_MODEL).first())candidates.push(c);}
  const decisions=new Array(candidates.length);let cursor=0;
  await Promise.all(Array.from({length:Math.min(5,candidates.length)},async()=>{
   while(cursor<candidates.length){const index=cursor++;decisions[index]=await judgeCandidate(env,candidates[index],now,network);}
@@ -393,7 +443,7 @@ async function feedStatus(db,now=Date.now()) {
  const active=(rows.results||[]).filter(x=>fresh({bar_time:x.last_bar_time,feed_type:x.feed_type},now));
  const scan=reports.results||[],valid=scan.filter(x=>fresh({bar_time:x.last_bar_time,feed_type:'INDICATIVE_INTRADAY'},now));
  const scanning=active.length>0||valid.some(x=>x.fetched>0);
- return {status:scanning?'ACTIVE':'BLOCKED_MARKET_DATA_UNAVAILABLE',scanner_live:scanning,
+ return {status:scanning?'ACTIVE':'BLOCKED_MARKET_DATA_UNAVAILABLE',scanner_live:scanning,time_zone:'Europe/Istanbul',timestamps:'UTC_ISO8601',server_time:new Date(now).toISOString(),data_session_open:sessionOpen(now),freshness_minutes:35,min_daily_turnover_tl:MIN_DAILY_TURNOVER_TL,
   active_symbols:active.length,scanned_symbols:valid.reduce((n,x)=>n+x.fetched,0),
   universe_total:scan[0]?.universe_total||0,eligible_total:scan[0]?.eligible_total||0,
   stage1_hot:scan.reduce((n,x)=>n+x.hot,0),shards_completed:scan.length,
@@ -458,7 +508,7 @@ document.getElementById('copyReport').onclick=()=>{const out=document.getElement
  const fallback=()=>{out.focus();out.select();out.setSelectionRange(0,text.length);try{if(document.execCommand('copy')){status.textContent='Karne kopyalandı ✅';return}}catch{}status.textContent='Karne hazır ve seçili. Metne uzun basıp Kopyala seçebilirsin.'};
  if(navigator.clipboard?.writeText){try{navigator.clipboard.writeText(text).then(()=>{status.textContent='Karne kopyalandı ✅'},fallback)}catch{fallback()}}else fallback();};
 async function checkApis(silent=false){if(pending)return;pending=true;if(!silent){setDot('gemini','wait','Kontrol');setDot('gpt','wait','Kontrol');}try{
-const [a,b,c]=await Promise.all([fetch('/bist/connections',{headers:headers()}),fetch('/bist/overview',{headers:headers()}),fetch('/bist/status',{headers:headers()})]);const x=await a.json(),o=await b.json(),status=await c.json();if(a.status===401){setDot('gemini','','Oturum gerekli');setDot('gpt','','Oturum gerekli');document.getElementById('checkResult').textContent='Bir defa erişim tokenı girerek oturum aç.';return}document.getElementById('checkResult').textContent=JSON.stringify(x,null,2);for(const [label,field] of [['gemini','gemini'],['gpt','openai']]){const ok=a.ok&&x[field]&&x[field].connection==='CONNECTED';setDot(label,ok?'ok':'bad',ok?'Bağlı':(field==='openai'?(x.openai?.connection==='CONFIGURED'?'Mini hazır · ilk karar bekleniyor':x.openai?.connection==='ERROR'?'Mini API hatası':'Mini anahtarı eksik'):'Bulut köprü modunda kapalı'))}if(!b.ok)throw Error('Panel verisi güncellenemedi: HTTP '+b.status);lastData=o;renderOverview(o);document.getElementById('mainState').textContent=status.scanner_live?'Bulut radar aktif':'Veri bekleniyor';
+const [a,b,c]=await Promise.all([fetch('/bist/connections',{headers:headers()}),fetch('/bist/overview',{headers:headers()}),fetch('/bist/status',{headers:headers()})]);const x=await a.json(),o=await b.json(),status=await c.json();if(a.status===401){setDot('gemini','','Oturum gerekli');setDot('gpt','','Oturum gerekli');document.getElementById('checkResult').textContent='Bir defa erişim tokenı girerek oturum aç.';return}document.getElementById('checkResult').textContent=JSON.stringify(x,null,2);for(const [label,field] of [['gemini','gemini'],['gpt','openai']]){const ok=a.ok&&x[field]&&x[field].connection==='CONNECTED';setDot(label,ok?'ok':'bad',ok?'Bağlı':(field==='openai'?(x.openai?.connection==='CONFIGURED'?'Mini hazır · ilk karar bekleniyor':x.openai?.connection==='ERROR'?'Mini API hatası':'Mini anahtarı eksik'):x.gemini?.connection==='ERROR'?'Gemini API hatası':'Bulut Gemini testi bekleniyor'))}if(!b.ok)throw Error('Panel verisi güncellenemedi: HTTP '+b.status);lastData=o;renderOverview(o);document.getElementById('mainState').textContent=status.scanner_live?'Bulut radar aktif':'Veri bekleniyor';
 }catch(e){setDot('gemini','bad','Hata');setDot('gpt','bad','Hata');document.getElementById('panelFreshness').textContent='Panel yenilenemedi · son kayıtlar gösteriliyor';document.getElementById('checkResult').textContent=String(e.message)}finally{pending=false}}
 function renderOverview(d){
  const stamp=value=>value?new Date(value).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'}):'—';
@@ -522,12 +572,13 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
    return new Response(JSON.stringify({ok:true,expires_at:new Date(Number(exp)).toISOString()}),{status:200,headers:{"Content-Type":"application/json","Cache-Control":"no-store","Set-Cookie":"bist_session="+exp+"."+await sign(exp)+"; Max-Age=1209600; Path=/; HttpOnly; Secure; SameSite=Strict"}});
  }
  if(u.pathname==="/bist/logout"&&request.method==="POST")return new Response(JSON.stringify({ok:true}),{headers:{"Content-Type":"application/json","Set-Cookie":"bist_session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict"}});
- if(['/bist/feed/ingest','/bist/feed/risk','/bist/feed/monitor','/bist/feed/report','/bist/feed/finalize','/bist/feed/daily','/bist/feed/audit','/bist/feed/probe'].includes(u.pathname)){
-  if(['/bist/feed/monitor','/bist/feed/daily'].includes(u.pathname)?request.method!=='GET':request.method!=='POST')return reply({error:'METHOD_NOT_ALLOWED'},405);
+ if(['/bist/feed/ingest','/bist/feed/risk','/bist/feed/monitor','/bist/feed/report','/bist/feed/finalize','/bist/feed/daily','/bist/feed/audit','/bist/feed/probe','/bist/feed/gemini'].includes(u.pathname)){
+  if(u.pathname==='/bist/feed/gemini'?!['GET','POST'].includes(request.method):['/bist/feed/monitor','/bist/feed/daily'].includes(u.pathname)?request.method!=='GET':request.method!=='POST')return reply({error:'METHOD_NOT_ALLOWED'},405);
   const ingestToken=env.BIST_INGEST_TOKEN||env.ACCESS_TOKEN;
   if(!ingestToken)return reply({error:'INGEST_TOKEN_NOT_CONFIGURED'},503);
   if(!provided || !await secureEqual(provided,ingestToken))return reply({error:'Unauthorized'},401);
-  try{if(u.pathname.endsWith('/probe'))return await probeMini(env);
+  try{if(u.pathname.endsWith('/gemini'))return await geminiDecision(request,env);
+   if(u.pathname.endsWith('/probe'))return await probeMini(env);
    if(u.pathname.endsWith('/daily'))return reply(await dailyReport(env.DB));
    if(u.pathname.endsWith('/audit'))return await externalAudit(request,env);
    if(u.pathname.endsWith('/monitor'))return await monitorSymbols(env);
@@ -539,7 +590,7 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
  if(!authenticated)return reply({error:"Unauthorized"},401);
 
  if(u.pathname==='/bist/status'||u.pathname==='/bist/bridge/status')return reply(await feedStatus(env.DB));
- if(u.pathname==='/bist/connections')return reply({mode:'CLOUD_BRIDGE_AI_REFEREE',external_fetch_enabled:true,market_data_fetch_enabled:false,gemini:{connection:'DISABLED'},openai:await aiStatus(env)});
+ if(u.pathname==='/bist/connections')return reply({mode:'CLOUD_BRIDGE_AI_REFEREE',external_fetch_enabled:true,market_data_fetch_enabled:false,gemini:await geminiStatus(env),openai:await aiStatus(env)});
  if(u.pathname==='/bist/ai/decisions')return reply({decisions:(await env.DB.prepare('SELECT symbol,bar_time,model,status,reason,completed_at,confidence,input_tokens,output_tokens FROM bist_ai_decisions ORDER BY created_at DESC LIMIT 100').all()).results});
  if(u.pathname==='/bist/report'){const report=await dailyReport(env.DB);const audit=await env.DB.prepare('SELECT * FROM bist_external_audits ORDER BY trt_date DESC LIMIT 1').first();return reply({...report,external_audit:audit?{...audit,report:JSON.parse(audit.report_json)}:null});}
  if(u.pathname==='/bist/overview'){
@@ -556,7 +607,7 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
   const openTrades=open.results||[];
   return reply({...status,total_capital:5000,equity:(account.SCALP||0)+(account.SWING||0)+openTrades.reduce((s,t)=>s+t.executed_price*t.lot_count,0),
    sniper_queue:(standby.results||[]).map(q=>({...q,fresh:fresh({bar_time:q.last_checked_bar,feed_type:'INDICATIVE_INTRADAY'},Date.now())})),sniper_state:sniperStates.results?.[0]||null,
-   scalp_cash:account.SCALP||0,swing_cash:account.SWING||0,open_trades:openTrades,closed_trades:closed.results||[],
+   scalp_cash:account.SCALP||0,swing_cash:account.SWING||0,open_trades:openTrades,closed_trades:closed.results||[],gemini:await geminiStatus(env),exit_audit:(await env.DB.prepare('SELECT * FROM bist_exit_audit ORDER BY exit_observed_at DESC LIMIT 30').all()).results||[],
    scanned:status.scanned_symbols||status.active_symbols,approved:counts?.approved||0,candidates:status.stage1_hot||0,pending_entries:counts?.pending_entries||0,realised_pnl:counts?.realised_pnl||0,watchlist:signals.results,ai_signals:aiSignals.results||[],
    latest_run:status.last_received?{phase:'CLOUD_BRIDGE',status:status.status,created_at:status.last_received}:null});
  }

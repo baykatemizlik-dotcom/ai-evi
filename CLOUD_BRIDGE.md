@@ -1,114 +1,5 @@
 # BIST Cloud Bridge
 
-## Gemini için güncel denetim notu — 9 Ekim 2026
-
-Bu belge uygulanan mimariyi anlatır; aşağıdaki canlı kanıtlar ile henüz
-doğrulanmamış davranışlar birbirinden ayrılmalıdır. İncelenecek kod tabanı:
-`4dfd59d09a1aede5c925027358e43e3e66c4ccbd`. Bu bölüm yalnızca dokümantasyon güncellemesidir.
-
-### Uygulanan kapsam
-
-| Bileşen | Güncel davranış |
-| --- | --- |
-| Evren | Son doğrulamada 631 saf pay; pazar/brüt takas ve resmi tedbir elemelerinden sonra 530 uygun hisse. Sayılar hedef veya sabit kota değildir. |
-| Veri | Actions üzerinde 8 parça, 15m Yahoo OHLCV; yalnız kapanmış ve 900 saniyeye hizalı barlar. Worker piyasa sağlayıcısını çağırmaz. |
-| Huni | Python RVOL≥2, yeşil mum, gövde≥%60, üst fitil≤%20; Worker önceki 20 bar kırılımı ve seans VWAP doğrulaması. |
-| Mini | Teknik aşamaları geçen dinamik havuzun tamamı; 3 aday sınırı yok. Eşzamanlı 5 çağrı yalnız taşıma sınırıdır. |
-| Karar | GPT-4o-mini katı JSON onay/ret, neden ve 0–100 güven skoru. Resmi, tarihli tedbir kaydı verilir; modelden bilinmeyen haber veya cezayı uydurması istenmez. |
-| Scalp | 2 slot, net TP +%3 / SL -%1,5; aynı mumda stop önceliği; giriş ve çıkış maliyetleri dahil. |
-| Sniper | Mevcut SWING kasasıyla 1 slot; net taban stop -%2, net +%2,5 sonrası maliyeti karşılayan stop, önceki tepeye göre %2 takip, 60 dakika yeni tepe yoksa çıkış. |
-| Yedekler | Onaylı dinamik havuz, panelde sıralama/güven/tazelik/neden; her yeni kapanmış barda sağlık kontrolü, bozulana INVALID. |
-| Seans sonu | 17:55 TRT giriş kilidi; bağımsız Worker dakika cron'u, son kayıtlı kapanmış barla sanal kapanış. |
-| Gemini | Dış Actions denetçisi; rapor ve kod inceler, otomatik kod/işlem değişikliği yapmaz. |
-
-Açık pozisyonların, bekleyen girişlerin ve READY yedeklerin izleme barları,
-ilk huni filtresinden artık geçmeseler bile gönderilir. Yalnız sıcak adayları
-göndermek stop ve yedek izlemesini keserdi.
-
-### Mini hatası: kök neden ve gerçek doğrulama
-
-Hata model seçimi veya ChatGPT sohbet ayarı değildi. Bizim OpenAI HTTP
-isteğimizdeki `redirect: "error"` seçeneği canlı Cloudflare runtime'ında
-TypeError üretiyordu. Hata metni bu redirect değerinin edge'de uygulanmadığını
-bildirdi. İstek `redirect: "manual"` olarak düzeltildi; 3xx dahil tüm başarısız
-HTTP yanıtları reddedilir, başka adrese kimlik bilgisi yönlendirilmez.
-
-Gerçek OpenAI çağrısı D1'e **MARMR / APPROVED / güven 85 / 524 giriş ve
-74 çıkış tokenı** olarak kaydedildi. Başarılı bağlantı testi Actions run:
-`37907005038`. Bu **yalnız bağlantı testi** idi: aynı günün geçmiş adayı da
-kullanılabilir; sinyal, yedek veya sanal emir oluşturmaz. MARMR için canlı AL
-veya gerçekleşmiş işlem kanıtı olarak yorumlanmamalıdır. Eski ERROR kayıtları
-denetim izi olarak korunur; onların varlığı tek başına bağlantının halen bozuk
-olduğunu göstermez.
-
-Bu hatadan Worker'ın tüm dış HTTP bağlantılarının kalıcı olarak çöktüğü sonucu
-çıkarılamaz. Güncel tasarımda yalnız piyasa verisi Actions'a taşındı; OpenAI
-karar çağrısı kullanıcı talebiyle Worker içindedir.
-
-### Kanıtlar ve kalan doğrulamalar
-
-- 35 otomatik test geçti: 15 Python, 20 Node. İzole geçici veritabanları ve
-  sentetik barlar kullanılır; üretim D1'i sıfırlanmadı.
-- Canlı panelde Dinamik Yedek Havuz ve Karneyi kopyala alanları doğrulandı.
-- Gerçek mini yanıtı doğrulandı; yeni Sniper'ın üretimde tüm giriş → takip →
-  çıkış → yedek değişim döngüsü henüz bu kanıtlarla doğrulanmış sayılmaz.
-- GitHub tarafında `GEMINI_API_KEY` ve başarılı dış Gemini yanıtı ayrıca
-  doğrulanmalıdır. Cloudflare'daki aynı isimli secret otomatik taşınmaz.
-- Güven skoru kalibre edilmiş kazanma olasılığı değildir. OHLCV oranları wash
-  trade olmadığını kanıtlamaz. Yahoo gösterge verisidir, lisanslı gerçek zamanlı
-  işlem fiyatı doğrulaması değildir. Tüm işlemler sanaldır; gerçek broker emri yoktur.
-- Bu not canlı tablo sayaçlarının anlık fotoğrafı değildir. Yeni taramanın
-  aday, karar ve işlem sayıları tarih/saatli D1 kayıtlarıyla ayrıca okunmalıdır.
-
-### Gemini'den özellikle istenen denetim
-
-1. **Lookahead ve gecikmeli giriş:** Sinyal barı kapanışı, gerçek onay zamanı,
-   yedek sağlık gözlem zamanı ve önceki Sniper çıkışının öğrenilme zamanı
-   birlikte giriş sınırını belirliyor mu? N+1 açılışı geçmişse daha sonraki
-   uygun bar beklenmeli; geçmiş fiyatla geriye dönük karar verilmemeli.
-   Scalp ve Sniper için ayrı kontrol et.
-2. **Bar içi belirsizlik:** Aynı mumda TP/SL stop önceliğini, kötü gap açılışını,
-   net maliyet hesaplarını kontrol et. Yeni görülen tepe takip/breakeven
-   stopunu sonraki mum için yükseltir; aynı mumun daha önce oluşmuş olabilecek
-   low'una uygulanmamalı. OHLCV ile anlık, kesin risksiz çıkış vaat edilmemeli.
-3. **Atomiklik ve çift motor:** İki eşzamanlı ingest/finalize, tekrar gönderim,
-   API karar önbelleği ve slot boşalması yarışlarında 2 Scalp/1 Sniper sınırı,
-   aynı sembolde mükerrer pozisyon ve kasa bakiyesi D1 trigger'larıyla korunuyor mu?
-   Kapanış tekrarında çift nakit kredisi olmamalı.
-4. **Yedek sağlık ve tazelik:** READY isimlerin tamamı izleniyor mu?
-   35 dakika toleransı bar başlangıcından değil bar sonundan ölçülmeli.
-   Yedek uygunluğu gerçek giriş anında değerlendirilmelidir. Her yeni barda
-   RVOL≥2 koşulunu tekrar istemenin iyi trendleri çok erken eleme etkisini
-   kalibrasyon bulgusu olarak belirt; filtreleri sessizce gevşetme.
-5. **17:55 ve kesinti:** Kapanış zamanı cron'un nominal zamanı değil gerçek
-   çalıştırılma zamanıdır. Son kayıtlı barla kapanış gösterge fiyatıdır;
-   doğrulanmış 17:55 piyasa fiyatı değildir. Cron gecikmesi, hiç kullanılabilir
-   bar bulunmaması veya servis kesintisi halinde geceye pozisyon kalması ve
-   sonraki gün toparlanma davranışını ayrıca incele. Mutlak kapanış garantisi
-   varmış gibi raporlama.
-6. **Evren ve tedbir:** KAP sınıflandırması/şirket tipi ve sembol filtresinin
-   birlikte çalışmasını, 7 günlük snapshot sınırını, günlük resmi tedbir
-   listesinin geçerliliğini kontrol et. Tedbir kaynağı yoksa yeni girişler
-   bloklanmalı, açık pozisyon izlemesi sürmeli.
-7. **AI ve dış denetim:** Şema dışı yanıt, ret, zaman aşımı ve eksik secret
-   giriş açmamalı. Bağlantı testi canlı sinyal üretmemeli. Dış Gemini audit
-   başarısızlığı motor durumuna veya geçmiş kayıtlara müdahale etmemeli.
-   Mevcut günlük karne özet ağırlıklıdır; ayrıntılı işlem incelemesi için
-   gerekli satırların raporda eksik olup olmadığını belirt.
-
-İnceleme dosyaları: `bridge/bist_sync.py`, `bridge/bist_universe.py`,
-`worker/cloud_bridge.mjs`, dağıtılan `worker/index.js`,
-`migrations/0010_cloud_bridge.sql`–`0014_external_audit.sql`,
-`.github/workflows/bist_sync.yml`, `bist_ai_probe.yml`, `bist_review.yml`,
-`bridge/bist_review.py` ve `tests/`.
-
-İstenen çıktı: Her bulgu için **dosya/fonksiyon → tekrar üretme koşulu →
-etki → düzeltme önerisi**. Canlı işlem doğruluğu hatalarını strateji
-kalibrasyonundan ayır. Kanıt olmadan “tam eksiksiz / kârlı / canlıda doğrulandı”
-sonucu verme; bu denetim aşamasında D1'i sıfırlama veya stratejiyi kendiliğinden değiştirme.
-
----
-
 Market data is fetched only by GitHub Actions. The Worker calls only OpenAI for
 the GPT-4o-mini paper referee; provider fetching and old cron routes remain disabled.
 The existing mobile dashboard and ACCESS_TOKEN sessions remain available.
@@ -120,7 +11,8 @@ The existing mobile dashboard and ACCESS_TOKEN sessions remain available.
    Apply additive `migrations/0011_dynamic_funnel.sql` for risk, candidate and scan-report tables,
    then `migrations/0012_ai_referee.sql` for the idempotent AI decision cache,
    `0013_sniper.sql` for Sniper state/atomic two-engine triggers and
-   `0014_external_audit.sql` for external Gemini reports. Apply each migration once.
+   `0014_external_audit.sql` for external Gemini reports and
+   `0015_gemini_and_exit_audit.sql` for cloud Gemini decisions and backfill provenance. Apply each migration once.
 2. Deploy `worker/index.js` (self-contained). `worker/cloud_bridge.mjs` is its tested
    source module; it does not need a separate upload when using the dashboard editor.
 3. GitHub repository Settings → Secrets and variables → Actions:
@@ -134,7 +26,10 @@ The existing mobile dashboard and ACCESS_TOKEN sessions remain available.
 
 ## Operation and limits
 
-Cron: weekdays 07:00,07:15,…,15:00,15:15 UTC (10:00–18:15 TRT).
+Cron: `4,19,34,49 7-15 * * 1-5` (UTC); the sender accepts scheduled data runs only
+between 10:00 and 18:05 Europe/Istanbul. Thus scans after 18:05 are skipped.
+Epoch/UTC ISO timestamps remain unchanged; only session calendars and panel display
+use Europe/Istanbul. Freshness is measured from bar END, with 35 minutes tolerance.
 GitHub schedules can be delayed or dropped; this is a 15m paper radar, not an
 execution-time SLA. Market holidays are handled by the closed-bar freshness gate.
 
@@ -166,7 +61,10 @@ patterns can prove absence of manipulation or wash trading.
 1. Python partitions the eligible universe exactly once across eight Actions
    jobs. Pandas/NumPy filters each symbol's latest closed 15m bar simultaneously:
    RVOL >=2 against the **previous** 20 bars, close > open, body/range >=0.60,
-   upper wick/range <=0.20. No fixed candidate count is imposed. It rejects
+   upper wick/range <=0.20 and current-session turnover estimate >=40,000,000 TL.
+   Turnover is the cumulative sum of closed 15m `close * volume`, not an exchange-certified
+   daily turnover figure. Prior-day or unfinished bars do not contribute.
+   No fixed candidate count is imposed. It rejects
    off-grid timestamps and bars not closed according to both wall clock and
    Yahoo's provider timestamp. The final row is discarded only if unfinished.
 2. Only hot candidates are posted with up to 100 historical closed bars for
@@ -284,3 +182,43 @@ account cash, standby counts and the latest external audit for sharing with
 Gemini manually. End-of-session reports are also persisted automatically in D1.
 
 Live root cause: Workers rejects redirect=error. OpenAI requests now use redirect=manual; every non-2xx, including 3xx, is rejected without forwarding credentials.
+
+## 2026-10-09 recovery patch
+
+The UTC timestamps were already epoch-comparable. A provider/scheduler gap must
+not be hidden by shifting them three hours or falsely declaring stale data ACTIVE.
+New entries remain blocked without fresh bars; exits now replay every persisted
+closed bar from entry in chronological order even while data status is BLOCKED.
+The old latest-100-bar cutoff no longer applies to exit replay. Monitoring symbols
+are still fetched even if they fail the liquidity filter. Missing provider bars
+cannot be reconstructed or treated as confirmed price action.
+
+Scalp exits preserve net +3%/-1.5% thresholds including fees/slippage. Stop wins
+if both levels are touched in one bar; adverse opening gaps use the worse open.
+The first triggering bar wins. `exit_time` is its close time (15m OHLCV cannot
+identify the exact intrabar second), while `bist_exit_audit.exit_bar_time` records
+its start and `exit_observed_at` records when recovery actually detected it.
+Cash/slot updates are atomic and retries cannot close/pay the same trade twice.
+Sniper replays its persisted trailing-stop state without using the current high
+to trigger a same-bar higher stop. History and cash are never reset.
+
+Gemini 2.5 Flash now runs through `google-genai` on GitHub Actions, not in the
+Worker. Required repository secret: `GEMINI_API_KEY`. All Worker stage-2 candidates
+are reviewed (four concurrent requests throttle transport, not pool size).
+The bridge submits validated `{approved, confidence, reason}` decisions through
+a Bearer-authenticated `/bist/feed/gemini` endpoint. Model/API/malformed-output
+errors fail closed for new entries and are logged without keys or response bodies.
+Approved/rejected symbol+bar decisions are cached. A once-per-TRT-day connection
+probe never produces a trade. Panel Gemini state reflects received cloud results.
+
+GPT-4o-mini remains the Worker referee: both Gemini and Mini must approve before
+a new signal/standby can enter. Entry waits for a bar whose OPEN is after approval
+was actually observed; delayed Yahoo bars cannot retroactively fill at N+1 if
+that open happened before approval. Both runtime engines independently enforce
+the liquidity gate. Legacy low-liquidity/unvalidated pending records are expired
+or invalidated, retained for audit; existing open trades remain under exit control.
+The earlier 17:55 TRT entry/EOD lock is preserved despite data-session end 18:05.
+
+Google documents restricted access to Gemini 2.5 models for newer projects.
+If this account returns 403/404, the bridge records the actual error and blocks
+entries; it does not silently swap the explicitly requested model.
