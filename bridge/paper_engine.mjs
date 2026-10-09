@@ -9,7 +9,8 @@ export function planExit(entry, rawPrice){
  const sell=rawPrice*0.998,fee=sell*entry.lot_count*0.002;
  const proceeds=sell*entry.lot_count-fee;
  const netPnl=proceeds-(entry.executed_price*entry.lot_count+entry.commission);
- const reason=rawPrice>=entry.executed_price*1.03?'TP_3_PCT':rawPrice<=entry.executed_price*0.985?'STOP_1_5_PCT':null;
+ const netReturn=netPnl/(entry.executed_price*entry.lot_count+entry.commission);
+ const reason=netReturn>=0.03?'TP_NET_3_PCT':netReturn<=-0.015?'STOP_NET_1_5_PCT':null;
  return {reason,exitPrice:sell,commission:fee,proceeds,pnlNet:netPnl};
 }
 // Operates only if upstream explicitly verified market+disclosures. D1 batch executes transactionally.
