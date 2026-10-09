@@ -525,4 +525,4 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
    latest_run:status.last_received?{phase:'CLOUD_BRIDGE',status:status.status,created_at:status.last_received}:null});
  }
  return reply({error:'DISABLED_IN_INGRESS_ONLY_MODE',external_fetch_enabled:false},410);
-},async scheduled(controller,env){return await enforceSessionClose(env.DB,controller.scheduledTime||Date.now());}};
+},async scheduled(controller,env){return await enforceSessionClose(env.DB,Date.now());}};

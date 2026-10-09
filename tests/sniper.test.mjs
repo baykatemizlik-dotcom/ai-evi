@@ -58,6 +58,6 @@ test('bad standby candle is invalidated and panel includes ranked standby and co
   await db.prepare("INSERT INTO bist_sniper_queue VALUES('k','TUPRS','2026-10-09T07:00:00Z','2026-10-09T07:31:00Z','2026-10-09T09:00:00Z','2026-10-09T07:00:00Z','2026-10-09T07:31:00Z',10,80,'READY','OK','{}')").run();
   const bars=Array.from({length:21},(_,i)=>candle(new Date(Date.parse('2026-10-09T07:00:00Z')+i*900000).toISOString(),100,110,90,99,100));
   await refreshStandby(db,'TUPRS',bars,Date.parse('2026-10-09T12:16:00Z'));assert.equal((await db.prepare('SELECT status FROM bist_sniper_queue').first()).status,'INVALID');
-  const code=readFileSync(new URL('../worker/index.js',import.meta.url),'utf8');assert.match(code,/sniperStandby/);assert.match(code,/copyReport/);assert.match(code,/enforceSessionClose\(env.DB,controller.scheduledTime/);
+  const code=readFileSync(new URL('../worker/index.js',import.meta.url),'utf8');assert.match(code,/sniperStandby/);assert.match(code,/copyReport/);assert.match(code,/enforceSessionClose\(env.DB,Date.now/);
  }finally{clean();}
 });
