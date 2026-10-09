@@ -397,6 +397,10 @@ export async function feedStatus(db,now=Date.now()) {
   active_symbols:active.length,scanned_symbols:valid.reduce((n,x)=>n+x.fetched,0),
   universe_total:scan[0]?.universe_total||0,eligible_total:scan[0]?.eligible_total||0,
   stage1_hot:scan.reduce((n,x)=>n+x.hot,0),shards_completed:scan.length,
+  last_scan_id:scan[0]?.run_id||null,
+  last_scan_at:scan.map(x=>x.completed_at).sort().at(-1)||null,
+  last_scan_bar:scan.map(x=>x.last_bar_time).filter(Boolean).sort().at(-1)||null,
+  last_scan_fetched:scan.reduce((n,x)=>n+x.fetched,0),
   source:'GITHUB_ACTIONS_CLOUD_BRIDGE',market_feed_verified:false,paper_only:true,risk_verified:false,
   last_received:[...(rows.results||[]).map(x=>x.received_at),...scan.map(x=>x.completed_at)].sort().at(-1)||null};
 }
