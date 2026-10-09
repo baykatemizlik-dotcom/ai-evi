@@ -97,13 +97,15 @@ const scanUniverse=async(env)=>{
  if(!names.length)throw Error("UNIVERSE_EMPTY");
  return names;
 };
+const loadBridgeUniverse=async(env)=>{const r=await env.DB.prepare("SELECT symbol FROM bist_universe WHERE active=1 AND market IN ('YILDIZ','ANA') AND liquidity_tl>30000000 ORDER BY liquidity_tl DESC LIMIT 1000").all();return r.results.map(x=>x.symbol)};
+const bridgeBars=async(env,symbol,interval)=>{const r=await env.DB.prepare("SELECT bar_time,open,high,low,close,volume,received_at FROM bist_bridge_bars WHERE symbol=? AND interval=? ORDER BY bar_time DESC LIMIT 90").bind(symbol,interval).all();const rows=r.results.reverse();if(rows.length<30)throw Error("BRIDGE_INSUFFICIENT_BARS");const last=rows.at(-1);if(Date.now()-Date.parse(last.bar_time)>4*86400000||Date.now()-Date.parse(last.received_at)>4*86400000)throw Error("BRIDGE_STALE");return rows.map(x=>({t:Math.floor(Date.parse(x.bar_time)/1000),o:x.open,h:x.high,l:x.low,c:x.close,v:x.volume}))};
 const nightRadar=async(env)=>{
- const names=await scanUniverse(env);
+ const names=await loadBridgeUniverse(env);
  const date=new Intl.DateTimeFormat("sv-SE",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
  const kap=await kapPreflight(env),candidates=[],errors=[];
  for(const symbol of names){
    try{
-     const bars=await yahooOHLCV(symbol,"1d"),last=bars.at(-1),prior=bars.slice(-21,-1);
+     const bars=await bridgeBars(env,symbol,"1d"),last=bars.at(-1),prior=bars.slice(-21,-1);
      if(!last||prior.length<20)continue;
      const volAvg=prior.reduce((v,x)=>v+x.v,0)/20;
      const rvol=volAvg>0?last.v/volAvg:0;
@@ -116,7 +118,7 @@ const nightRadar=async(env)=>{
  candidates.sort((a,b)=>b.rvol-a.rvol);
  for(const c of candidates.slice(0,5)){
    await env.DB.prepare("INSERT INTO watchlist_pool(trade_day,symbol,source,verified,created_at,strategy,metrics_json,radar_status,updated_at) VALUES(?,?,?,0,?,'SWING',?,'RADAR_ONLY',?) ON CONFLICT(trade_day,symbol) DO UPDATE SET metrics_json=excluded.metrics_json,updated_at=excluded.updated_at,radar_status='RADAR_ONLY'")
-    .bind(date,c.symbol,"Yahoo Finance daily / unverified",new Date().toISOString(),JSON.stringify(c),new Date().toISOString()).run();
+    .bind(date,c.symbol,"Bridge D1 daily / unverified",new Date().toISOString(),JSON.stringify(c),new Date().toISOString()).run();
  }
  const status=(!names.length||errors.some(x=>x.reason==="YAHOO_HTTP_429"))?"BLOCKED_MARKET_DATA_UNAVAILABLE":!kap.ready?"NIGHT_OHLCV_OK_KAP_BLOCKED":"NIGHT_OHLCV_OK_KAP_UNVERIFIED";
  const summary={status,scanned:Math.min(names.length,errors.length+candidates.length),universe_count:names.length,market_data_success:Math.max(0,Math.min(names.length,errors.length+candidates.length)-errors.length),candidates:candidates.slice(0,5),errors,kap,approved_signals:0};
@@ -197,6 +199,20 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
   const cap=await env.DB.prepare("SELECT value FROM bist_settings WHERE key='TOTAL_CAPITAL'").first();
   const budget=Number(cap?.value||5000)/2;
   return reply({budget,market_price:price,...paperLotPlan(budget,price),note:"Simulation sizing only; actual orders and live price feeds are not connected."});
+ }
+ if(u.pathname==="/bist/bridge/status"&&request.method==="GET"){const [u,b]=await Promise.all([env.DB.prepare("SELECT COUNT(*) n FROM bist_universe WHERE active=1 AND liquidity_tl>30000000").first(),env.DB.prepare("SELECT COUNT(*) n,MAX(received_at) last_received FROM bist_bridge_bars").first()]);return reply({universe:u?.n||0,bars:b?.n||0,last_received:b?.last_received||null,ready:(u?.n||0)>0&&(b?.n||0)>0})}
+ if(u.pathname==="/bist/bridge/import"&&request.method==="POST"){
+  if(!env.DB)return reply({error:"DB_MISSING"},503);
+  const cl=Number(request.headers.get("Content-Length")||0);if(cl>400000)return reply({error:"PAYLOAD_TOO_LARGE"},413);
+  let data;try{data=await request.json()}catch{return reply({error:"BAD_JSON"},400)}
+  const symbols=Array.isArray(data.universe)?data.universe:[],bars=Array.isArray(data.bars)?data.bars:[];
+  if(symbols.length>150||bars.length>300)return reply({error:"BATCH_TOO_LARGE"},422);
+  const validSymbol=x=>/^[A-Z][A-Z0-9]{2,6}$/.test(x||"");
+  const statements=[];
+  for(const x of symbols){if(!validSymbol(x.symbol)||!["YILDIZ","ANA"].includes(x.market)||!Number.isFinite(x.liquidity_tl)||x.liquidity_tl<0)return reply({error:"INVALID_UNIVERSE_ROW"},422);statements.push(env.DB.prepare("INSERT INTO bist_universe(symbol,market,active,liquidity_tl,source,verified_at) VALUES(?,?,1,?,?,?) ON CONFLICT(symbol) DO UPDATE SET market=excluded.market,liquidity_tl=excluded.liquidity_tl,source=excluded.source,verified_at=excluded.verified_at").bind(x.symbol,x.market,x.liquidity_tl,String(data.source||"external bridge").slice(0,100),new Date().toISOString()))}
+  for(const x of bars){if(!validSymbol(x.symbol)||!["15m","1d"].includes(x.interval)||!Number.isFinite(Date.parse(x.time))||Date.parse(x.time)>Date.now()||![x.open,x.high,x.low,x.close,x.volume].every(v=>Number.isFinite(v)&&v>=0)||x.low>x.high||x.open<x.low||x.open>x.high||x.close<x.low||x.close>x.high)return reply({error:"INVALID_BAR"},422);statements.push(env.DB.prepare("INSERT OR IGNORE INTO bist_bridge_bars(symbol,interval,bar_time,open,high,low,close,volume,source,received_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(x.symbol,x.interval,x.time,x.open,x.high,x.low,x.close,x.volume,String(data.source||"external bridge").slice(0,100),new Date().toISOString()))}
+  if(!statements.length)return reply({error:"EMPTY_IMPORT"},422);
+  await env.DB.batch(statements);return reply({ok:true,universe_rows:symbols.length,bar_rows:bars.length,signals_created:0,orders_sent:0})
  }
  if(u.pathname==="/bist/night-test"&&request.method==="POST"){
   if(!env.DB)return reply({error:"D1 unavailable"},503);
@@ -320,16 +336,16 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
    let status="BLOCKED_MISSING_VERIFIED_FEED",results=[],kap={ready:false};
    if(phase==="NIGHT_WATCH"){await nightRadar(env);return}
    if(phase==="INTRADAY_SCAN"){
-     const symbols=await scanUniverse(env);
+     const symbols=await loadBridgeUniverse(env);
      kap=await kapPreflight(env);
      for(const symbol of symbols){
        try{
-         const bars=await yahooOHLCV(symbol);
+         const bars=await bridgeBars(env,symbol,"15m");
          const m=technicalCandidate(bars);
          if(!m||!m.passed||m.volumeTL<30000000)continue;
          results.push({symbol,...m});
          const tradeDay=new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
-         await env.DB.prepare("INSERT INTO watchlist_pool(trade_day,symbol,source,verified,created_at,strategy,metrics_json,radar_status,updated_at) VALUES(?,?,?,0,?,'SCALP',?,'RADAR_ONLY',?) ON CONFLICT(trade_day,symbol) DO UPDATE SET metrics_json=excluded.metrics_json,updated_at=excluded.updated_at,radar_status='RADAR_ONLY'").bind(tradeDay,symbol,"Yahoo Finance / delayed-unverified",new Date().toISOString(),JSON.stringify(m),new Date().toISOString()).run();
+         await env.DB.prepare("INSERT INTO watchlist_pool(trade_day,symbol,source,verified,created_at,strategy,metrics_json,radar_status,updated_at) VALUES(?,?,?,0,?,'SCALP',?,'RADAR_ONLY',?) ON CONFLICT(trade_day,symbol) DO UPDATE SET metrics_json=excluded.metrics_json,updated_at=excluded.updated_at,radar_status='RADAR_ONLY'").bind(tradeDay,symbol,"Bridge D1 intraday / unverified",new Date().toISOString(),JSON.stringify(m),new Date().toISOString()).run();
        }catch(e){const reason=String(e.message||e);console.log("FEED_SKIP",symbol,reason.slice(0,80));if(reason==="YAHOO_HTTP_429")break}
      }
      status=kap.ready?"TECHNICAL_RADAR_KAP_UNVERIFIED":"TECHNICAL_RADAR_KAP_BLOCKED";
