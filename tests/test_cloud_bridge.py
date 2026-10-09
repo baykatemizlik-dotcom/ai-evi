@@ -1,24 +1,76 @@
 import importlib.util
 import pathlib
+import json
 import sqlite3
 import unittest
+import sys
 from unittest.mock import patch
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT/'bridge'))
 spec = importlib.util.spec_from_file_location('sender', ROOT/'bridge/bist_sync.py')
 sender = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sender)
 
 class Bars(unittest.TestCase):
     def test_incomplete_invalid_and_future_are_filtered(self):
-        self.assertIsNone(sender.normalize('TUPRS', 1000, [10,11,9,10,100], 1800))
-        self.assertIsNone(sender.normalize('TUPRS', 1000, [10,11,12,10,100], 2000))
-        self.assertIsNone(sender.normalize('TUPRS', 1000, [10,11,9,float('nan'),100], 2000))
-        self.assertIsNotNone(sender.normalize('TUPRS', 1000, [10,11,9,10,100], 2000))
+        self.assertIsNone(sender.normalize('TUPRS', 900, [10,11,9,10,100], 1799))
+        self.assertIsNone(sender.normalize('TUPRS', 900, [10,11,12,10,100], 2000))
+        self.assertIsNone(sender.normalize('TUPRS', 900, [10,11,9,float('nan'),100], 2000))
+        self.assertIsNotNone(sender.normalize('TUPRS', 900, [10,11,9,10,100], 2000))
+    def test_snapshot_timestamp_is_rejected(self):
+        self.assertIsNone(sender.normalize('TUPRS', 1435, [10,11,9,10,100], 3000))
+        self.assertIsNotNone(sender.normalize('TUPRS', 900, [10,11,9,10,100], 1800))
     def test_yahoo_null_bar_not_sent(self):
-        data={'chart':{'result':[{'timestamp':[1000,1900], 'indicators':{'quote':[
+        data={'chart':{'result':[{'meta':{'instrumentType':'EQUITY','regularMarketTime':2000},'timestamp':[900,1800], 'indicators':{'quote':[
             {'open':[10,None],'high':[11,11],'low':[9,9],'close':[10,10],'volume':[100,100]}]}}]}}
         with patch.object(sender,'request_json',return_value=data):
             self.assertEqual(len(sender.yahoo('TUPRS',2000)),1)
+
+class Funnel(unittest.TestCase):
+    def candles(self,symbol,last):
+        history=[dict(symbol=symbol,interval='15m',time=f'2026-10-08T{10+i//4:02d}:{i%4*15:02d}:00.000Z',open=99,high=100,low=98,close=99,volume=100) for i in range(20)]
+        return history+[dict(symbol=symbol,interval='15m',time='2026-10-09T07:00:00.000Z',**last)]
+    def test_vectorized_all_conditions_and_risk_exclusion(self):
+        good=dict(open=100,high=104,low=100,close=103.5,volume=200)
+        bars=self.candles('TUPRS',good)+self.candles('ASELS',{**good,'close':100.1})+self.candles('THYAO',{**good,'high':110})+self.candles('EREGL',good)
+        hot=sender.stage_one(bars,{'TUPRS','ASELS','THYAO'})
+        self.assertEqual(list(hot.symbol),['TUPRS'])
+        self.assertEqual(hot.iloc[0].rvol,2)
+    def test_delayed_provider_clock_rejects_in_progress_aligned_candle(self):
+        data={'chart':{'result':[{'meta':{'instrumentType':'EQUITY','regularMarketTime':2000},
+         'timestamp':[900,1800], 'indicators':{'quote':[{'open':[10,10],'high':[11,11],'low':[9,9],'close':[10,10],'volume':[100,100]}]}}]}}
+        with patch.object(sender,'request_json',return_value=data):
+            rows=sender.yahoo('TUPRS',4000)
+            self.assertEqual(len(rows),1)
+    def test_restrictions_active_expiry_and_stale_rejected(self):
+        from bist_universe import parse_restrictions
+        from datetime import datetime,timezone
+        text='09.10.2026 08:29:00;\nPay Adı;İşlem Kodu;Uygulanan Tedbir Kodu;Uygulanan Tedbir Adı;Tedbirin İlk Tarihi;Tedbirin Son Tarihi;\nX;TUPRS;PBRUT;BRÜT TAKAS;01.10.2026;09.10.2026;\nX;ASELS;PBRUT;BRÜT TAKAS;01.10.2026;08.10.2026;'
+        risk=parse_restrictions(text,datetime(2026,10,9,8,tzinfo=timezone.utc))
+        self.assertEqual(risk['excluded'],['TUPRS'])
+        with self.assertRaises(ValueError):parse_restrictions(text,datetime(2026,10,10,8,tzinfo=timezone.utc))
+
+class Universe(unittest.TestCase):
+    def test_official_market_parser_and_no_fund_or_bond_issuers(self):
+        from bist_universe import parse_markets
+        symbols=['THYAO','TUPRS','ASELS','EREGL']+[f'T{i:04d}' for i in range(420)]
+        rows=[{'stockCode':s,'types':'IGS','fundOid':None} for s in symbols]
+        markets=[{'financialMarketOid':'test','financialMarketName':'PAY PİYASASI',
+                  'marketName':'ANA PAZAR','marketDetailContentList':rows},
+                 {'financialMarketOid':'test2','financialMarketName':'BORÇLANMA ARAÇLARI PİYASASI',
+                  'marketName':'ANA PAZAR','marketDetailContentList':[{'stockCode':'BOND','types':'IGS'}]}]
+        fragment='test:'+json.dumps(markets)
+        html='<script>self.__next_f.push('+json.dumps([1,fragment])+')</script>'
+        result=parse_markets(html)
+        self.assertEqual(set(result),set(symbols))
+        self.assertNotIn('BOND',result)
+    def test_all_eight_partitions_cover_universe_once(self):
+        from bist_universe import partition
+        symbols=[f'T{i:04d}' for i in range(631)]
+        parts=[partition(symbols,i,8) for i in range(8)]
+        self.assertEqual(sorted(x for p in parts for x in p),symbols)
+        self.assertEqual(len(set(x for p in parts for x in p)),631)
+        self.assertLessEqual(max(map(len,parts))-min(map(len,parts)),1)
 
 class Accounting(unittest.TestCase):
     def setUp(self):

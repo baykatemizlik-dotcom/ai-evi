@@ -7,6 +7,7 @@ The existing mobile dashboard and ACCESS_TOKEN sessions remain available.
 
 1. Apply `migrations/0010_cloud_bridge.sql` **once** to the existing D1 database.
    It preserves existing cash/trades and adds the idempotent, atomic paper triggers.
+   Apply additive `migrations/0011_dynamic_funnel.sql` for risk, candidate and scan-report tables.
 2. Deploy `worker/index.js` (self-contained). `worker/cloud_bridge.mjs` is its tested
    source module; it does not need a separate upload when using the dashboard editor.
 3. GitHub repository Settings → Secrets and variables → Actions:
@@ -30,21 +31,50 @@ its fallback imports history but never enables intraday paper entries or ACTIVE.
 The first 10:00 run cannot import a fully closed 10:00 candle; normally the first
 current-session candle becomes usable after 10:15, depending on provider delay.
 
-A validated recent closed candle enables ACTIVE for that symbol. After 20 minutes
+A validated recent closed candle enables ACTIVE for that symbol. After 35 minutes
 without a newly closed candle, status becomes BLOCKED again. No authenticated
 provider/KAP/risk verification is claimed: `market_feed_verified=false`,
 `risk_verified=false`, `orders_sent=0` always. Signals and trades are technical
 paper simulations only; real broker orders and AI requests are disabled.
 
-Pilot symbols are a configured watchlist, not an assertion of today's official
-index or market membership. Sender sends one symbol/request and up to 100 bars.
-Each ingest uses JSON bulk SQL rather than one query per candle.
+## Three-stage dynamic funnel
 
-Signals: >=21 bars, RVOL >=2.5, green candle body >=0.6, breakout above the
-previous 20 highs, close above session VWAP. A signal generated at ingestion
-can only fill at a subsequent bar open AFTER its observation time. Thus the
-first scan does not immediately buy historical prices. The paper simulation
-records that next bar's open after the candle has closed and arrived.
+KAP equity-market classification, company type and a strict `[A-Z0-9]{3,6}`
+symbol filter exclude warrants, funds/ETFs and debt instruments. The current
+snapshot contains 631 equity symbols; this is not a fixed symbol-count target.
+Prepare refreshes KAP (a dated snapshot may be used for at most seven days).
+The official Borsa Istanbul daily restrictions CSV is checked independently.
+ALT, YAKIN IZLEME and PIYASA ONCESI markets use gross settlement and are excluded;
+all currently restricted shares are excluded as well. On 2026-10-09 this leaves
+530 eligible shares. An unavailable/stale risk list blocks new candidates;
+existing positions still receive monitoring bars. Neither a regex nor OHLCV
+patterns can prove absence of manipulation or wash trading.
+
+1. Python partitions the eligible universe exactly once across eight Actions
+   jobs. Pandas/NumPy filters each symbol's latest closed 15m bar simultaneously:
+   RVOL >=2 against the **previous** 20 bars, close > open, body/range >=0.60,
+   upper wick/range <=0.20. No fixed candidate count is imposed. It rejects
+   off-grid timestamps and bars not closed according to both wall clock and
+   Yahoo's provider timestamp. The final row is discarded only if unfinished.
+2. Only hot candidates are posted with up to 100 historical closed bars for
+   session VWAP. Open-position/pending-signal symbols also receive monitoring
+   bars even when cold, so stops and later entries continue to work. The Worker
+   rechecks stage 1, previous-20-high breakout and current-session VWAP. Freshness
+   tolerance is 35 minutes from bar end. Each shard reports actual fetched
+   coverage separately from the number of posted candidates.
+3. After the shard jobs finish, finalize ranks fresh momentum candidates globally
+   and selects **up to four**, possibly none. It creates pending paper signals;
+   it never fabricates trades merely to fill the two slots.
+
+Previously imported off-grid rows are preserved for audit and excluded from
+freshness, signals, entries and exits. D1 records and cash are never reset.
+
+A signal can fill only at a subsequent bar open at or after the time it was
+actually observed. The fill is recorded when that closed bar later arrives.
+N+1 is usable only when its open is at or after signal observation; with delayed
+Yahoo data, finalization may already be later than N+1 open, so the engine waits
+for a later eligible bar. It never backdates a signal or uses future bars to
+select a signal. This delayed indicative feed cannot offer real-time scalp fills.
 
 SCALP: 2 slots, <=1250 TL each, existing 2500 TL cash, integer lots; buy +0.2%
 slippage and 0.2% commission, sell -0.2% slippage and 0.2% commission.
@@ -59,3 +89,6 @@ previously imported Yahoo candles prevent duplicate debits/credits on retries.
 `node --test tests/cloud_bridge.test.mjs`
 
 Tests use synthetic bars in isolated temporary databases, never production data.
+
+Current automated suite: 12 Python and 13 Node tests, including full isolated
+risk → hot ingest → selection → future entry → stop → idempotent retry flow.

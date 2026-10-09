@@ -12,10 +12,11 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
-# Pilot watchlist, NOT a claim of current official index/market membership.
-SYMBOLS = ('THYAO', 'TUPRS', 'ASELS', 'EREGL', 'AKBNK', 'GARAN', 'ISCTR',
-           'YKBNK', 'BIMAS', 'KCHOL', 'SAHOL', 'SISE', 'TCELL', 'TTKOM',
-           'FROTO', 'TOASO', 'ENKAI', 'PETKM', 'PGSUS', 'SASA')
+from bist_universe import load_universe, partition, restrict_universe
+import re
+import pandas as pd
+import numpy as np
+
 UTC = dt.timezone.utc
 MAX_BYTES = 2_000_000
 
@@ -55,7 +56,7 @@ def normalize(symbol, timestamp, values, now):
     # Timestamps are UTC bar START times. Only completed candles are sent.
     if not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
         return None
-    if timestamp + 900 > now or timestamp < now - 7 * 86400:
+    if timestamp % 900 != 0 or timestamp + 900 > now or timestamp < now - 7 * 86400:
         return None
     if len(values) != 5 or any(isinstance(v, bool) or not isinstance(v, (int, float))
                               or not math.isfinite(v) for v in values):
@@ -76,12 +77,18 @@ def yahoo(symbol, now):
     if chart.get('error') or not result:
         raise FeedError('YAHOO_NO_DATA')
     x = result[0]
+    meta=x.get('meta',{})
+    if meta.get('instrumentType')!='EQUITY':raise FeedError('YAHOO_NOT_EQUITY')
+    provider_time=meta.get('regularMarketTime')
+    if not isinstance(provider_time,(int,float)) or not math.isfinite(provider_time):
+        raise FeedError('YAHOO_PROVIDER_CLOCK_UNAVAILABLE')
+    confirmed_now=min(now,provider_time)
     q = ((x.get('indicators') or {}).get('quote') or [{}])[0]
     bars = []
     for i, timestamp in enumerate(x.get('timestamp') or []):
         values = [(q.get(k) or [])[i] if i < len(q.get(k) or []) else None
                   for k in ('open', 'high', 'low', 'close', 'volume')]
-        bar = normalize(symbol, timestamp, values, now)
+        bar = normalize(symbol, timestamp, values, confirmed_now)
         if bar:
             bars.append(bar)
     if not bars:
@@ -110,58 +117,99 @@ def twelve(symbol, now, key):
         raise FeedError('TWELVE_NO_CLOSED_BARS')
     return sorted(bars, key=lambda b: b['time'])[-100:]
 
-def main():
-    base = os.environ.get('BIST_WORKER_URL', '').rstrip('/')
-    token = os.environ.get('BIST_INGEST_TOKEN', '')
-    parsed = urllib.parse.urlsplit(base)
-    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or \
-            parsed.password or parsed.query or parsed.fragment or not token:
+def stage_one(all_bars, eligible_symbols):
+    if not all_bars:return pd.DataFrame()
+    df=pd.DataFrame(all_bars).sort_values(['symbol','time']).drop_duplicates(['symbol','time'])
+    prior=df.groupby('symbol')['volume'].transform(lambda x:x.shift(1).rolling(20,min_periods=20).mean())
+    spread=df['high']-df['low']+1e-9
+    df['rvol']=np.divide(df['volume'],prior.where(prior>0))
+    df['body']=np.abs(df['close']-df['open'])/spread
+    df['upper_wick']=(df['high']-df['close'])/spread
+    latest=df.groupby('symbol',sort=False).tail(1)
+    mask=((latest.rvol>=2.0)&(latest.close>latest.open)&(latest.body>=.60)&
+          (latest.upper_wick<=.20)&latest.symbol.isin(eligible_symbols))
+    return latest.loc[mask].copy()
+
+
+def worker_config():
+    base=os.environ.get('BIST_WORKER_URL','').rstrip('/')
+    token=os.environ.get('BIST_INGEST_TOKEN','')
+    parsed=urllib.parse.urlsplit(base)
+    if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or not token:
         raise FeedError('CONFIGURE_BIST_WORKER_URL_AND_BIST_INGEST_TOKEN')
-    now = time.time()
-    local = dt.datetime.fromtimestamp(now, ZoneInfo('Europe/Istanbul'))
-    minutes = local.hour * 60 + local.minute
-    if os.environ.get('GITHUB_EVENT_NAME') == 'schedule' and \
-            (local.weekday() >= 5 or not 600 <= minutes <= 1100):
-        print('SKIPPED_OUTSIDE_SESSION')
+    return base,token
+
+
+def worker_call(path,body=None):
+    base,token=worker_config()
+    return request_json(base+path,body,{'Authorization':'Bearer '+token,'Content-Type':'application/json'})
+
+
+def main():
+    if '--prepare' in sys.argv:
+        universe = restrict_universe(load_universe())
+        worker_call('/bist/feed/risk', {'symbols':universe['symbols'],'eligible_symbols':universe['eligible_symbols'],
+                    'risk':universe.get('risk'), 'risk_status':universe['risk_status']})
+        output = os.environ.get('GITHUB_OUTPUT')
+        if not output:
+            raise FeedError('GITHUB_OUTPUT_REQUIRED')
+        with open(output, 'a') as stream:
+            stream.write('universe=' + json.dumps(universe, separators=(',', ':')) + '\n')
+        print('UNIVERSE symbols=',len(universe['symbols']),'eligible=',len(universe['eligible_symbols']),'risk=',universe['risk_status'])
         return 0
+    run_id=os.environ.get('BIST_RUN_ID') or dt.datetime.now(UTC).strftime('%Y%m%dT%H%M')
+    if '--finalize' in sys.argv:
+        print('FINALIZE',worker_call('/bist/feed/finalize',{'run_id':run_id}))
+        return 0
+    raw_universe=os.environ.get('BIST_UNIVERSE_JSON')
+    universe=json.loads(raw_universe) if raw_universe else restrict_universe(load_universe())
+    all_symbols=sorted(set(universe.get('symbols',[])))
+    if len(all_symbols)<400 or any(not re.fullmatch(r'[A-Z0-9]{3,6}',x) for x in all_symbols):
+        raise FeedError('INVALID_BIST_UNIVERSE')
+    eligible=set(universe.get('eligible_symbols',[]))
+    monitors=set(worker_call('/bist/feed/monitor').get('symbols',[]))
+    shard=int(os.environ.get('BIST_SHARD_INDEX','0'));shards=int(os.environ.get('BIST_SHARD_COUNT','1'))
+    symbols=partition(sorted(eligible|monitors),shard,shards)
+    print(f'SCOPE total={len(all_symbols)} eligible={len(eligible)} shard={shard}/{shards} assigned={len(symbols)}')
+    worker_config()
+    now=time.time(); local=dt.datetime.fromtimestamp(now,ZoneInfo('Europe/Istanbul'))
+    if os.environ.get('GITHUB_EVENT_NAME')=='schedule' and (local.weekday()>=5 or not 600<=local.hour*60+local.minute<=1100):
+        print('SKIPPED_OUTSIDE_SESSION');return 0
     key = os.environ.get('TWELVE_DATA_API_KEY', '')
     fallback_count = 0
     last_twelve = 0.0
-    active = 0
-    imported = 0
-    for symbol in SYMBOLS:
+    fetched={};errors=0
+    for symbol in symbols:
         try:
             try:
-                bars = yahoo(symbol, time.time())
-                source = 'YAHOO_INDICATIVE'
-                feed_type = 'INDICATIVE_INTRADAY'
+                bars=yahoo(symbol,time.time());source='YAHOO_INDICATIVE';feed_type='INDICATIVE_INTRADAY'
             except FeedError:
-                # <= 6 requests/run; 34 scheduled runs/day => <=204 fallback credits.
-                if not key or fallback_count >= 6:
-                    raise FeedError('YAHOO_UNAVAILABLE_NO_USABLE_FALLBACK') from None
-                time.sleep(max(0, 12 - (time.monotonic() - last_twelve)))
-                last_twelve = time.monotonic()
-                fallback_count += 1
-                bars = twelve(symbol, time.time(), key)
-                source = 'TWELVE_DATA_XIST_EOD'
-                feed_type = 'EOD'
-            body = {'source': source, 'feed_type': feed_type, 'bars': bars}
-            body['batch_id'] = hashlib.sha256(json.dumps(body, sort_keys=True,
-                separators=(',', ':')).encode()).hexdigest()
-            result = request_json(base + '/bist/feed/ingest', body,
-                {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
-            if not result.get('ok'):
-                raise FeedError('INGEST_NOT_ACCEPTED')
-            imported += 1
-            active += result.get('status') == 'ACTIVE'
-            print(symbol, 'accepted=', result.get('bar_rows'),
-                  'state=', result.get('status'), 'paper=', result.get('engine'))
+                if not key or shard!=0 or fallback_count>=6:raise FeedError('YAHOO_UNAVAILABLE_NO_USABLE_FALLBACK') from None
+                time.sleep(max(0,12-(time.monotonic()-last_twelve)));last_twelve=time.monotonic();fallback_count+=1
+                bars=twelve(symbol,time.time(),key);source='TWELVE_DATA_XIST_EOD';feed_type='EOD'
+            fetched[symbol]={'bars':bars,'source':source,'feed_type':feed_type}
+            # Close/entry monitoring cannot depend on whether today's candle stays hot.
+            if symbol in monitors:
+                worker_call('/bist/feed/ingest',{**fetched[symbol],'run_id':run_id,'purpose':'MONITOR'})
         except FeedError as exc:
-            print(symbol, str(exc))
+            errors+=1;print(symbol,str(exc))
         time.sleep(3)
-    print(f'SUMMARY imported_symbols={imported} active_symbols={active}')
-    # Historical data alone must not pass an intraday scan as healthy.
-    return 0 if active else 1
+    hot=stage_one([b for x in fetched.values() if x['feed_type']=='INDICATIVE_INTRADAY' for b in x['bars']],eligible)
+    hot_symbols=set(hot.symbol) if not hot.empty else set()
+    posted=0
+    for symbol in sorted(hot_symbols):
+        try:
+            result=worker_call('/bist/feed/ingest',{**fetched[symbol],'run_id':run_id,'purpose':'HOT_CANDIDATE'})
+            posted+=1;print(symbol,'stage2=',result.get('stage2'),'engine=',result.get('engine'))
+        except FeedError as exc:errors+=1;print(symbol,str(exc))
+    latest=max((x['bars'][-1]['time'] for x in fetched.values() if x['feed_type']=='INDICATIVE_INTRADAY'),default=None)
+    report={'run_id':run_id,'shard':shard,'universe_total':len(all_symbols),'eligible_total':len(eligible),
+            'assigned':len(symbols),'fetched':len(fetched),'hot':len(hot_symbols),'posted':posted,'errors':errors,'last_bar_time':latest}
+    worker_call('/bist/feed/report',report)
+    print('SUMMARY',report)
+    if not eligible:print('BLOCKED_RESTRICTIONS_UNAVAILABLE: monitoring only')
+    # A zero-hot scan is a normal outcome. Do not force candidate/trade counts.
+    return 0 if fetched or not symbols else 1
 
 if __name__ == '__main__':
     try:

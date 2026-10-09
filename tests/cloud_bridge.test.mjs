@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {validate, fresh, entryPlan, exitPlan, technicalSignal, ingest} from '../worker/cloud_bridge.mjs';
+import {validate, fresh, entryPlan, exitPlan, technicalSignal, ingest, eligibleEntryBar, stageOneMetrics} from '../worker/cloud_bridge.mjs';
 const now=Date.parse('2026-10-09T07:31:00Z');
 const bar={symbol:'TUPRS',interval:'15m',time:'2026-10-09T07:00:00Z',open:100,high:101,low:99,close:100.5,volume:100};
 const payload={source:'YAHOO_INDICATIVE',feed_type:'INDICATIVE_INTRADAY',bars:[bar]};
@@ -57,4 +57,72 @@ test('actual Worker rejects missing/wrong token; ingress cannot use cookie auth'
  }
  const status=await worker.fetch(new Request('https://example.test/bist/provider/probe',{method:'POST',headers:{Authorization:'Bearer unit-test-only'}}),env);
  assert.equal(status.status,410);
+});
+
+test('snapshot rejected in Worker too; all valid BIST symbols admitted',()=>{
+ assert.throws(()=>validate({...payload,bars:[{...bar,time:'2026-10-09T07:03:55Z'}]},now));
+ assert.equal(validate({...payload,bars:[{...bar,symbol:'ACSEL'}]},now).bars[0].symbol,'ACSEL');
+ assert.throws(()=>validate({...payload,bars:[{...bar,symbol:'../../evil'}]},now));
+});
+test('35 minute freshness boundary and legacy snapshot filtering',()=>{
+ const row={...bar,feed_type:'INDICATIVE_INTRADAY'};
+ const end=Date.parse(bar.time)+900000;
+ assert.equal(fresh(row,end+35*60000),true);
+ assert.equal(fresh(row,end+35*60000+1),false);
+ assert.equal(fresh({...row,time:'2026-10-09T07:23:55Z'},Date.parse('2026-10-09T07:45:00Z')),false);
+});
+test('N+1 entry only if known by its open; delayed Yahoo cannot backdate a fill',()=>{
+ const candles=['07:00','07:15','07:30','07:45'].map(t=>({bar_time:'2026-10-09T'+t+':00.000Z',open:100}));
+ const signal={bar_time:candles[0].bar_time,observed_at:candles[1].bar_time,expires_at:candles[3].bar_time};
+ assert.equal(eligibleEntryBar(signal,candles).bar_time,candles[1].bar_time);
+ assert.equal(eligibleEntryBar({...signal,observed_at:'2026-10-09T07:31:00.000Z'},candles).bar_time,candles[3].bar_time);
+ assert.equal(eligibleEntryBar({...signal,observed_at:'2026-10-09T07:46:00.000Z'},candles),null);
+ const chosen=eligibleEntryBar(signal,candles);
+ assert.equal(entryPlan(2500,chosen.open).executed,100.2);
+});
+
+test('Worker independently enforces RVOL2 green/body/wick before breakout/VWAP',()=>{
+ const previous=Array.from({length:20},()=>({time:bar.time,open:99,high:100,low:98,close:99,volume:100}));
+ const last={time:bar.time,open:100,high:104,low:100,close:103.5,volume:200};
+ assert.equal(stageOneMetrics([...previous,last]).rvol,2);
+ assert.ok(technicalSignal([...previous,last]));
+ assert.equal(technicalSignal([...previous,{...last,high:110}]),null);
+ assert.equal(technicalSignal([...previous,{...last,close:100.1}]),null);
+ assert.equal(technicalSignal([...previous,{...last,volume:199}]),null);
+});
+test('full funnel: hot ingest → global selection → future eligible entry → stop → retry preserves cash',async()=>{
+ const {mkdtempSync,rmSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');
+ const {execFileSync}=await import('node:child_process');
+ const {riskIngest,finalize,monitorSymbols,feedStatus,reportIngest}=await import('../worker/cloud_bridge.mjs');
+ const dir=mkdtempSync(join(tmpdir(),'bist-test-')),path=join(dir,'db.sqlite');
+ const adapter=new URL('./funnel_sqlite.py',import.meta.url).pathname;
+ const call=data=>JSON.parse(execFileSync('python3',[adapter,path],{input:JSON.stringify(data),encoding:'utf8'}));
+ call({init:true});
+ const db={prepare(sql){return {sql,params:[],bind(...p){this.params=p;return this;},async all(){return call({statements:[this]})[0];},async first(){return (await this.all()).results[0]||null;},async run(){return await this.all();}};},async batch(statements){return call({statements});}};
+ const env={DB:db};const req=body=>new Request('https://example.test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+ try{
+  const risk={source:'https://www.borsaistanbul.com/erd/menkul_tedbir_listesi.csv',as_of:'2026-10-09T07:00:00Z',valid_until:'2026-10-09T21:00:00Z'};
+  assert.equal((await riskIngest(req({symbols:['TUPRS'],eligible_symbols:['TUPRS'],risk,risk_status:'VERIFIED_OFFICIAL_RESTRICTIONS'}),env,now)).status,200);
+  const previous=Array.from({length:20},(_,i)=>({...bar,time:new Date(Date.parse('2026-10-08T07:00:00Z')+i*900000).toISOString(),open:99,high:100,low:98,close:99,volume:100}));
+  const signalBar={...bar,open:100,high:104,low:100,close:103.5,volume:200};
+  const batch={...payload,bars:[...previous,signalBar],purpose:'HOT_CANDIDATE',run_id:'test-1'};
+  const first=await (await ingest(req(batch),env,now)).json();assert.equal(first.stage2,'MOMENTUM_PASSED');
+  assert.equal((await db.prepare('SELECT COUNT(*) n FROM virtual_trades').first()).n,0);
+  const selected=await (await finalize(req({run_id:'test-1'}),env,now+60000)).json();assert.deepEqual(selected.selected,['TUPRS']);assert.equal(selected.signals_created,1);
+  assert.equal((await (await finalize(req({run_id:'test-1'}),env,now+60000)).json()).signals_created,0);
+  assert.deepEqual((await (await monitorSymbols(env,now+60000)).json()).symbols,['TUPRS']);
+  const entryBar={...bar,time:'2026-10-09T07:45:00Z',open:103.4,high:104,low:103,close:103.6,volume:100};
+  await ingest(req({...batch,purpose:'MONITOR',bars:[...previous,signalBar,entryBar]}),env,Date.parse('2026-10-09T08:16:00Z'));
+  const trade=await db.prepare('SELECT * FROM virtual_trades').first();assert.equal(trade.entry_time,'2026-10-09T07:45:00.000Z');assert.ok(Math.abs(trade.executed_price-103.4*1.002)<1e-10);
+  const stopBar={...bar,time:'2026-10-09T08:00:00Z',open:104,high:115,low:90,close:104,volume:100};
+  const closeBatch={...batch,purpose:'MONITOR',bars:[...previous,signalBar,entryBar,stopBar]};
+  await ingest(req(closeBatch),env,Date.parse('2026-10-09T08:31:00Z'));
+  const closed=await db.prepare('SELECT * FROM virtual_trades').first();assert.equal(closed.exit_reason,'STOP_NET_1_5_PCT');assert.equal(closed.status,'CLOSED');
+  const cash=await db.prepare("SELECT available_cash cash FROM paper_cash_accounts WHERE strategy='SCALP'").first();
+  await ingest(req(closeBatch),env,Date.parse('2026-10-09T08:31:00Z'));
+  assert.deepEqual(await db.prepare("SELECT available_cash cash FROM paper_cash_accounts WHERE strategy='SCALP'").first(),cash);
+  assert.ok((await feedStatus(db,Date.parse('2026-10-09T08:31:00Z'))).scanner_live);
+  assert.equal((await reportIngest(req({run_id:'test-1',shard:0,universe_total:631,eligible_total:530,assigned:67,fetched:60,hot:1,posted:1,errors:7,last_bar_time:stopBar.time}),env,Date.parse('2026-10-09T08:31:00Z'))).status,200);
+  const coverage=await feedStatus(db,Date.parse('2026-10-09T08:31:00Z'));assert.equal(coverage.scanned_symbols,60);assert.equal(coverage.eligible_total,530);assert.equal(coverage.shards_completed,1);
+ }finally{rmSync(dir,{recursive:true,force:true});}
 });
