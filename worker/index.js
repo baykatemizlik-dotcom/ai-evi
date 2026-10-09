@@ -68,22 +68,29 @@ const kapPreflight=async(env)=>{
 const scanUniverse=async(env)=>{
  let raw=[],source="NONE";
  if(env.BIST_UNIVERSE_URL){
-   const u=new URL(env.BIST_UNIVERSE_URL);if(u.protocol!=="https:")throw Error("UNIVERSE_HTTPS_REQUIRED");
-   const r=await fetch(u.toString(),{signal:AbortSignal.timeout(10000)});if(!r.ok)throw Error("UNIVERSE_HTTP_"+r.status);
+   const u=new URL(env.BIST_UNIVERSE_URL);
+   if(u.protocol!=="https:")throw Error("UNIVERSE_HTTPS_REQUIRED");
+   const r=await fetch(u.toString(),{signal:AbortSignal.timeout(10000)});
+   if(!r.ok)throw Error("UNIVERSE_HTTP_"+r.status);
    const j=await r.json();raw=Array.isArray(j)?j:Array.isArray(j.symbols)?j.symbols:[];source=u.hostname;
  }else if(env.SCAN_SYMBOLS){
    raw=String(env.SCAN_SYMBOLS).split(",");source="MANUAL_CONFIG";
  }else{
-   // KAP Pazarlar is a public reference catalogue, NOT market-data or disclosure verification.
+   // Public KAP page is a catalogue. Never infer tradability from a company count.
    const r=await fetch("https://www.kap.org.tr/tr/Pazarlar",{headers:{"Accept":"text/html"},signal:AbortSignal.timeout(10000)});
    if(!r.ok)throw Error("KAP_UNIVERSE_HTTP_"+r.status);
    const html=await r.text();
    if(html.length<1000||html.length>4000000)throw Error("KAP_UNIVERSE_INVALID_HTML");
-   const section=html.match(/YILDIZ PAZAR[\s\S]*?ANA PAZAR[\s\S]*?(?:ALT PAZAR|YAKIN İZLEME PAZARI)/i)?.[0];
-   if(!section)throw Error("KAP_UNIVERSE_MARKET_SECTIONS_MISSING");
-   const text=section.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi," ").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi," ").replace(/<[^>]*>/g," ").replace(/&nbsp;|&#160;/gi," ").replace(/\s+/g," ");
-   const matches=[...text.matchAll(/(?:^|\s)([A-Z0-9]{4,6})\s+[A-ZÇĞİÖŞÜ]/g)].map(x=>x[1]);
-   raw=matches;source="KAP_PUBLIC_MARKET_CATALOG";
+   // Section boundaries must follow the numbered market rows, not the page navigation.
+   const strip=t=>t.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi," ").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi," ").replace(/<[^>]*>/g," ").replace(/&nbsp;|&#160;/gi," ").replace(/\s+/g," ").trim();
+   const page=strip(html);
+   const star=page.search(/YILDIZ PAZAR\s+\d+\s+Şirket\s*\/\s*Fon Bulundu/i);
+   const main=page.search(/ANA PAZAR\s+\d+\s+Şirket\s*\/\s*Fon Bulundu/i);
+   const lower=page.search(/ALT PAZAR\s+\d+\s+Şirket\s*\/\s*Fon Bulundu/i);
+   if(star<0||main<=star||lower<=main)throw Error("KAP_UNIVERSE_MARKET_SECTIONS_MISSING");
+   const selected=page.slice(star,lower);
+   raw=[...selected.matchAll(/(?:^|\s)\d{1,4}\s+\|?\s*([A-Z][A-Z0-9]{2,6})\s+\|?\s+/g)].map(x=>x[1]);
+   source="KAP_PUBLIC_MARKET_CATALOG";
    if(raw.length<100||raw.length>1000)throw Error("KAP_UNIVERSE_PARSING_UNVERIFIED_"+raw.length);
  }
  const names=[...new Set(raw.map(x=>String(typeof x==="string"?x:x?.symbol||"").trim().toUpperCase()).filter(x=>/^[A-Z][A-Z0-9]{2,6}$/.test(x)))].slice(0,1000);
