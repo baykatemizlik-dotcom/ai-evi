@@ -1,3 +1,4 @@
+import {tickStrategies,fillStrategy,enqueueScalp,strategyMonitor,saveQuote} from './strategy_engines.mjs';
 // Market data is ingress-only. The only outbound request is the OpenAI paper referee.
 export const validSymbol = symbol => typeof symbol==='string' && /^[A-Z0-9]{3,6}$/.test(symbol);
 const FRESH_MS = 35 * 60000;
@@ -96,67 +97,10 @@ export function eligibleEntryBar(signal, bars) {
  if(!Number.isFinite(earliest)||!Number.isFinite(expiry))return null;
  return bars.find(b=>{const t=Date.parse(b.bar_time);return t%900000===0 && t>=earliest && t<=expiry;})||null;
 }
-export async function runPaper(db, symbol, now) {
- const bars=await symbolBars(db,symbol,now),last=bars.at(-1);
- const result={signals_created:0,opened:0,closed:0,mode:'PAPER_ONLY',risk_verified:false};
- const positions=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN' AND symbol=? AND feed_entry_key IS NOT NULL").bind(symbol).all();
- for(const trade of positions.results||[]) {
-  const exit=exitPlan(trade,bars);
-  if(exit)result.closed+=await closePaper(db,trade,exit,now)?1:0;
- }
- if(!last || !fresh({...last,feed_type:'INDICATIVE_INTRADAY'},now))return {...result,blocked:'STALE_OR_EOD'};
- const pending=await db.prepare("SELECT * FROM bist_feed_signals WHERE symbol=? AND status='PENDING' AND expires_at>=? ORDER BY observed_at DESC LIMIT 1").bind(symbol,new Date(now).toISOString()).first();
- if(entryWindow(now) && !await db.prepare('SELECT trt_date FROM bist_session_lock WHERE trt_date=?').bind(trtDate(now)).first() && pending && await entryApproved(db,pending.signal_key,bars,now) && await restrictionClear(db,symbol,now) && await db.prepare("SELECT signal_key FROM bist_ai_decisions WHERE signal_key=? AND status='APPROVED' AND model='gpt-4o-mini'").bind(pending.signal_key).first()){
-  const next=eligibleEntryBar(pending,bars);
-  // Never fill a signal at a price observed before it was generated.
-  if(next){
-   const account=await db.prepare("SELECT available_cash FROM paper_cash_accounts WHERE strategy='SCALP'").first();
-   const slots=await db.prepare("SELECT slot_id,symbol FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN'").all();
-   const open=slots.results||[], slot=[1,2].find(s=>!open.some(x=>x.slot_id===s));
-   const plan=entryPlan(account?.available_cash||0,next.open);
-   if(open.length<2 && slot && !open.some(x=>x.symbol===symbol) && plan.qty>0){
-    try{
-     const r=await db.prepare("INSERT INTO virtual_trades(strategy,symbol,signal_price,executed_price,lot_count,commission,entry_time,status,slot_id,feed_entry_key) VALUES('SCALP',?,?,?,?,?,?,'OPEN',?,?) ON CONFLICT(feed_entry_key) DO NOTHING RETURNING id")
-      .bind(symbol,next.open,plan.executed,plan.qty,plan.commission,next.bar_time,slot,pending.signal_key).first();
-     if(r){result.opened=1;
-      const trade=await db.prepare("SELECT * FROM virtual_trades WHERE feed_entry_key=?").bind(pending.signal_key).first();
-      const exit=exitPlan(trade,bars);
-      if(exit)result.closed+=await closePaper(db,trade,exit,now)?1:0;
-     }
-    }catch(e){if(!/PAPER_SLOT_BUSY|PAPER_INSUFFICIENT_CASH|PAPER_SIGNAL_NOT_ELIGIBLE/.test(String(e)))throw e;result.entry_deferred='CONCURRENT_OR_EXPIRED';}
-   }
-  }
- }
- return result;
-}
-export function entryWindow(now) {
- const p=trtParts(now),minute=Number(p.hour)*60+Number(p.minute);
- return sessionOpen(now)&&minute<1075; // 17:55 TRT
-}
+export async function runPaper(db,symbol,now){return (await tickStrategies(db,now)).scalp;}
+export async function runSniper(db,now){return (await tickStrategies(db,now)).trend;}
+export function entryWindow(now){const p=trtParts(now);return sessionOpen(now)&&Number(p.hour)*60+Number(p.minute)<1060;}
 export function trtDate(now){const p=trtParts(now);return `${p.year}-${p.month}-${p.day}`;}
-export function sniperEntryPlan(cash,price){const executed=price*1.002,qty=Math.floor(cash/(executed*1.002));return {qty,executed,commission:executed*qty*.002};}
-export function initialSniperState(trade){
- const cost=trade.executed_price*trade.lot_count+trade.commission;
- return {peak_price:trade.executed_price,stop_price:cost*.98/(trade.lot_count*.998*.998),last_peak_at:trade.entry_time,last_processed_bar:null,breakeven:0};
-}
-export function sniperAdvance(trade,state,bars){
- const next={...state},cost=trade.executed_price*trade.lot_count+trade.commission;
- const breakPrice=cost/(trade.lot_count*.998*.998),armPrice=breakPrice*1.025;
- for(const b of bars){
-  if(b.bar_time<trade.entry_time||next.last_processed_bar&&b.bar_time<=next.last_processed_bar)continue;
-  const end=new Date(Date.parse(b.bar_time)+900000).toISOString();
-  // Only the stop known at candle OPEN may execute in this candle.
-  if(b.low<=next.stop_price){const raw=Math.min(b.open,next.stop_price),executed=raw*.998;
-   return {state:next,exit:{executed,time:end,pnl:executed*trade.lot_count*.998-cost,reason:next.stop_price>initialSniperState(trade).stop_price+1e-8?(Math.abs(next.stop_price-breakPrice)<1e-8?'SNIPER_BREAKEVEN':'SNIPER_TRAILING_STOP_2_PCT'):'SNIPER_BASE_STOP_NET_2_PCT',quote_time:b.bar_time}};}
-  if(b.high>next.peak_price){next.peak_price=b.high;next.last_peak_at=end;}
-  if(next.peak_price>=armPrice)next.breakeven=1;
-  next.stop_price=Math.max(next.stop_price,next.peak_price*.98,next.breakeven?breakPrice:0);
-  next.last_processed_bar=b.bar_time;
-  if(Date.parse(end)-Date.parse(next.last_peak_at)>=3600000){const executed=b.close*.998;
-   return {state:next,exit:{executed,time:end,pnl:executed*trade.lot_count*.998-cost,reason:'SNIPER_NO_NEW_HIGH_60_MIN',quote_time:b.bar_time}};}
- }
- return {state:next,exit:null};
-}
 export async function symbolBars(db,symbol,now=Date.now()){
  // Keep ALL persisted intervening bars from the earliest open position, not only the latest 100.
  const rows=await db.prepare(`SELECT * FROM bist_bridge_bars WHERE symbol=? AND interval='15m' AND source='YAHOO_INDICATIVE'
@@ -173,83 +117,17 @@ export async function entryApproved(db,key,bars,now){
  if(dailyTurnover(bars)<MIN_DAILY_TURNOVER_TL)return false;
  return !!await db.prepare("SELECT signal_key FROM bist_gemini_decisions WHERE signal_key=? AND status='APPROVED' AND model=? AND completed_at<=?").bind(key,GEMINI_MODEL,new Date(now).toISOString()).first();
 }
-export async function processSniper(db,trade,bars,now){
- let state=await db.prepare('SELECT * FROM bist_sniper_state WHERE trade_id=?').bind(trade.id).first();
- if(!state){const initial=initialSniperState(trade);await db.prepare('INSERT OR IGNORE INTO bist_sniper_state(trade_id,peak_price,stop_price,last_peak_at,breakeven) VALUES(?,?,?,?,0)').bind(trade.id,initial.peak_price,initial.stop_price,initial.last_peak_at).run();state=await db.prepare('SELECT * FROM bist_sniper_state WHERE trade_id=?').bind(trade.id).first();}
- const outcome=sniperAdvance(trade,state,bars),s=outcome.state;
- if(outcome.exit&&await closePaper(db,trade,outcome.exit,now)){
-  await db.prepare('UPDATE bist_sniper_state SET quote_time=?,last_exit_note=?,exit_observed_at=? WHERE trade_id=?').bind(outcome.exit.quote_time,outcome.exit.reason,new Date(now).toISOString(),trade.id).run();return 1;
- }
- // A concurrent retry with an older bar must not roll back the high-water mark.
- await db.prepare(`UPDATE bist_sniper_state SET peak_price=?,stop_price=?,last_peak_at=?,last_processed_bar=?,breakeven=? WHERE trade_id=? AND (last_processed_bar IS NULL OR last_processed_bar<=?)`)
-  .bind(s.peak_price,s.stop_price,s.last_peak_at,s.last_processed_bar,s.breakeven,trade.id,s.last_processed_bar).run();return 0;
-}
-export async function refreshStandby(db,symbol,bars,now){
- const ready=await db.prepare("SELECT * FROM bist_sniper_queue WHERE symbol=? AND status='READY'").bind(symbol).all();
- const last=bars.at(-1);if(!last)return;
- const metrics=stageOneMetrics(bars),session=sameSession(bars);
- const volume=session.reduce((n,b)=>n+b.volume,0),vwap=volume?session.reduce((n,b)=>n+(b.high+b.low+b.close)/3*b.volume,0)/volume:0;
- for(const q of ready.results||[]){
-  if(last.bar_time<=q.last_checked_bar)continue;
-  const good=fresh({...last,feed_type:'INDICATIVE_INTRADAY'},now)&&metrics&&last.close>vwap&&await restrictionClear(db,symbol,now);
-  await db.prepare("UPDATE bist_sniper_queue SET status=?,reason=?,last_checked_bar=?,last_checked_at=?,score=?,expires_at=? WHERE signal_key=? AND status='READY' AND last_checked_bar<?")
-   .bind(good?'READY':'INVALID',good?'HEALTH_RECHECK_PASSED':'VWAP_CANDLE_VOLUME_OR_RISK_FAILED',last.bar_time,new Date(now).toISOString(),good?metrics.rvol+100*(last.close/vwap-1):q.score,new Date(now+3600000).toISOString(),q.signal_key,last.bar_time).run();
- }
-}
-export async function runSniper(db,now){
- const result={opened:0,closed:0};
- const positions=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SWING' AND status='OPEN' AND feed_entry_key LIKE 'SNIPER:%'").all();
- for(const trade of positions.results||[]){const bars=await symbolBars(db,trade.symbol,now);if(bars.length)result.closed+=await processSniper(db,trade,bars,now);}
- if(!entryWindow(now)||await db.prepare('SELECT trt_date FROM bist_session_lock WHERE trt_date=?').bind(trtDate(now)).first())return result;
- if(await db.prepare("SELECT id FROM virtual_trades WHERE strategy='SWING' AND status='OPEN' LIMIT 1").first())return result;
- const queue=await db.prepare(`SELECT q.* FROM bist_sniper_queue q JOIN bist_funnel_risk r ON r.symbol=q.symbol
-  WHERE q.status='READY' AND q.expires_at>=? AND r.eligible=1 AND r.valid_until>?
-  AND NOT EXISTS(SELECT 1 FROM virtual_trades t WHERE t.status='OPEN' AND t.symbol=q.symbol)
-  ORDER BY q.score DESC,q.confidence DESC,q.symbol ASC`).bind(new Date(now).toISOString(),new Date(now).toISOString()).all();
- for(const q of queue.results||[]){
-  if(!await db.prepare("SELECT signal_key FROM bist_ai_decisions WHERE signal_key=? AND status='APPROVED'").bind(q.signal_key).first())continue;
-  const latestExit=await db.prepare('SELECT MAX(exit_observed_at) t FROM bist_sniper_state').first();
-  const bars=await symbolBars(db,q.symbol,now),observed=new Date(Math.max(Date.parse(q.observed_at),Date.parse(q.last_checked_at),Date.parse(latestExit?.t)||0)).toISOString();
-  if(!await entryApproved(db,q.signal_key,bars,now))continue;
-  const next=eligibleEntryBar({...q,observed_at:observed},bars);
-  if(!next||!entryWindow(Date.parse(next.bar_time)))break;
-  if(!fresh({bar_time:q.last_checked_bar,feed_type:'INDICATIVE_INTRADAY'},Date.parse(next.bar_time)))continue;
-  if(!fresh({...bars.at(-1),feed_type:'INDICATIVE_INTRADAY'},now))continue;
-  const account=await db.prepare("SELECT available_cash FROM paper_cash_accounts WHERE strategy='SWING'").first(),plan=sniperEntryPlan(account?.available_cash||0,next.open);
-  if(plan.qty<=0)break;
-  try{const inserted=await db.prepare("INSERT INTO virtual_trades(strategy,symbol,signal_price,executed_price,lot_count,commission,entry_time,status,slot_id,feed_entry_key) VALUES('SWING',?,?,?,?,?,?,'OPEN',1,?) ON CONFLICT(feed_entry_key) DO NOTHING RETURNING id")
-   .bind(q.symbol,next.open,plan.executed,plan.qty,plan.commission,next.bar_time,'SNIPER:'+q.signal_key).first();
-   if(inserted){result.opened=1;const trade=await db.prepare('SELECT * FROM virtual_trades WHERE id=?').bind(inserted.id).first();result.closed+=await processSniper(db,trade,bars,now);}
-  }catch(e){if(!/PAPER_SLOT_BUSY|PAPER_INSUFFICIENT_CASH|PAPER_SIGNAL_NOT_ELIGIBLE/.test(String(e)))throw e;}
-  break;
- }
- return result;
-}
 export async function enforceSessionClose(db,now=Date.now()){
- const p=trtParts(now);if(Number(p.hour)*60+Number(p.minute)<1075)return {closed:0};
- const stamp=new Date(now).toISOString();
- await db.batch([db.prepare('INSERT OR IGNORE INTO bist_session_lock(trt_date,locked_at) VALUES(?,?)').bind(trtDate(now),stamp),
-  db.prepare("UPDATE bist_feed_signals SET status='EXPIRED' WHERE status='PENDING'"),db.prepare("UPDATE bist_sniper_queue SET status='EXPIRED',reason='SESSION_1755_LOCK' WHERE status='READY'")]);
- const positions=await db.prepare("SELECT * FROM virtual_trades WHERE status='OPEN' AND feed_entry_key IS NOT NULL").all();let closed=0;
- for(const trade of positions.results||[]){
-  const rows=await symbolBars(db,trade.symbol,now);
-  const historical=trade.strategy==='SCALP'?exitPlan(trade,rows):null;
-  if(historical&&await closePaper(db,trade,historical,now)){closed++;continue;}
-  if(trade.strategy==='SWING'&&await processSniper(db,trade,rows,now)){closed++;continue;}
-  const bar=rows.at(-1);if(!bar)continue;
-  const executed=bar.close*.998,cost=trade.executed_price*trade.lot_count+trade.commission;
-  const reason='SESSION_1755_INDICATIVE_LAST_CLOSED_BAR';
-  if(await closePaper(db,trade,{executed,time:stamp,pnl:executed*trade.lot_count*.998-cost,reason,quote_time:bar.bar_time},now)){closed++;
-   if(trade.strategy==='SWING')await db.prepare('UPDATE bist_sniper_state SET quote_time=?,last_exit_note=? WHERE trade_id=?').bind(bar.bar_time,reason,trade.id).run();}
- }
- await dailyReport(db,now);return {closed,price_mode:'INDICATIVE_LAST_CLOSED_BAR'};
+ const result=await tickStrategies(db,now);
+ const p=trtParts(now);if(Number(p.hour)*60+Number(p.minute)>=1085)await dailyReport(db,now);
+ return result;
 }
 export async function dailyReport(db,now=Date.now()){
  const date=trtDate(now),start=date+'T00:00:00',end=date+'T23:59:59';
  const [trades,ai,cash,queue]=await Promise.all([
-  db.prepare("SELECT strategy,COUNT(*) trades,SUM(pnl_net) pnl,SUM(CASE WHEN pnl_net>0 THEN 1 ELSE 0 END) wins FROM virtual_trades WHERE status='CLOSED' AND datetime(exit_time,'+3 hours') BETWEEN ? AND ? GROUP BY strategy").bind(start.replace('T',' '),end.replace('T',' ')).all(),
+  db.prepare("SELECT strategy,COUNT(*) exits,SUM(pnl_net) pnl,SUM(CASE WHEN pnl_net>0 THEN 1 ELSE 0 END) wins FROM strategy_exit_legs WHERE datetime(exit_time,'+3 hours') BETWEEN ? AND ? GROUP BY strategy").bind(start.replace('T',' '),end.replace('T',' ')).all(),
   db.prepare("SELECT status,COUNT(*) n,SUM(input_tokens) input_tokens,SUM(output_tokens) output_tokens FROM bist_ai_decisions WHERE substr(datetime(created_at,'+3 hours'),1,10)=? GROUP BY status").bind(date).all(),
-  db.prepare('SELECT strategy,available_cash FROM paper_cash_accounts').all(),db.prepare('SELECT status,COUNT(*) n FROM bist_sniper_queue GROUP BY status').all()]);
+  db.prepare('SELECT strategy,available_cash FROM paper_cash_accounts').all(),db.prepare("SELECT 'SCALP' strategy,status,COUNT(*) n FROM scalp_sniper_queue GROUP BY status UNION ALL SELECT 'SWING',status,COUNT(*) n FROM trend_radar_queue GROUP BY status").all()]);
  const report={trt_date:date,generated_at:new Date(now).toISOString(),paper_only:true,trades:trades.results,ai:ai.results,cash:cash.results,standby:queue.results};
  await db.prepare('INSERT INTO bist_daily_reports(trt_date,generated_at,report_json) VALUES(?,?,?) ON CONFLICT(trt_date) DO UPDATE SET generated_at=excluded.generated_at,report_json=excluded.report_json').bind(date,report.generated_at,JSON.stringify(report)).run();return report;
 }
@@ -265,7 +143,7 @@ export async function readBody(request) {
 }
 export async function ingest(request, env, now=Date.now()) {
  if(!env.DB)return json({error:'DB_MISSING'},503);
- let data;try{data=validate(await readBody(request),now);}catch(e){return json({error:e.message||'INVALID_JSON'},e.message==='PAYLOAD_TOO_LARGE'?413:422);}
+ let data,body;try{body=await readBody(request);data=validate(body,now);}catch(e){return json({error:e.message||'INVALID_JSON'},e.message==='PAYLOAD_TOO_LARGE'?413:422);}
  const symbol=data.bars[0].symbol, latest=data.bars.at(-1), received=new Date(now).toISOString();
  const inserted=await env.DB.batch([
   env.DB.prepare(`INSERT INTO bist_bridge_bars(symbol,interval,bar_time,open,high,low,close,volume,source,received_at)
@@ -284,11 +162,9 @@ export async function ingest(request, env, now=Date.now()) {
    .bind(symbol,latest.time,data.source,data.feed_type,received)
  ]);
  const active=fresh({...latest,feed_type:data.feed_type},now);
- // Run on retries too: a storage success + engine failure can recover safely.
- const sniper=await runSniper(env.DB,now);
- const engine=await runPaper(env.DB,symbol,now);
- const session=await enforceSessionClose(env.DB,now);
- await refreshStandby(env.DB,symbol,await symbolBars(env.DB,symbol,now),now);
+ // Save only the independently timestamped provider quote. A bar close is not a live quote.
+ await saveQuote(env.DB,symbol,body.quote,now);
+ const engines=await tickStrategies(env.DB,now),engine=engines.scalp,sniper=engines.trend,session={scalp_close_at:'17:40',trend_overnight:true};
  let stage2='NOT_HOT';
  if(active && data.purpose==='HOT_CANDIDATE' && validRunId(data.run_id)) {
   const rows=await env.DB.prepare("SELECT * FROM bist_bridge_bars WHERE symbol=? AND source='YAHOO_INDICATIVE' AND interval='15m' AND bar_time<=? AND CAST(strftime('%s',bar_time) AS INTEGER)%900=0 ORDER BY bar_time DESC LIMIT 100").bind(symbol,latest.time).all();
@@ -322,10 +198,7 @@ export async function riskIngest(request,env,now=Date.now()) {
   .bind(stamp,expiry,source,JSON.stringify(rows)).run();
  return json({ok:true,total:symbols.length,eligible:eligible.size,restrictions_verified:eligible.size>0});
 }
-export async function monitorSymbols(env,now=Date.now()) {
- const rows=await env.DB.prepare("SELECT symbol FROM virtual_trades WHERE strategy IN('SCALP','SWING') AND status='OPEN' UNION SELECT symbol FROM bist_feed_signals WHERE status='PENDING' AND expires_at>=? UNION SELECT symbol FROM bist_sniper_queue WHERE status='READY' AND expires_at>=?")
-  .bind(new Date(now).toISOString(),new Date(now).toISOString()).all();return json({symbols:(rows.results||[]).map(x=>x.symbol)});
-}
+export async function monitorSymbols(env,now=Date.now()){return json(await strategyMonitor(env.DB,now));}
 export async function reportIngest(request,env,now=Date.now()) {
  const b=await readBody(request),fields=['shard','universe_total','eligible_total','assigned','fetched','hot','posted','errors'];
  if(!validRunId(b.run_id)||!fields.every(k=>Number.isInteger(b[k])&&b[k]>=0)||b.shard>7||
@@ -431,10 +304,8 @@ export async function finalize(request,env,now=Date.now(),network=(...args)=>glo
   const observed=Math.max(now,Date.parse(decision.completed_at)||now);
   if(!entryWindow(observed)||!fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},observed)||!await restrictionClear(env.DB,c.symbol,observed))continue;
   const result=await env.DB.prepare("INSERT OR IGNORE INTO bist_feed_signals(signal_key,symbol,bar_time,observed_at,expires_at,source,metrics_json) VALUES(?,?,?,?,?,'YAHOO_INDICATIVE',?)")
-   .bind(decision.signal_key,c.symbol,c.bar_time,new Date(observed).toISOString(),new Date(observed+60*60000).toISOString(),c.metrics_json).run();created+=result.meta.changes;selected.push(c.symbol);
-  await env.DB.batch([env.DB.prepare("UPDATE bist_sniper_queue SET status='EXPIRED',reason='SUPERSEDED_BY_NEW_APPROVAL' WHERE symbol=? AND status='READY' AND signal_key!=?").bind(c.symbol,decision.signal_key),
-   env.DB.prepare("INSERT OR IGNORE INTO bist_sniper_queue(signal_key,symbol,bar_time,observed_at,expires_at,last_checked_bar,last_checked_at,score,confidence,status,reason,metrics_json) VALUES(?,?,?,?,?,?,?,?,?,'READY','MINI_APPROVED',?)")
-    .bind(decision.signal_key,c.symbol,c.bar_time,new Date(observed).toISOString(),new Date(observed+3600000).toISOString(),c.bar_time,new Date(observed).toISOString(),c.score,decision.confidence||0,c.metrics_json)]);
+   .bind(decision.signal_key,c.symbol,c.bar_time,new Date(observed).toISOString(),new Date(observed+15*60000).toISOString(),c.metrics_json).run();created+=result.meta.changes;selected.push(c.symbol);
+  await enqueueScalp(env.DB,c,decision,observed);
  }
  return json({ok:true,run_id:b.run_id,model:AI_MODEL,candidates_reviewed:candidates.length,selected,signals_created:created,
   rejected:decisions.filter(d=>d?.status==='REJECTED').length,errors:decisions.filter(d=>d?.status==='ERROR'||d?.status==='PENDING').length,orders_sent:0});

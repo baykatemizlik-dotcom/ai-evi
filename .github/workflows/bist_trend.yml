@@ -1,0 +1,31 @@
+name: BIST Independent Trend Radar
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '10,40 7-14 * * 1-5'
+  push:
+    branches: [main]
+    paths: [bridge/bist_trend.py, .github/workflows/bist_trend.yml]
+permissions:
+  contents: read
+concurrency:
+  group: bist-trend-radar
+  cancel-in-progress: false
+jobs:
+  trend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: python3 -m pip install --disable-pip-version-check -r bridge/requirements.txt
+      - name: Independent hourly and daily trend scan
+        env:
+          BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
+          BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
+        run: python3 bridge/bist_trend.py --shard ${{ matrix.shard }}

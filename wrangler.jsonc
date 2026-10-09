@@ -5,7 +5,7 @@
   "workers_dev": true,
   "vars": {
     "OPENAI_MODEL": "gpt-4o-mini",
-    "GEMINI_MODEL": "gemini-3.8-flash",
+    "GEMINI_MODEL": "gemini-3.1-flash-lite",
     "ALLOWED_ORIGIN": "https://baykatemizlik-dotcom.github.io"
   },
   "d1_databases": [
@@ -19,5 +19,8 @@
     "crons": [
       "* 6-16 * * 1-5"
     ]
+  },
+  "observability": {
+    "enabled": true
   }
 }

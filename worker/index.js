@@ -96,67 +96,10 @@ function eligibleEntryBar(signal, bars) {
  if(!Number.isFinite(earliest)||!Number.isFinite(expiry))return null;
  return bars.find(b=>{const t=Date.parse(b.bar_time);return t%900000===0 && t>=earliest && t<=expiry;})||null;
 }
-async function runPaper(db, symbol, now) {
- const bars=await symbolBars(db,symbol,now),last=bars.at(-1);
- const result={signals_created:0,opened:0,closed:0,mode:'PAPER_ONLY',risk_verified:false};
- const positions=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN' AND symbol=? AND feed_entry_key IS NOT NULL").bind(symbol).all();
- for(const trade of positions.results||[]) {
-  const exit=exitPlan(trade,bars);
-  if(exit)result.closed+=await closePaper(db,trade,exit,now)?1:0;
- }
- if(!last || !fresh({...last,feed_type:'INDICATIVE_INTRADAY'},now))return {...result,blocked:'STALE_OR_EOD'};
- const pending=await db.prepare("SELECT * FROM bist_feed_signals WHERE symbol=? AND status='PENDING' AND expires_at>=? ORDER BY observed_at DESC LIMIT 1").bind(symbol,new Date(now).toISOString()).first();
- if(entryWindow(now) && !await db.prepare('SELECT trt_date FROM bist_session_lock WHERE trt_date=?').bind(trtDate(now)).first() && pending && await entryApproved(db,pending.signal_key,bars,now) && await restrictionClear(db,symbol,now) && await db.prepare("SELECT signal_key FROM bist_ai_decisions WHERE signal_key=? AND status='APPROVED' AND model='gpt-4o-mini'").bind(pending.signal_key).first()){
-  const next=eligibleEntryBar(pending,bars);
-  // Never fill a signal at a price observed before it was generated.
-  if(next){
-   const account=await db.prepare("SELECT available_cash FROM paper_cash_accounts WHERE strategy='SCALP'").first();
-   const slots=await db.prepare("SELECT slot_id,symbol FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN'").all();
-   const open=slots.results||[], slot=[1,2].find(s=>!open.some(x=>x.slot_id===s));
-   const plan=entryPlan(account?.available_cash||0,next.open);
-   if(open.length<2 && slot && !open.some(x=>x.symbol===symbol) && plan.qty>0){
-    try{
-     const r=await db.prepare("INSERT INTO virtual_trades(strategy,symbol,signal_price,executed_price,lot_count,commission,entry_time,status,slot_id,feed_entry_key) VALUES('SCALP',?,?,?,?,?,?,'OPEN',?,?) ON CONFLICT(feed_entry_key) DO NOTHING RETURNING id")
-      .bind(symbol,next.open,plan.executed,plan.qty,plan.commission,next.bar_time,slot,pending.signal_key).first();
-     if(r){result.opened=1;
-      const trade=await db.prepare("SELECT * FROM virtual_trades WHERE feed_entry_key=?").bind(pending.signal_key).first();
-      const exit=exitPlan(trade,bars);
-      if(exit)result.closed+=await closePaper(db,trade,exit,now)?1:0;
-     }
-    }catch(e){if(!/PAPER_SLOT_BUSY|PAPER_INSUFFICIENT_CASH|PAPER_SIGNAL_NOT_ELIGIBLE/.test(String(e)))throw e;result.entry_deferred='CONCURRENT_OR_EXPIRED';}
-   }
-  }
- }
- return result;
-}
-function entryWindow(now) {
- const p=trtParts(now),minute=Number(p.hour)*60+Number(p.minute);
- return sessionOpen(now)&&minute<1075; // 17:55 TRT
-}
+async function runPaper(db,symbol,now){return (await tickStrategies(db,now)).scalp;}
+async function runSniper(db,now){return (await tickStrategies(db,now)).trend;}
+function entryWindow(now){const p=trtParts(now);return sessionOpen(now)&&Number(p.hour)*60+Number(p.minute)<1060;}
 function trtDate(now){const p=trtParts(now);return `${p.year}-${p.month}-${p.day}`;}
-function sniperEntryPlan(cash,price){const executed=price*1.002,qty=Math.floor(cash/(executed*1.002));return {qty,executed,commission:executed*qty*.002};}
-function initialSniperState(trade){
- const cost=trade.executed_price*trade.lot_count+trade.commission;
- return {peak_price:trade.executed_price,stop_price:cost*.98/(trade.lot_count*.998*.998),last_peak_at:trade.entry_time,last_processed_bar:null,breakeven:0};
-}
-function sniperAdvance(trade,state,bars){
- const next={...state},cost=trade.executed_price*trade.lot_count+trade.commission;
- const breakPrice=cost/(trade.lot_count*.998*.998),armPrice=breakPrice*1.025;
- for(const b of bars){
-  if(b.bar_time<trade.entry_time||next.last_processed_bar&&b.bar_time<=next.last_processed_bar)continue;
-  const end=new Date(Date.parse(b.bar_time)+900000).toISOString();
-  // Only the stop known at candle OPEN may execute in this candle.
-  if(b.low<=next.stop_price){const raw=Math.min(b.open,next.stop_price),executed=raw*.998;
-   return {state:next,exit:{executed,time:end,pnl:executed*trade.lot_count*.998-cost,reason:next.stop_price>initialSniperState(trade).stop_price+1e-8?(Math.abs(next.stop_price-breakPrice)<1e-8?'SNIPER_BREAKEVEN':'SNIPER_TRAILING_STOP_2_PCT'):'SNIPER_BASE_STOP_NET_2_PCT',quote_time:b.bar_time}};}
-  if(b.high>next.peak_price){next.peak_price=b.high;next.last_peak_at=end;}
-  if(next.peak_price>=armPrice)next.breakeven=1;
-  next.stop_price=Math.max(next.stop_price,next.peak_price*.98,next.breakeven?breakPrice:0);
-  next.last_processed_bar=b.bar_time;
-  if(Date.parse(end)-Date.parse(next.last_peak_at)>=3600000){const executed=b.close*.998;
-   return {state:next,exit:{executed,time:end,pnl:executed*trade.lot_count*.998-cost,reason:'SNIPER_NO_NEW_HIGH_60_MIN',quote_time:b.bar_time}};}
- }
- return {state:next,exit:null};
-}
 async function symbolBars(db,symbol,now=Date.now()){
  // Keep ALL persisted intervening bars from the earliest open position, not only the latest 100.
  const rows=await db.prepare(`SELECT * FROM bist_bridge_bars WHERE symbol=? AND interval='15m' AND source='YAHOO_INDICATIVE'
@@ -173,83 +116,17 @@ async function entryApproved(db,key,bars,now){
  if(dailyTurnover(bars)<MIN_DAILY_TURNOVER_TL)return false;
  return !!await db.prepare("SELECT signal_key FROM bist_gemini_decisions WHERE signal_key=? AND status='APPROVED' AND model=? AND completed_at<=?").bind(key,GEMINI_MODEL,new Date(now).toISOString()).first();
 }
-async function processSniper(db,trade,bars,now){
- let state=await db.prepare('SELECT * FROM bist_sniper_state WHERE trade_id=?').bind(trade.id).first();
- if(!state){const initial=initialSniperState(trade);await db.prepare('INSERT OR IGNORE INTO bist_sniper_state(trade_id,peak_price,stop_price,last_peak_at,breakeven) VALUES(?,?,?,?,0)').bind(trade.id,initial.peak_price,initial.stop_price,initial.last_peak_at).run();state=await db.prepare('SELECT * FROM bist_sniper_state WHERE trade_id=?').bind(trade.id).first();}
- const outcome=sniperAdvance(trade,state,bars),s=outcome.state;
- if(outcome.exit&&await closePaper(db,trade,outcome.exit,now)){
-  await db.prepare('UPDATE bist_sniper_state SET quote_time=?,last_exit_note=?,exit_observed_at=? WHERE trade_id=?').bind(outcome.exit.quote_time,outcome.exit.reason,new Date(now).toISOString(),trade.id).run();return 1;
- }
- // A concurrent retry with an older bar must not roll back the high-water mark.
- await db.prepare(`UPDATE bist_sniper_state SET peak_price=?,stop_price=?,last_peak_at=?,last_processed_bar=?,breakeven=? WHERE trade_id=? AND (last_processed_bar IS NULL OR last_processed_bar<=?)`)
-  .bind(s.peak_price,s.stop_price,s.last_peak_at,s.last_processed_bar,s.breakeven,trade.id,s.last_processed_bar).run();return 0;
-}
-async function refreshStandby(db,symbol,bars,now){
- const ready=await db.prepare("SELECT * FROM bist_sniper_queue WHERE symbol=? AND status='READY'").bind(symbol).all();
- const last=bars.at(-1);if(!last)return;
- const metrics=stageOneMetrics(bars),session=sameSession(bars);
- const volume=session.reduce((n,b)=>n+b.volume,0),vwap=volume?session.reduce((n,b)=>n+(b.high+b.low+b.close)/3*b.volume,0)/volume:0;
- for(const q of ready.results||[]){
-  if(last.bar_time<=q.last_checked_bar)continue;
-  const good=fresh({...last,feed_type:'INDICATIVE_INTRADAY'},now)&&metrics&&last.close>vwap&&await restrictionClear(db,symbol,now);
-  await db.prepare("UPDATE bist_sniper_queue SET status=?,reason=?,last_checked_bar=?,last_checked_at=?,score=?,expires_at=? WHERE signal_key=? AND status='READY' AND last_checked_bar<?")
-   .bind(good?'READY':'INVALID',good?'HEALTH_RECHECK_PASSED':'VWAP_CANDLE_VOLUME_OR_RISK_FAILED',last.bar_time,new Date(now).toISOString(),good?metrics.rvol+100*(last.close/vwap-1):q.score,new Date(now+3600000).toISOString(),q.signal_key,last.bar_time).run();
- }
-}
-async function runSniper(db,now){
- const result={opened:0,closed:0};
- const positions=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SWING' AND status='OPEN' AND feed_entry_key LIKE 'SNIPER:%'").all();
- for(const trade of positions.results||[]){const bars=await symbolBars(db,trade.symbol,now);if(bars.length)result.closed+=await processSniper(db,trade,bars,now);}
- if(!entryWindow(now)||await db.prepare('SELECT trt_date FROM bist_session_lock WHERE trt_date=?').bind(trtDate(now)).first())return result;
- if(await db.prepare("SELECT id FROM virtual_trades WHERE strategy='SWING' AND status='OPEN' LIMIT 1").first())return result;
- const queue=await db.prepare(`SELECT q.* FROM bist_sniper_queue q JOIN bist_funnel_risk r ON r.symbol=q.symbol
-  WHERE q.status='READY' AND q.expires_at>=? AND r.eligible=1 AND r.valid_until>?
-  AND NOT EXISTS(SELECT 1 FROM virtual_trades t WHERE t.status='OPEN' AND t.symbol=q.symbol)
-  ORDER BY q.score DESC,q.confidence DESC,q.symbol ASC`).bind(new Date(now).toISOString(),new Date(now).toISOString()).all();
- for(const q of queue.results||[]){
-  if(!await db.prepare("SELECT signal_key FROM bist_ai_decisions WHERE signal_key=? AND status='APPROVED'").bind(q.signal_key).first())continue;
-  const latestExit=await db.prepare('SELECT MAX(exit_observed_at) t FROM bist_sniper_state').first();
-  const bars=await symbolBars(db,q.symbol,now),observed=new Date(Math.max(Date.parse(q.observed_at),Date.parse(q.last_checked_at),Date.parse(latestExit?.t)||0)).toISOString();
-  if(!await entryApproved(db,q.signal_key,bars,now))continue;
-  const next=eligibleEntryBar({...q,observed_at:observed},bars);
-  if(!next||!entryWindow(Date.parse(next.bar_time)))break;
-  if(!fresh({bar_time:q.last_checked_bar,feed_type:'INDICATIVE_INTRADAY'},Date.parse(next.bar_time)))continue;
-  if(!fresh({...bars.at(-1),feed_type:'INDICATIVE_INTRADAY'},now))continue;
-  const account=await db.prepare("SELECT available_cash FROM paper_cash_accounts WHERE strategy='SWING'").first(),plan=sniperEntryPlan(account?.available_cash||0,next.open);
-  if(plan.qty<=0)break;
-  try{const inserted=await db.prepare("INSERT INTO virtual_trades(strategy,symbol,signal_price,executed_price,lot_count,commission,entry_time,status,slot_id,feed_entry_key) VALUES('SWING',?,?,?,?,?,?,'OPEN',1,?) ON CONFLICT(feed_entry_key) DO NOTHING RETURNING id")
-   .bind(q.symbol,next.open,plan.executed,plan.qty,plan.commission,next.bar_time,'SNIPER:'+q.signal_key).first();
-   if(inserted){result.opened=1;const trade=await db.prepare('SELECT * FROM virtual_trades WHERE id=?').bind(inserted.id).first();result.closed+=await processSniper(db,trade,bars,now);}
-  }catch(e){if(!/PAPER_SLOT_BUSY|PAPER_INSUFFICIENT_CASH|PAPER_SIGNAL_NOT_ELIGIBLE/.test(String(e)))throw e;}
-  break;
- }
- return result;
-}
 async function enforceSessionClose(db,now=Date.now()){
- const p=trtParts(now);if(Number(p.hour)*60+Number(p.minute)<1075)return {closed:0};
- const stamp=new Date(now).toISOString();
- await db.batch([db.prepare('INSERT OR IGNORE INTO bist_session_lock(trt_date,locked_at) VALUES(?,?)').bind(trtDate(now),stamp),
-  db.prepare("UPDATE bist_feed_signals SET status='EXPIRED' WHERE status='PENDING'"),db.prepare("UPDATE bist_sniper_queue SET status='EXPIRED',reason='SESSION_1755_LOCK' WHERE status='READY'")]);
- const positions=await db.prepare("SELECT * FROM virtual_trades WHERE status='OPEN' AND feed_entry_key IS NOT NULL").all();let closed=0;
- for(const trade of positions.results||[]){
-  const rows=await symbolBars(db,trade.symbol,now);
-  const historical=trade.strategy==='SCALP'?exitPlan(trade,rows):null;
-  if(historical&&await closePaper(db,trade,historical,now)){closed++;continue;}
-  if(trade.strategy==='SWING'&&await processSniper(db,trade,rows,now)){closed++;continue;}
-  const bar=rows.at(-1);if(!bar)continue;
-  const executed=bar.close*.998,cost=trade.executed_price*trade.lot_count+trade.commission;
-  const reason='SESSION_1755_INDICATIVE_LAST_CLOSED_BAR';
-  if(await closePaper(db,trade,{executed,time:stamp,pnl:executed*trade.lot_count*.998-cost,reason,quote_time:bar.bar_time},now)){closed++;
-   if(trade.strategy==='SWING')await db.prepare('UPDATE bist_sniper_state SET quote_time=?,last_exit_note=? WHERE trade_id=?').bind(bar.bar_time,reason,trade.id).run();}
- }
- await dailyReport(db,now);return {closed,price_mode:'INDICATIVE_LAST_CLOSED_BAR'};
+ const result=await tickStrategies(db,now);
+ const p=trtParts(now);if(Number(p.hour)*60+Number(p.minute)>=1085)await dailyReport(db,now);
+ return result;
 }
 async function dailyReport(db,now=Date.now()){
  const date=trtDate(now),start=date+'T00:00:00',end=date+'T23:59:59';
  const [trades,ai,cash,queue]=await Promise.all([
-  db.prepare("SELECT strategy,COUNT(*) trades,SUM(pnl_net) pnl,SUM(CASE WHEN pnl_net>0 THEN 1 ELSE 0 END) wins FROM virtual_trades WHERE status='CLOSED' AND datetime(exit_time,'+3 hours') BETWEEN ? AND ? GROUP BY strategy").bind(start.replace('T',' '),end.replace('T',' ')).all(),
+  db.prepare("SELECT strategy,COUNT(*) exits,SUM(pnl_net) pnl,SUM(CASE WHEN pnl_net>0 THEN 1 ELSE 0 END) wins FROM strategy_exit_legs WHERE datetime(exit_time,'+3 hours') BETWEEN ? AND ? GROUP BY strategy").bind(start.replace('T',' '),end.replace('T',' ')).all(),
   db.prepare("SELECT status,COUNT(*) n,SUM(input_tokens) input_tokens,SUM(output_tokens) output_tokens FROM bist_ai_decisions WHERE substr(datetime(created_at,'+3 hours'),1,10)=? GROUP BY status").bind(date).all(),
-  db.prepare('SELECT strategy,available_cash FROM paper_cash_accounts').all(),db.prepare('SELECT status,COUNT(*) n FROM bist_sniper_queue GROUP BY status').all()]);
+  db.prepare('SELECT strategy,available_cash FROM paper_cash_accounts').all(),db.prepare("SELECT 'SCALP' strategy,status,COUNT(*) n FROM scalp_sniper_queue GROUP BY status UNION ALL SELECT 'SWING',status,COUNT(*) n FROM trend_radar_queue GROUP BY status").all()]);
  const report={trt_date:date,generated_at:new Date(now).toISOString(),paper_only:true,trades:trades.results,ai:ai.results,cash:cash.results,standby:queue.results};
  await db.prepare('INSERT INTO bist_daily_reports(trt_date,generated_at,report_json) VALUES(?,?,?) ON CONFLICT(trt_date) DO UPDATE SET generated_at=excluded.generated_at,report_json=excluded.report_json').bind(date,report.generated_at,JSON.stringify(report)).run();return report;
 }
@@ -265,7 +142,7 @@ async function readBody(request) {
 }
 async function ingest(request, env, now=Date.now()) {
  if(!env.DB)return json({error:'DB_MISSING'},503);
- let data;try{data=validate(await readBody(request),now);}catch(e){return json({error:e.message||'INVALID_JSON'},e.message==='PAYLOAD_TOO_LARGE'?413:422);}
+ let data,body;try{body=await readBody(request);data=validate(body,now);}catch(e){return json({error:e.message||'INVALID_JSON'},e.message==='PAYLOAD_TOO_LARGE'?413:422);}
  const symbol=data.bars[0].symbol, latest=data.bars.at(-1), received=new Date(now).toISOString();
  const inserted=await env.DB.batch([
   env.DB.prepare(`INSERT INTO bist_bridge_bars(symbol,interval,bar_time,open,high,low,close,volume,source,received_at)
@@ -284,11 +161,9 @@ async function ingest(request, env, now=Date.now()) {
    .bind(symbol,latest.time,data.source,data.feed_type,received)
  ]);
  const active=fresh({...latest,feed_type:data.feed_type},now);
- // Run on retries too: a storage success + engine failure can recover safely.
- const sniper=await runSniper(env.DB,now);
- const engine=await runPaper(env.DB,symbol,now);
- const session=await enforceSessionClose(env.DB,now);
- await refreshStandby(env.DB,symbol,await symbolBars(env.DB,symbol,now),now);
+ // Save only the independently timestamped provider quote. A bar close is not a live quote.
+ await saveQuote(env.DB,symbol,body.quote,now);
+ const engines=await tickStrategies(env.DB,now),engine=engines.scalp,sniper=engines.trend,session={scalp_close_at:'17:40',trend_overnight:true};
  let stage2='NOT_HOT';
  if(active && data.purpose==='HOT_CANDIDATE' && validRunId(data.run_id)) {
   const rows=await env.DB.prepare("SELECT * FROM bist_bridge_bars WHERE symbol=? AND source='YAHOO_INDICATIVE' AND interval='15m' AND bar_time<=? AND CAST(strftime('%s',bar_time) AS INTEGER)%900=0 ORDER BY bar_time DESC LIMIT 100").bind(symbol,latest.time).all();
@@ -322,10 +197,7 @@ async function riskIngest(request,env,now=Date.now()) {
   .bind(stamp,expiry,source,JSON.stringify(rows)).run();
  return json({ok:true,total:symbols.length,eligible:eligible.size,restrictions_verified:eligible.size>0});
 }
-async function monitorSymbols(env,now=Date.now()) {
- const rows=await env.DB.prepare("SELECT symbol FROM virtual_trades WHERE strategy IN('SCALP','SWING') AND status='OPEN' UNION SELECT symbol FROM bist_feed_signals WHERE status='PENDING' AND expires_at>=? UNION SELECT symbol FROM bist_sniper_queue WHERE status='READY' AND expires_at>=?")
-  .bind(new Date(now).toISOString(),new Date(now).toISOString()).all();return json({symbols:(rows.results||[]).map(x=>x.symbol)});
-}
+async function monitorSymbols(env,now=Date.now()){return json(await strategyMonitor(env.DB,now));}
 async function reportIngest(request,env,now=Date.now()) {
  const b=await readBody(request),fields=['shard','universe_total','eligible_total','assigned','fetched','hot','posted','errors'];
  if(!validRunId(b.run_id)||!fields.every(k=>Number.isInteger(b[k])&&b[k]>=0)||b.shard>7||
@@ -375,256 +247,25 @@ async function aiVerdict(env,candidate,risk,network=(...args)=>globalThis.fetch(
   const response=await network('https://api.openai.com/v1/chat/completions',{
    method:'POST',redirect:'manual',signal:controller.signal,
    headers:{Authorization:'Bearer '+apiKey,'Content-Type':'application/json'},
-   body:JSON.stringify({model:AI_MODEL,temperature:0,max_completion_tokens:200,
-    messages:[{role:'system',content:'Sanal BIST scalp teknik tetik hakemisin. Sadece verilen doğrulanmış sayısal veriyi değerlendir. RVOL>=2, yeşil mum, gövde>=0.60, üst fitil<=0.20, 20-bar breakout ve seans VWAP üstü kapanış gereklidir. Resmi VBTS/tedbir listesi güncel ve uygun değilse onay verme. Haber/ceza/mutlak manipülasyon yokluğu için dış araştırma yapılmadı; bunu uydurma, kesin güvence verme. OHLCV wash trade kanıtı değildir. Veriler tutarsız/eksikse veya teknik kırılım zayıfsa onay=false. Diğer durumda teknik sanal takip için onay verebilirsin. Kısa Türkçe neden ve 0-100 arasında guven skoru yaz. Guven bir model değerlendirmesidir, kalibre edilmiş başarı olasılığı değildir. Gerçek emir verme, gelecekteki bar hakkında tahmin uydurma.'},
-     {role:'user',content:JSON.stringify({symbol:candidate.symbol,bar_time:candidate.bar_time,metrics:m,green_candle:true,breakout_passed:true,vwap_passed:true,
-      vbts:{eligible:risk.eligible===1,source:risk.source,as_of:risk.as_of,valid_until:risk.valid_until},other_penalty_news_checked:false})}],
-    response_format:{type:'json_schema',json_schema:{name:'bist_paper_verdict',strict:true,schema:{type:'object',properties:{onay:{type:'boolean'},neden:{type:'string'},guven:{type:'integer',minimum:0,maximum:100}},required:['onay','neden','guven'],additionalProperties:false}}}})
-  });
-  if(!response.ok){await response.body?.cancel();throw Error('OPENAI_HTTP_'+response.status);}
-  // Bound even an unexpected upstream response; never log its body or credentials.
-  stage='READ_RESPONSE';const reader=response.body.getReader();let size=0,text='';const decoder=new TextDecoder();
-  while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>64000){await reader.cancel();throw Error('OPENAI_RESPONSE_TOO_LARGE');}text+=decoder.decode(value,{stream:true});}
-  stage='PARSE_RESPONSE';text+=decoder.decode();const data=JSON.parse(text),choice=data.choices?.[0];
-  if(choice?.finish_reason!=='stop'||choice.message?.refusal)throw Error('OPENAI_REFUSAL_OR_INCOMPLETE');
-  const result=JSON.parse(choice.message.content);
-  if(!result||typeof result.onay!=='boolean'||typeof result.neden!=='string'||!result.neden.trim()||result.neden.length>1000||!Number.isInteger(result.guven)||result.guven<0||result.guven>100||Object.keys(result).sort().join(',')!=='guven,neden,onay')throw Error('OPENAI_BAD_VERDICT');
-  return {...result,input_tokens:Number.isInteger(data.usage?.prompt_tokens)?data.usage.prompt_tokens:0,
-   output_tokens:Number.isInteger(data.usage?.completion_tokens)?data.usage.completion_tokens:0};
- }catch(e){if(/^OPENAI_|^AI_INPUT_/.test(e.message))throw e;const kind=e.name==='AbortError'?'TIMEOUT':e.name==='TypeError'?'TYPE_ERROR':e.name==='SyntaxError'?'BAD_JSON':'RUNTIME_ERROR';const detail=kind==='TYPE_ERROR'?String(e.message).replaceAll(apiKey,'[redacted]').replaceAll(env.OPENAI_API_KEY||apiKey,'[redacted]').replace(/sk-[^\s\"'<>]+/g,'[redacted]').slice(0,180):'';throw Error('OPENAI_'+stage+'_'+kind+(detail?': '+detail:''));}finally{clearTimeout(timer);}
+   body:JSON.stringify({model:AI_MODEL,temperature:0,max_com…12810 tokens truncated…,headers:{'Content-Type':'application/json'},body:JSON.stringify({trade_id:t.id,strategy:t.strategy})});const x=await r.json();if(!r.ok)throw Error(x.error==='FRESH_QUOTE_REQUIRED'?'Taze fiyat bekleniyor.':'Kapatma başarısız; paneli yenile.');await refresh();}catch(e){button.textContent=e.message;button.disabled=false;}};card.append(button);box.append(card);}
+ if(!trades.length)empty(box,'İki slot da boş; uygun aday bekleniyor.');
 }
-async function judgeCandidate(env,c,now,network) {
- const key=c.symbol+':'+c.bar_time,wallStart=Date.now();
- const claimed=await env.DB.prepare("INSERT OR IGNORE INTO bist_ai_decisions(signal_key,run_id,symbol,bar_time,model,status,reason,created_at) VALUES(?,?,?,?,?,'PENDING','AWAITING_VERDICT',?)")
-  .bind(key,c.run_id,c.symbol,c.bar_time,AI_MODEL,new Date(now).toISOString()).run();
- const retry=claimed.meta.changes?null:await env.DB.prepare("UPDATE bist_ai_decisions SET status='PENDING',reason='RETRY_AFTER_FETCH_FIX',attempts=attempts+1 WHERE signal_key=? AND status='ERROR' AND (reason='OPENAI_NETWORK_OR_INVALID_RESPONSE' OR reason LIKE 'OPENAI_FETCH_TYPE_ERROR%') AND attempts<4 RETURNING signal_key").bind(key).first();
- if(claimed.meta.changes||retry){
-  let status='ERROR',reason='AI_UNAVAILABLE',input=0,output=0,confidence=null;
-  try{
-   const risk=await env.DB.prepare('SELECT * FROM bist_funnel_risk WHERE symbol=? AND eligible=1 AND valid_until>?').bind(c.symbol,new Date(now).toISOString()).first();
-   if(!risk)throw Error('RESTRICTIONS_EXPIRED');
-   const verdict=await aiVerdict(env,c,risk,network);status=verdict.onay?'APPROVED':'REJECTED';reason=verdict.neden;input=verdict.input_tokens;output=verdict.output_tokens;confidence=verdict.guven;
-  }catch(e){reason=/^(OPENAI_[A-Z_0-9]+|AI_INPUT_NOT_ELIGIBLE|RESTRICTIONS_EXPIRED)(: .{0,180})?$/.test(e.message)?e.message:'OPENAI_NETWORK_OR_INVALID_RESPONSE';}
-  await env.DB.prepare("UPDATE bist_ai_decisions SET status=?,reason=?,completed_at=?,input_tokens=?,output_tokens=?,confidence=? WHERE signal_key=? AND status='PENDING'")
-   .bind(status,reason,new Date(now+Math.max(0,Date.now()-wallStart)).toISOString(),input,output,confidence,key).run();
-  console.log(JSON.stringify({event:'BIST_AI_DECISION',symbol:c.symbol,status,model:AI_MODEL}));
- }
- return await env.DB.prepare('SELECT * FROM bist_ai_decisions WHERE signal_key=?').bind(key).first();
-}
-async function finalize(request,env,now=Date.now(),network=(...args)=>globalThis.fetch(...args)) {
- const b=await readBody(request);if(!validRunId(b.run_id))return json({error:'INVALID_RUN'},422);
- if(!env.OPENAI_API_KEY)return json({error:'OPENAI_KEY_MISSING',signals_created:0},503);
- const rows=await env.DB.prepare(`SELECT c.* FROM bist_funnel_candidates c JOIN bist_funnel_risk r ON r.symbol=c.symbol
-  WHERE c.run_id=? AND r.eligible=1 AND r.valid_until>? AND c.bar_time>=?
-  ORDER BY c.score DESC,c.symbol ASC`).bind(b.run_id,new Date(now).toISOString(),new Date(now-50*60000).toISOString()).all();
- // No candidate-count cap: five concurrent calls are transport throttling only.
- const candidates=[];
- for(const c of rows.results||[]){const m=JSON.parse(c.metrics_json);if(fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now)&&Number.isFinite(m.daily_turnover_tl_estimate)&&m.daily_turnover_tl_estimate>=MIN_DAILY_TURNOVER_TL&&await env.DB.prepare("SELECT signal_key FROM bist_gemini_decisions WHERE signal_key=? AND status='APPROVED' AND model=?").bind(c.symbol+':'+c.bar_time,GEMINI_MODEL).first())candidates.push(c);}
- const decisions=new Array(candidates.length);let cursor=0;
- await Promise.all(Array.from({length:Math.min(5,candidates.length)},async()=>{
-  while(cursor<candidates.length){const index=cursor++;decisions[index]=await judgeCandidate(env,candidates[index],now,network);}
- }));
- let created=0;const selected=[];
- for(let i=0;i<candidates.length;i++){
-  const c=candidates[i],decision=decisions[i];if(decision?.status!=='APPROVED')continue;
-  // After a slow API response, recheck freshness/risk. Never use request-start time for entry.
-  const observed=Math.max(now,Date.parse(decision.completed_at)||now);
-  if(!entryWindow(observed)||!fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},observed)||!await restrictionClear(env.DB,c.symbol,observed))continue;
-  const result=await env.DB.prepare("INSERT OR IGNORE INTO bist_feed_signals(signal_key,symbol,bar_time,observed_at,expires_at,source,metrics_json) VALUES(?,?,?,?,?,'YAHOO_INDICATIVE',?)")
-   .bind(decision.signal_key,c.symbol,c.bar_time,new Date(observed).toISOString(),new Date(observed+60*60000).toISOString(),c.metrics_json).run();created+=result.meta.changes;selected.push(c.symbol);
-  await env.DB.batch([env.DB.prepare("UPDATE bist_sniper_queue SET status='EXPIRED',reason='SUPERSEDED_BY_NEW_APPROVAL' WHERE symbol=? AND status='READY' AND signal_key!=?").bind(c.symbol,decision.signal_key),
-   env.DB.prepare("INSERT OR IGNORE INTO bist_sniper_queue(signal_key,symbol,bar_time,observed_at,expires_at,last_checked_bar,last_checked_at,score,confidence,status,reason,metrics_json) VALUES(?,?,?,?,?,?,?,?,?,'READY','MINI_APPROVED',?)")
-    .bind(decision.signal_key,c.symbol,c.bar_time,new Date(observed).toISOString(),new Date(observed+3600000).toISOString(),c.bar_time,new Date(observed).toISOString(),c.score,decision.confidence||0,c.metrics_json)]);
- }
- return json({ok:true,run_id:b.run_id,model:AI_MODEL,candidates_reviewed:candidates.length,selected,signals_created:created,
-  rejected:decisions.filter(d=>d?.status==='REJECTED').length,errors:decisions.filter(d=>d?.status==='ERROR'||d?.status==='PENDING').length,orders_sent:0});
-}
-async function aiStatus(env) {
- const last=await env.DB.prepare("SELECT symbol,status,reason,completed_at FROM bist_ai_decisions WHERE status!='PENDING' ORDER BY completed_at DESC LIMIT 1").first();
- return {model:AI_MODEL,connection:!env.OPENAI_API_KEY?'MISSING_KEY':last&&['APPROVED','REJECTED'].includes(last.status)?'CONNECTED':last?.status==='ERROR'?'ERROR':'CONFIGURED',last_decision:last||null};
-}
-async function feedStatus(db,now=Date.now()) {
- const [rows,reports]=await Promise.all([db.prepare('SELECT * FROM bist_feed_state').all(),
-  db.prepare('SELECT * FROM bist_funnel_reports WHERE run_id=(SELECT run_id FROM bist_funnel_reports ORDER BY completed_at DESC LIMIT 1)').all()]);
- const active=(rows.results||[]).filter(x=>fresh({bar_time:x.last_bar_time,feed_type:x.feed_type},now));
- const scan=reports.results||[],valid=scan.filter(x=>fresh({bar_time:x.last_bar_time,feed_type:'INDICATIVE_INTRADAY'},now));
- const scanning=active.length>0||valid.some(x=>x.fetched>0);
- return {status:scanning?'ACTIVE':'BLOCKED_MARKET_DATA_UNAVAILABLE',scanner_live:scanning,time_zone:'Europe/Istanbul',timestamps:'UTC_ISO8601',server_time:new Date(now).toISOString(),data_session_open:sessionOpen(now),freshness_minutes:35,min_daily_turnover_tl:MIN_DAILY_TURNOVER_TL,
-  active_symbols:active.length,scanned_symbols:valid.reduce((n,x)=>n+x.fetched,0),
-  universe_total:scan[0]?.universe_total||0,eligible_total:scan[0]?.eligible_total||0,
-  stage1_hot:scan.reduce((n,x)=>n+x.hot,0),shards_completed:scan.length,
-  last_scan_id:scan[0]?.run_id||null,
-  last_scan_at:scan.map(x=>x.completed_at).sort().at(-1)||null,
-  last_scan_bar:scan.map(x=>x.last_bar_time).filter(Boolean).sort().at(-1)||null,
-  last_scan_fetched:scan.reduce((n,x)=>n+x.fetched,0),
-  source:'GITHUB_ACTIONS_CLOUD_BRIDGE',market_feed_verified:false,paper_only:true,risk_verified:false,
-  last_received:[...(rows.results||[]).map(x=>x.received_at),...scan.map(x=>x.completed_at)].sort().at(-1)||null};
-}
-
-async function externalAudit(request,env,now=Date.now()) {
- const b=await readBody(request),r=b.report;
- if(b.trt_date!==trtDate(now)||!['COMPLETED','MISSING_KEY'].includes(b.status)||!/^gemini-[a-zA-Z0-9.-]+$/.test(b.model)||!r||typeof r.summary!=='string'||r.summary.length>5000||!['issues','calibration'].every(k=>Array.isArray(r[k])&&r[k].length<=100&&r[k].every(x=>typeof x==='string'&&x.length<=2000)))return json({error:'INVALID_EXTERNAL_AUDIT'},422);
- await env.DB.prepare('INSERT INTO bist_external_audits(trt_date,received_at,model,status,report_json) VALUES(?,?,?,?,?) ON CONFLICT(trt_date) DO UPDATE SET received_at=excluded.received_at,model=excluded.model,status=excluded.status,report_json=excluded.report_json').bind(b.trt_date,new Date(now).toISOString(),b.model,b.status,JSON.stringify(r)).run();return json({ok:true});
-}
-async function probeMini(env,now=Date.now()) {
- const rows=await env.DB.prepare(`SELECT c.* FROM bist_funnel_candidates c JOIN bist_funnel_risk r ON r.symbol=c.symbol WHERE r.eligible=1 AND r.valid_until>? ORDER BY c.bar_time DESC,c.score DESC`).bind(new Date(now).toISOString()).all();
- const c=(rows.results||[]).find(c=>fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now))||(rows.results||[]).find(c=>trtDate(Date.parse(c.bar_time))===trtDate(now));
- if(!c)return json({status:'NO_FRESH_CANDIDATE',model:AI_MODEL});
- const d=await judgeCandidate(env,c,now,(...args)=>globalThis.fetch(...args));
- return json({purpose:'CONNECTION_CHECK_ONLY',input_fresh:fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now),status:d.status,model:AI_MODEL,symbol:c.symbol,reason:d.reason,confidence:d.confidence});
-}
-
-// RFC 8291 payload encryption and RFC 8292 VAPID; no external packages or key logging.
-const pushBytes=s=>new TextEncoder().encode(s);
-function pushB64(b){return btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
-function pushUnb64(s){if(typeof s!=='string'||! /^[A-Za-z0-9_-]+={0,2}$/.test(s))throw Error('INVALID_PUSH_KEY');return Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));}
-function pushJoin(...parts){const out=new Uint8Array(parts.reduce((n,p)=>n+p.byteLength,0));let i=0;for(const p of parts){out.set(new Uint8Array(p),i);i+=p.byteLength;}return out;}
-function pushEndpoint(endpoint){const u=new URL(endpoint);if(u.protocol!=='https:'||u.username||u.password||u.port||u.hash||!['web.push.apple.com','fcm.googleapis.com','updates.push.services.mozilla.com'].includes(u.hostname))throw Error('INVALID_PUSH_ENDPOINT');return u;}
-async function pushHKDF(secret,salt,info,size){const k=await crypto.subtle.importKey('raw',secret,'HKDF',false,['deriveBits']);return new Uint8Array(await crypto.subtle.deriveBits({name:'HKDF',hash:'SHA-256',salt,info},k,size*8));}
-async function pushEncrypt(sub,payload){
- const ua=pushUnb64(sub.p256dh),auth=pushUnb64(sub.auth);if(ua.length!==65||ua[0]!==4||auth.length!==16)throw Error('INVALID_PUSH_KEYS');
- const text=pushBytes(JSON.stringify(payload));if(text.length>3000)throw Error('PUSH_PAYLOAD_TOO_LARGE');
- const pair=await crypto.subtle.generateKey({name:'ECDH',namedCurve:'P-256'},true,['deriveBits']);
- const pub=new Uint8Array(await crypto.subtle.exportKey('raw',pair.publicKey));
- const peer=await crypto.subtle.importKey('raw',ua,{name:'ECDH',namedCurve:'P-256'},false,[]);
- const shared=await crypto.subtle.deriveBits({name:'ECDH',public:peer},pair.privateKey,256);
- const ikm=await pushHKDF(shared,auth,pushJoin(pushBytes('WebPush: info\u0000'),ua,pub),32),salt=crypto.getRandomValues(new Uint8Array(16));
- const cek=await pushHKDF(ikm,salt,pushBytes('Content-Encoding: aes128gcm\u0000'),16),nonce=await pushHKDF(ikm,salt,pushBytes('Content-Encoding: nonce\u0000'),12);
- const key=await crypto.subtle.importKey('raw',cek,'AES-GCM',false,['encrypt']);
- const encrypted=await crypto.subtle.encrypt({name:'AES-GCM',iv:nonce},key,pushJoin(text,Uint8Array.of(2)));
- const rs=new Uint8Array(4);new DataView(rs.buffer).setUint32(0,4096);
- return pushJoin(salt,rs,Uint8Array.of(pub.length),pub,encrypted);
-}
-async function pushAuthorization(env,endpoint,now=Date.now()){
- const aud=pushEndpoint(endpoint).origin,jwk=JSON.parse(env.VAPID_PRIVATE_JWK);
- const header=pushB64(pushBytes(JSON.stringify({typ:'JWT',alg:'ES256'})));
- const claims=pushB64(pushBytes(JSON.stringify({aud,exp:Math.floor(now/1000)+3600,sub:'https://ai-evi.baykatemizlik.workers.dev'})));
- const key=await crypto.subtle.importKey('jwk',jwk,{name:'ECDSA',namedCurve:'P-256'},false,['sign']);
- const signature=await crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},key,pushBytes(header+'.'+claims));
- return 'vapid t='+header+'.'+claims+'.'+pushB64(signature)+', k='+env.VAPID_PUBLIC_KEY;
-}
-async function sendWebPush(env,sub,payload,network=(...args)=>globalThis.fetch(...args)){
- pushEndpoint(sub.endpoint);
- const body=await pushEncrypt(sub,payload),authorization=await pushAuthorization(env,sub.endpoint);
- const response=await network(sub.endpoint,{method:'POST',redirect:'manual',signal:AbortSignal.timeout(10000),headers:{Authorization:authorization,TTL:'300',Urgency:'normal','Content-Encoding':'aes128gcm','Content-Type':'application/octet-stream'},body});
- const status=response.status;await response.body?.cancel();return status;
-}
-async function pushStatus(env){const sub=await env.DB.prepare('SELECT COUNT(*) n FROM push_subscriptions').first();const counts=await env.DB.prepare('SELECT status,COUNT(*) n FROM bist_push_deliveries GROUP BY status').all();return {configured:!!(env.VAPID_PUBLIC_KEY&&env.VAPID_PRIVATE_JWK),subscribers:sub.n,deliveries:counts.results||[]};}
-async function pushRoute(request,env){
- const path=new URL(request.url).pathname;
- if(path==='/push/key'&&request.method==='GET')return json({key:env.VAPID_PUBLIC_KEY||null,enabled:!!(env.VAPID_PUBLIC_KEY&&env.VAPID_PRIVATE_JWK)},env.VAPID_PUBLIC_KEY&&env.VAPID_PRIVATE_JWK?200:503);
- if(path==='/push/status'&&request.method==='GET')return json(await pushStatus(env));
- if(!['/push/subscribe','/push/test'].includes(path)||request.method!=='POST')return json({error:'METHOD_NOT_ALLOWED'},405);
- if(!env.VAPID_PUBLIC_KEY||!env.VAPID_PRIVATE_JWK)return json({error:'PUSH_NOT_CONFIGURED'},503);
- let b;try{b=await readBody(request);pushEndpoint(b.endpoint);}catch{return json({error:'INVALID_SUBSCRIPTION'},422);}
- if(path==='/push/subscribe'){
-  try{const pub=pushUnb64(b.keys?.p256dh),auth=pushUnb64(b.keys?.auth);if(b.endpoint.length>2000||pub.length!==65||pub[0]!==4||auth.length!==16)throw Error();await crypto.subtle.importKey('raw',pub,{name:'ECDH',namedCurve:'P-256'},false,[]);}catch{return json({error:'INVALID_SUBSCRIPTION_KEYS'},422);}
-  await env.DB.prepare('INSERT INTO push_subscriptions(endpoint,p256dh,auth,created_at) VALUES(?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET p256dh=excluded.p256dh,auth=excluded.auth').bind(b.endpoint,b.keys.p256dh,b.keys.auth,new Date().toISOString()).run();return json({ok:true});
- }
- const sub=await env.DB.prepare('SELECT * FROM push_subscriptions WHERE endpoint=?').bind(b.endpoint).first();if(!sub)return json({error:'SUBSCRIPTION_NOT_FOUND'},404);
- try{const status=await sendWebPush(env,sub,{title:'BIST · Test bildirimi',body:'Bildirim bağlantısı çalışıyor. İşlemler sanaldır.',tag:'bist-test-'+Date.now()});if([404,410].includes(status))await env.DB.prepare('DELETE FROM push_subscriptions WHERE endpoint=?').bind(sub.endpoint).run();return json({accepted:status>=200&&status<300,provider_status:status},status>=200&&status<300?200:502);}catch{return json({error:'PUSH_SEND_FAILED'},502);}
-}
-async function drainPush(env,now=Date.now(),network=(...args)=>globalThis.fetch(...args)){
- if(!env.VAPID_PUBLIC_KEY||!env.VAPID_PRIVATE_JWK)return {sent:0,configured:false};
- const stamp=new Date(now).toISOString();
- await env.DB.prepare("INSERT OR IGNORE INTO bist_push_deliveries(event_id,endpoint,status,attempts,next_attempt) SELECT e.id,s.endpoint,'PENDING',0,? FROM bist_push_events e CROSS JOIN push_subscriptions s WHERE e.created_at>=s.created_at AND e.expires_at>? ").bind(stamp,stamp).run();
- const rows=await env.DB.prepare("SELECT d.*,e.payload_json,s.p256dh,s.auth FROM bist_push_deliveries d JOIN bist_push_events e ON e.id=d.event_id JOIN push_subscriptions s ON s.endpoint=d.endpoint WHERE d.status IN('PENDING','ERROR','SENDING') AND d.attempts<5 AND d.next_attempt<=? AND (d.lease_until IS NULL OR d.lease_until<=?) AND e.expires_at>? ORDER BY e.created_at LIMIT 5").bind(stamp,stamp,stamp).all();let sent=0;
- for(const d of rows.results||[]){
-  const lease=new Date(now+90000).toISOString();const claim=await env.DB.prepare("UPDATE bist_push_deliveries SET status='SENDING',attempts=attempts+1,lease_until=? WHERE event_id=? AND endpoint=? AND status IN('PENDING','ERROR','SENDING') AND (lease_until IS NULL OR lease_until<=?)").bind(lease,d.event_id,d.endpoint,stamp).run();if(!claim.meta.changes)continue;
-  let status=0;try{status=await sendWebPush(env,d,JSON.parse(d.payload_json),network);}catch{}
-  const ok=status>=200&&status<300,dead=[404,410].includes(status);
-  await env.DB.prepare('UPDATE bist_push_deliveries SET status=?,provider_status=?,lease_until=NULL,next_attempt=? WHERE event_id=? AND endpoint=?').bind(ok?'SENT':dead?'DEAD':'ERROR',status,new Date(now+Math.min(300000,60000*(d.attempts+1))).toISOString(),d.event_id,d.endpoint).run();
-  if(dead)await env.DB.prepare('DELETE FROM push_subscriptions WHERE endpoint=?').bind(d.endpoint).run();if(ok)sent++;
- }
- return {sent};
-}
-
-const reply=json;
-const hash=async value=>new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)));
-const secureEqual=async(a,b)=>{const[x,y]=await Promise.all([hash(a),hash(b)]);let d=0;for(let i=0;i<x.length;i++)d|=x[i]^y[i];return d===0;};
-export default {async fetch(request,env){
- const u=new URL(request.url);
- const dashboard=String.raw`<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0b1019"><meta name="referrer" content="no-referrer"><link rel="manifest" href="/manifest.json"><title>BIST AVCI</title><style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0b1019;color:#f2f5fa;font:15px -apple-system,BlinkMacSystemFont,system-ui,sans-serif}main{max-width:720px;margin:auto;padding:20px 17px 100px}header{display:flex;justify-content:space-between;align-items:center;gap:8px}h1{font-size:25px;line-height:1.15;margin:0}h2{font-size:18px;margin:25px 0 12px}p{color:#aeb8c8;margin:5px 0 13px;line-height:1.45}.muted,small{color:#99a5b5;font-size:12px}.badge{border-radius:50px;padding:8px 12px;background:#26313f;color:#ced9e7;font-size:12px}.api{display:flex;gap:7px;flex-wrap:wrap;margin:19px 0}.pill{padding:9px 12px;border:1px solid #374459;border-radius:25px;font-size:12px;color:#ccd5e2;background:#151d2b}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#778394;margin-right:6px}.ok{background:#37d58c;box-shadow:0 0 7px #37d58c}.bad{background:#ff7070}.wait{background:#e6bc50}.panel,.tile{border:1px solid #2d3849;border-radius:17px;padding:17px;background:#151d2b}.hero{background:linear-gradient(125deg,#1c3345,#122332);border:1px solid #365165;border-radius:19px;padding:20px;margin-top:18px}.hero strong{font-size:32px;letter-spacing:-1px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.statgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:12px}.stat{background:#222b3a;border-radius:14px;padding:13px;text-align:center}.stat strong{font-size:23px;display:block}.stat small{font-size:12px}.money{font-size:23px;font-weight:750;margin-top:6px}.empty{padding:18px;border:1px solid #354356;border-radius:15px;color:#a7b5c6;background:#111925;line-height:1.5}.hrow{display:flex;justify-content:space-between;align-items:center;gap:10px}.hrow h2{margin:23px 0 12px}.tabs{display:flex;gap:8px;margin-bottom:12px}.tabs button{width:auto;border-radius:24px;padding:10px 16px;background:#263244}.tabs button.active{background:#32745f}.page{display:none}.page.active{display:block}.nav{position:fixed;z-index:5;bottom:0;left:0;right:0;padding:9px max(10px,env(safe-area-inset-left)) calc(8px + env(safe-area-inset-bottom));background:#111a28;border-top:1px solid #394252;display:flex;justify-content:space-around;gap:4px}.nav button{border:0;background:transparent;flex:1;min-width:0;padding:7px 0;color:#9daabd;font-size:11px;border-radius:10px}.nav button.active{color:#65dfab;background:#213348}.nav b{display:block;font-size:20px;margin-bottom:3px}button{cursor:pointer;border:1px solid #426477;border-radius:11px;padding:12px 14px;background:#226b59;color:white;font-size:14px;font-weight:650}button:disabled{opacity:.6}input{width:100%;background:#0b111c;border:1px solid #56647a;border-radius:11px;padding:14px;color:#fff;font-size:16px;margin:8px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0a121e;border-radius:12px;padding:13px;color:#cdd9e7;font-size:12px;max-height:260px;overflow:auto}.warn{color:#e9c782}.subtle{border-top:1px solid #29374a;margin:19px 0 0}.chip{font-size:12px;border:1px solid #45617b;padding:5px 9px;border-radius:20px;color:#aecaee}.cards{display:grid;gap:9px}a{color:#81dccc}@media(min-width:700px){.nav{max-width:720px;margin:auto;border-left:1px solid #394252;border-right:1px solid #394252}}
-</style></head><body><main>
-<header><div><h1>📈 BIST AVCI</h1><p>Bulut radar & sanal portföy · teknik demo</p></div><span class="badge" id="mainState">Veri bekleniyor</span></header>
-<div class="api"><span class="pill"><i id="geminiDot" class="dot"></i>Gemini · <span id="geminiText">Kontrol bekliyor</span></span><span class="pill"><i id="gptDot" class="dot"></i>GPT · <span id="gptText">Kontrol bekliyor</span></span></div>
-<div id="home" class="page active">
-<div class="hero" role="button" tabindex="0" data-jump="demo"><small>💼 Sanal portföy · nakit + giriş değeri</small><div><strong id="total">5.000,00 TL</strong></div><p>Gerçekleşen kâr/zarar: <span id="pnl">Henüz işlem yok</span></p></div>
-<div class="grid" style="margin-top:11px"><div class="tile" role="button" tabindex="0" data-jump="demo"><b>⚡ SCALP</b><div class="money" id="scalpCash">2.500 TL</div><small>Kullanılabilir nakit · işlemler için dokun</small></div><div class="tile" role="button" tabindex="0" data-jump="candidates"><b>🎯 SNIPER</b><div class="money" id="swingCash">2.500 TL</div><small>Kullanılabilir nakit · tek slot için dokun</small></div></div>
-<div class="statgrid"><div class="stat" role="button" tabindex="0" data-jump="radar"><strong id="scanned">0</strong><small>Taranan</small></div><div class="stat" role="button" tabindex="0" data-jump="candidates"><strong id="candidateCount">0</strong><small>Son tarama · sıcak aday</small></div><div class="stat" role="button" tabindex="0" data-jump="signals"><strong id="approved">0</strong><small>Bugün mini onaylı</small></div></div>
-<div class="hrow"><h2>🎯 Günün İzleme Listesi</h2><small id="scanTime">Son tarama bekleniyor</small></div><p id="panelFreshness" aria-live="polite" style="font-size:13px;color:#9eafc2">Panel bağlanıyor…</p><p id="feedDetail" aria-live="polite">Veri zamanı bekleniyor.</p><div class="empty" id="watchlist" role="button" tabindex="0" data-jump="candidates">Henüz doğrulanmış piyasa verisiyle liste oluşmadı.</div>
-<div class="hrow"><h2>⚡ Canlı Radar</h2><small>15 dakikalık bulut döngüsü</small></div><div class="panel"><div class="hrow"><span>Piyasa veri kaynağı</span><span class="warn" id="marketState">Bağlantı bekleniyor</span></div><div class="hrow" style="margin-top:14px"><span>Son tarama</span><span class="warn" id="xuState">Veri bekleniyor</span></div><p class="muted" id="lastRun" style="margin-top:13px">Son tarama: bekleniyor</p></div>
-<div class="hrow"><h2>✅ Onaylı Sinyaller</h2><small>En yeniler üstte</small></div><div class="tabs"><button class="active" data-filter="ALL">Tümü</button><button data-filter="SCALP">Günlük</button><button data-filter="SWING">Sniper</button></div><div class="empty" id="signalsHome">Henüz onaylı AL / SAT sinyali yok.</div>
-<h2>💼 Açık Demo İşlemler</h2><div class="empty" id="openHome">Henüz sanal işlem açılmadı.</div><h2>📊 Performans</h2><div class="empty" id="performanceHome">Gerçek fiyatlarla kapanan sanal işlemler burada gösterilecek.</div>
-</div>
-<div id="candidates" class="page"><h2>🎯 Pusudaki Adaylar</h2><div class="tabs"><button class="active" data-candidate-filter="ALL">Tümü</button><button data-candidate-filter="SCALP">⚡ Scalp</button><button data-candidate-filter="SWING">🎯 Sniper</button><button data-candidate-filter="WHALE">🐋 Balina</button></div><p>Gerçek kaynaklardan doğrulanan adaylar burada gösterilir. Aday, AL sinyali değildir.</p><div id="candidateList" class="cards"><div class="empty">Henüz aday yok.</div></div><h2>🎯 Sniper · Tek Slot</h2><div id="sniperPosition" class="panel">Açık Sniper işlemi yok.</div><h2>🪑 Dinamik Yedek Havuz</h2><p>Mini onaylı adaylar güç sırasıyla gösterilir. Bozulan veya bayatlayan aday giriş için kullanılmaz.</p><div id="sniperStandby" class="cards"></div><h2>⚡ SCALP Slotları</h2><div id="scalpSlots" class="cards"></div></div><div id="radar" class="page"><h2>🎯 Radar</h2><p>⚡ Günlük Al-Sat · 📈 Swing · 🐋 Sessiz Balina</p><div class="empty" id="radarState">Doğrulanmış piyasa mum verisi gelmeden otomatik hisse taraması yapılamıyor.</div><h2>Manuel hisse araştırması</h2><div class="panel"><p>Bu bölüm sinyal değildir, mevcut araştırma testidir.</p><input id="symbol" value="ASTOR" maxlength="6" autocapitalize="characters" placeholder="Hisse kodu"><button id="go">Araştır</button><pre id="result">Henüz araştırma yapılmadı.</pre></div></div>
-<div id="signals" class="page"><h2>✅ Onaylı Sinyaller</h2><div class="empty" id="signalsPage">Teknik filtre ve resmî risk teyidinden geçmiş sinyal henüz bulunmuyor.</div><p>Mini onayı sanal giriş kararıdır; gerçekleşmiş alım değildir. Ayrıntılar için karta dokun.</p></div>
-<div id="demo" class="page"><h2>💼 Demo Portföy</h2><div class="hero" role="button" tabindex="0" data-jump="demo"><small>Başlangıç sanal kasa</small><div><strong id="demoTotal">5.000,00 TL</strong></div><p>SCALP ve SNIPER kasaları ayrı tutulur. Gerçek banka emri verilmez.</p></div><h2>Açık İşlemler</h2><div class="empty" id="demoOpen">Açık sanal işlem bulunmuyor.</div><h2>Gemini için Denetim Karnesi</h2><button id="copyReport">📋 Karneyi kopyala</button><p id="reportStatus" aria-live="polite"></p><textarea id="reportResult" readonly rows="12" style="width:100%;box-sizing:border-box;background:#0b1420;color:#eef5ff;border:1px solid #405269;border-radius:14px;padding:12px" placeholder="Karne burada hazırlanır."></textarea><button id="selectReport">Karne metnini seç</button><h2>Kapanan İşlemler</h2><div class="empty" id="demoClosed">Henüz kapanan işlem yok.</div></div>
-<div id="settings" class="page"><h2>⚙️ Ayarlar ve Bağlantılar</h2><div class="panel"><p>Mevcut erişim tokenını girince Gemini, GPT ve radar durumu otomatik kontrol edilir. Token cihazda saklanmaz.</p><input id="token" type="password" autocomplete="off" placeholder="ACCESS_TOKEN"><button id="check">🔌 API bağlantılarını kontrol et</button><pre id="checkResult">Token bekleniyor.</pre><button id="pushOn">🔔 iPhone bildirimlerini etkinleştir</button><button id="pushTest">🔔 Test bildirimi gönder</button><pre id="pushStatus">Bildirimleri etkinleştir; ardından test bildirimi gönder.</pre></div><h2>📋 Ortak Teknik Belge</h2><div class="panel"><p>GPT ve Gemini için güncel teknik belge.</p><button id="copyDoc">📋 Teknik belge bağlantısını kopyala</button><p id="copyStatus" class="muted">Gemini sohbetine yapıştırabilirsin.</p></div><h2>🌙 Gece taraması</h2><div class="panel"><p>Son kapanmış günlük mumlarla sistemin kendi testini çalıştır. Onaylı AL sinyali değil, teknik radar testidir.</p><button id="nightTest">🌙 Bulut besleme durumunu göster</button><pre id="nightResult">Henüz bu oturumdan başlatılmadı.</pre></div><h2>Diagnostik</h2><div class="panel"><p>Gemini üretim testleri AI kotası kullanabilir.</p><button id="plain">Basit Gemini testi</button><button id="ground">Gemini Google Search testi</button><pre id="testResult">Henüz test edilmedi.</pre></div></div>
-<dialog id="detailDialog" style="background:#152031;color:#eef5ff;border:1px solid #405269;border-radius:20px;max-width:90vw"><h2 id="detailTitle"></h2><pre id="detailBody" style="white-space:pre-wrap"></pre><button id="detailClose">Kapat</button></dialog></main><nav class="nav"><button data-page="candidates"><b>◉</b>Adaylar</button><button class="active" data-page="home"><b>⌂</b>Ana</button><button data-page="radar"><b>◎</b>Radar</button><button data-page="signals"><b>✓</b>Sinyaller</button><button data-page="demo"><b>▣</b>Demo</button><button data-page="settings"><b>⚙</b>Ayarlar</button></nav>
-<script>
-if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
-function showDetails(title,value){document.getElementById('detailTitle').textContent=title;document.getElementById('detailBody').textContent=value;document.getElementById('detailDialog').showModal()}
-document.getElementById('detailClose').onclick=()=>document.getElementById('detailDialog').close();
-const token=document.getElementById('token');let pending=false,lastData=null;const headers=()=>token.value.trim()?({Authorization:'Bearer '+token.value.trim()}):({});const money=n=>Number(n||0).toLocaleString('tr-TR',{minimumFractionDigits:2,maximumFractionDigits:2})+' TL';
-function navigate(p){document.querySelectorAll('[data-page]').forEach(x=>x.classList.toggle('active',x.dataset.page===p));document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===p));window.scrollTo(0,0);void checkApis(true)}
-document.querySelectorAll('[data-jump]').forEach(x=>{x.onclick=()=>navigate(x.dataset.jump);x.onkeydown=e=>{if(e.key==='Enter')x.click()}});
-document.querySelectorAll('[data-page]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-page]').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===b.dataset.page));window.scrollTo(0,0);void checkApis(true)});
-document.querySelectorAll('[data-candidate-filter]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-candidate-filter]').forEach(x=>x.classList.toggle('active',x===b));if(lastData)renderOverview(lastData)});
-document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-filter]').forEach(x=>x.classList.toggle('active',x===b));if(lastData)renderOverview(lastData)});
-function setDot(which,state,text){document.getElementById(which+'Dot').className='dot '+state;document.getElementById(which+'Text').textContent=text}
-document.getElementById('selectReport').onclick=()=>{const out=document.getElementById('reportResult');out.focus();out.select();out.setSelectionRange(0,out.value.length);document.getElementById('reportStatus').textContent='Metin seçildi; iPhone menüsünden Kopyala seçebilirsin.'};
-document.getElementById('copyReport').onclick=()=>{const out=document.getElementById('reportResult'),status=document.getElementById('reportStatus');if(!lastData){status.textContent='Panel verisi henüz gelmedi; Ayarlar bölümünden bağlantıyı kontrol et.';return}const text='BIST anlık sanal işlem karnesi\nhttps://github.com/baykatemizlik-dotcom/ai-evi/blob/main/CLOUD_BRIDGE.md\n'+JSON.stringify({...lastData,panel_report_at:new Date().toISOString()},null,2);out.value=text;
- const fallback=()=>{out.focus();out.select();out.setSelectionRange(0,text.length);try{if(document.execCommand('copy')){status.textContent='Karne kopyalandı ✅';return}}catch{}status.textContent='Karne hazır ve seçili. Metne uzun basıp Kopyala seçebilirsin.'};
- if(navigator.clipboard?.writeText){try{navigator.clipboard.writeText(text).then(()=>{status.textContent='Karne kopyalandı ✅'},fallback)}catch{fallback()}}else fallback();};
-async function checkApis(silent=false){if(pending)return;pending=true;if(!silent){setDot('gemini','wait','Kontrol');setDot('gpt','wait','Kontrol');}try{
-const [a,b,c]=await Promise.all([fetch('/bist/connections',{headers:headers()}),fetch('/bist/overview',{headers:headers()}),fetch('/bist/status',{headers:headers()})]);const x=await a.json(),o=await b.json(),status=await c.json();if(a.status===401){setDot('gemini','','Oturum gerekli');setDot('gpt','','Oturum gerekli');document.getElementById('checkResult').textContent='Bir defa erişim tokenı girerek oturum aç.';return}document.getElementById('checkResult').textContent=JSON.stringify(x,null,2);for(const [label,field] of [['gemini','gemini'],['gpt','openai']]){const ok=a.ok&&x[field]&&x[field].connection==='CONNECTED';setDot(label,ok?'ok':'bad',ok?'Bağlı':(field==='openai'?(x.openai?.connection==='CONFIGURED'?'Mini hazır · ilk karar bekleniyor':x.openai?.connection==='ERROR'?'Mini API hatası':'Mini anahtarı eksik'):x.gemini?.connection==='ERROR'?'Gemini API hatası':'Bulut Gemini testi bekleniyor'))}if(!b.ok)throw Error('Panel verisi güncellenemedi: HTTP '+b.status);lastData=o;renderOverview(o);document.getElementById('mainState').textContent=status.scanner_live?'Bulut radar aktif':'Veri bekleniyor';
-}catch(e){setDot('gemini','bad','Hata');setDot('gpt','bad','Hata');document.getElementById('panelFreshness').textContent='Panel yenilenemedi · son kayıtlar gösteriliyor';document.getElementById('checkResult').textContent=String(e.message)}finally{pending=false}}
-function renderOverview(d){
- const stamp=value=>value?new Date(value).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'}):'—';
- const states={PENDING:'Giriş bekliyor',ENTERED:'Sanal alım yapıldı',EXPIRED:'Giriş süresi doldu',OPEN:'Açık sanal işlem',CLOSED:'Sanal işlem kapandı'};
- const filter=document.querySelector('[data-filter].active')?.dataset.filter||'ALL';
- for(const id of ['signalsHome','signalsPage']){const container=document.getElementById(id);container.replaceChildren();
-  for(const s of (d.ai_signals||[]).filter(x=>id==='signalsPage'||filter==='ALL'||(x.strategy||'SCALP')===filter)){
-   const card=document.createElement('button');card.style.display='block';card.style.width='100%';
-   const state=s.trade_status?states[s.trade_status]:s.signal_status==='PENDING'&&Date.parse(s.expires_at)<Date.now()?states.EXPIRED:states[s.signal_status]||'Bağlantı kontrolü · giriş sinyali yok';
-   card.textContent=s.symbol+' · '+state+' · Mini güven '+s.confidence+'/100';
-   card.onclick=()=>showDetails(s.symbol+' · sanal sinyal',
-    'Durum: '+state+'\nMotor: '+(s.strategy==='SWING'?'SNIPER':s.strategy||'Giriş bekleniyor')+'\nMini onay zamanı: '+stamp(s.completed_at)+'\nSinyal mumu: '+stamp(s.bar_time)+'\nGüven: '+s.confidence+'/100\nNeden: '+s.reason+'\nGiriş: '+(s.executed_price?money(s.executed_price):'Henüz yok')+'\nLot: '+(s.lot_count||0)+'\nGiriş barı: '+stamp(s.entry_time)+'\nÇıkış: '+stamp(s.exit_time)+'\nNet gerçekleşen K/Z: '+(s.pnl_net==null?'Henüz kapanmadı':money(s.pnl_net)));
-   container.append(card);
-  }if(!container.children.length)container.textContent='Bugün mini onaylı kayıt yok.';
- }
- document.getElementById('pnl').textContent=money(d.realised_pnl||0)+' · '+(d.open_trades||[]).length+' açık sanal işlem';
- document.getElementById('radarState').textContent='Son tarama: '+(d.last_scan_fetched||0)+' / '+(d.eligible_total||0)+' hisse · '+(d.stage1_hot||0)+' sıcak aday · '+(d.watchlist||[]).length+' teknik filtreyi geçen · '+(d.scanner_live?'Veri taze':'Veri bayat');
- 
- const trt=value=>value?new Date(value).toLocaleTimeString('tr-TR',{timeZone:'Europe/Istanbul',hour:'2-digit',minute:'2-digit'}):'bekleniyor';
- document.getElementById('panelFreshness').textContent='Panel güncellendi '+new Date().toLocaleTimeString('tr-TR',{timeZone:'Europe/Istanbul'})+' · 5 sn';document.getElementById('scanTime').textContent='Son tarama '+trt(d.last_scan_at)+' TRT';
- document.getElementById('feedDetail').textContent='Son mum başlangıcı '+trt(d.last_scan_bar)+' TRT · '+(d.shards_completed||0)+'/8 parça · '+(d.pending_entries||0)+' bekleyen giriş · '+(d.sniper_queue||[]).filter(q=>q.fresh).length+' taze yedek · '+(d.scanner_live?'Veri taze':'Veri bayat; giriş kapalı');
- 
- const standby=document.getElementById('sniperStandby');standby.replaceChildren();
- for(const [rank,q] of (d.sniper_queue||[]).entries()){const el=document.createElement('div');el.className='tile';el.textContent=(rank+1)+'. '+q.symbol+' · Güven '+q.confidence+'/100 · '+(q.fresh?'Taze':'Bayat · giriş kapalı')+' · '+q.reason+' · Son mum '+new Date(q.last_checked_bar).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'});standby.append(el);}
- if(!standby.children.length){const el=document.createElement('div');el.className='empty';el.textContent='Mini onaylı taze yedek bekleniyor.';standby.append(el);}
- const sniper=(d.open_trades||[]).find(t=>t.strategy==='SWING');document.getElementById('sniperPosition').textContent=sniper?'SNIPER · '+sniper.symbol+' · '+sniper.lot_count+' lot · Stop '+money(d.sniper_state?.stop_price)+' · Tepe '+money(d.sniper_state?.peak_price):'Tek slot boş · Kasa '+money(d.swing_cash);
- const cap=Number(d.equity||d.total_capital||5000);document.getElementById('total').textContent=money(cap);document.getElementById('demoTotal').textContent=money(cap);document.getElementById('scalpCash').textContent=money(d.scalp_cash);document.getElementById('swingCash').textContent=money(d.swing_cash);document.getElementById('approved').textContent=String(d.approved||0);document.getElementById('candidateCount').textContent=String(d.candidates||0);document.getElementById('scanned').textContent=String(d.last_scan_fetched||d.scanned||0);document.getElementById('lastRun').textContent=d.last_scan_at?'Son mum başlangıcı '+trt(d.last_scan_bar)+' TRT · '+d.shards_completed+'/8 parça · '+(d.scanner_live?'Veri taze':'Yeni veri bekleniyor; son tarama gösteriliyor'):'Henüz tarama kaydı yok';document.getElementById('marketState').textContent=d.scanner_live?'Bulut verisi aktif · gösterge niteliğinde':'Taze 15m veri bekleniyor';document.getElementById('xuState').textContent=d.last_scan_at?trt(d.last_scan_at)+' TRT · '+d.last_scan_fetched+' hisse':'Henüz tarama kaydı yok';document.getElementById('watchlist').textContent=d.candidates>0?'Son taramada '+d.candidates+' sıcak aday · Teknik adaylar ve yedekler için dokun →':'Son taramada sıcak aday yok; yedek havuzu ayrıca izlenir.';
-const list=document.getElementById('candidateList');list.replaceChildren();const candidateFilter=document.querySelector('[data-candidate-filter].active')?.dataset.candidateFilter||'ALL';
-for(const a of (d.watchlist||[]).filter(x=>candidateFilter==='ALL'||x.strategy===candidateFilter)){const b=document.createElement('button');b.textContent=(a.strategy==='SCALP'?'⚡ SCALP':a.strategy==='SWING'?'🎯 SNIPER':a.strategy==='WHALE'?'🐋 BALİNA':'STRATEJİ BELİRSİZ')+' · '+a.symbol+' · '+(a.verified?'Doğrulandı':'Teyit bekliyor')+' · '+a.source+' · '+(a.ai_status||'Mini değerlendirmesi bekleniyor');b.onclick=()=>alert('Hisse: '+a.symbol+'\nKaynak: '+a.source+'\nDurum: '+(a.verified?'Doğrulandı':'Teyit bekliyor')+'\nAL sinyali değildir.');list.append(b)}
-if(!list.children.length){const e=document.createElement('div');e.className='empty';e.textContent='Doğrulanmış aday bulunmuyor.';list.append(e)}
-const slots=document.getElementById('scalpSlots');slots.replaceChildren();for(const id of [1,2]){const t=(d.open_trades||[]).find(x=>x.strategy==='SCALP'&&x.slot_id===id);const el=document.createElement('div');el.className='tile';el.tabIndex=0;el.setAttribute('role','button');el.onclick=()=>showDetails('SCALP Slot '+id,t?'Hisse: '+t.symbol+'\nLot: '+t.lot_count+'\nGiriş fiyatı: '+money(t.executed_price)+'\nGiriş barı: '+stamp(t.entry_time)+'\nKomisyon: '+money(t.commission)+'\nDurum: Açık sanal işlem':'Slot boş');el.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();el.click()}};el.textContent=t?'Slot '+id+' · '+t.symbol+' · '+t.lot_count+' lot':'Slot '+id+' · Boş · 1.250 TL';slots.append(el)}const o=d.open_trades||[],c=d.closed_trades||[];document.getElementById('demoOpen').style.whiteSpace='pre-line';document.getElementById('openHome').style.whiteSpace='pre-line';const openText=o.length?o.map(x=>x.strategy+' · '+x.symbol+' · '+x.lot_count+' lot · '+money(x.executed_price)).join('\n'):'Henüz sanal işlem açılmadı.';document.getElementById('openHome').textContent=openText;const demo=document.getElementById('demoOpen');demo.replaceChildren();
- for(const t of o){const cost=t.executed_price*t.lot_count+t.commission,scalp=t.strategy==='SCALP',stop=scalp?cost*.985/(t.lot_count*.998*.998):d.sniper_state?.stop_price,tp=scalp?cost*1.03/(t.lot_count*.998*.998):null;
- const card=document.createElement('button');card.style.width='100%';card.style.display='block';
- const detail=(scalp?'SCALP':'SNIPER')+' · '+t.symbol+'\n'+t.lot_count+' lot · Giriş '+money(t.executed_price)+'\nGiriş barı: '+stamp(t.entry_time)+'\nToplam maliyet: '+money(cost)+' · Komisyon: '+money(t.commission)+'\nStop eşik fiyatı: '+money(stop)+' · '+(tp?'TP eşik fiyatı: '+money(tp):'Dinamik takip stopu')+'\nDurum: Açık sanal işlem';
- card.style.whiteSpace='pre-line';card.textContent=detail;card.onclick=()=>showDetails(t.symbol+' · işlem ayrıntısı',detail);demo.append(card);
- }if(!o.length)demo.textContent='Henüz açık sanal işlem yok.';document.getElementById('demoClosed').textContent=c.length?c.map(x=>x.symbol+' · Net K/Z '+money(x.pnl_net)).join('\n'):'Henüz kapanan işlem yok.';document.getElementById('performanceHome').textContent=c.length?'Kapanan işlem: '+c.length+' · Net toplam: '+money(c.reduce((sum,x)=>sum+Number(x.pnl_net||0),0)):'Henüz kapanan işlem yok.'}
-async function loginAndCheck(){if(token.value.trim()){const r=await fetch('/bist/session',{method:'POST',headers:{Authorization:'Bearer '+token.value.trim()}});if(!r.ok){document.getElementById('checkResult').textContent='Erişim tokenı hatalı';return}token.value=''}await checkApis()}token.addEventListener('change',loginAndCheck);document.getElementById('check').onclick=loginAndCheck;checkApis();setInterval(()=>{if(!document.hidden)void checkApis(true)},5000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)void checkApis(true)});
-document.getElementById('go').onclick=async()=>{const sym=document.getElementById('symbol').value.trim().toUpperCase(),out=document.getElementById('result');if(!/^[A-Z0-9]{3,6}$/.test(sym)){out.textContent='Geçersiz sembol';return}out.textContent='Araştırılıyor';try{const r=await fetch('/bist/research',{method:'POST',headers:{...headers(),'Content-Type':'application/json'},body:JSON.stringify({symbol:sym})});out.textContent='HTTP '+r.status+'\n'+JSON.stringify(await r.json(),null,2)}catch(e){out.textContent=String(e)}};
-document.getElementById('nightTest').onclick=async()=>{const b=document.getElementById('nightTest'),o=document.getElementById('nightResult');b.disabled=true;o.textContent='Bot kapanmış mumları tarıyor...';try{const r=await fetch('/bist/status',{headers:headers()});const j=await r.json();o.textContent='HTTP '+r.status+'\\n'+JSON.stringify(j,null,2);if(r.ok)await checkApis()}catch(e){o.textContent='Tarama hatası: '+e.message}finally{b.disabled=false}};
-document.getElementById('copyDoc').onclick=async()=>{const link='https://docs.google.com/document/d/1G6Gj9O0dPHaNY0MdWhEp_F3EKyn_Q0sC9RaV9cxY2uk/edit';try{await navigator.clipboard.writeText(link);document.getElementById('copyStatus').textContent='Bağlantı kopyalandı ✅'}catch{document.getElementById('copyStatus').textContent='Kopyalanamadı. Belge bağlantısı: '+link}};
-async function testPush(){const out=document.getElementById('pushStatus');try{const reg=await navigator.serviceWorker.ready;const sub=await reg.pushManager.getSubscription();if(!sub)throw Error('Önce bildirimleri etkinleştir.');const r=await fetch('/push/test',{method:'POST',headers:{...headers(),'Content-Type':'application/json'},body:JSON.stringify({endpoint:sub.endpoint})});const data=await r.json();if(!r.ok||!data.accepted)throw Error('Test gönderilemedi; bildirimleri yeniden etkinleştir.');out.textContent='Test bildirimi telefonun bildirim servisine iletildi. Bildirim gelmezse iPhone bildirim ve Odak ayarlarını kontrol et.';}catch(e){out.textContent=e.message;}}
-document.getElementById('pushTest').onclick=testPush;
-document.getElementById('pushOn').onclick=async()=>{const out=document.getElementById('pushStatus');try{if(!('serviceWorker'in navigator)||!('PushManager'in window)||!('Notification'in window))throw Error('iPhone: Safari → Paylaş → Ana Ekrana Ekle. Paneli ana ekrandan aç.');const permission=await Notification.requestPermission();if(permission!=='granted')throw Error('Bildirim izni verilmedi. iPhone Ayarlar → Bildirimler bölümünden izin ver.');out.textContent='Bildirim bağlantısı kuruluyor…';await navigator.serviceWorker.register('/sw.js');const reg=await Promise.race([navigator.serviceWorker.ready,new Promise((_,reject)=>setTimeout(()=>reject(Error('Sayfayı yenileyip tekrar dene.')),20000))]);const k=await fetch('/push/key',{headers:headers()});if(!k.ok)throw Error('Bildirim servisi hazır değil.');const j=await k.json();const base=j.key.replace(/-/g,'+').replace(/_/g,'/');const bytes=Uint8Array.from(atob(base.padEnd(Math.ceil(base.length/4)*4,'=')),x=>x.charCodeAt(0));let sub=await reg.pushManager.getSubscription();if(sub&&sub.options.applicationServerKey){const prev=new Uint8Array(sub.options.applicationServerKey);if(prev.length!==bytes.length||prev.some((v,i)=>v!==bytes[i])){await sub.unsubscribe();sub=null;}}sub=sub||await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:bytes});const r=await fetch('/push/subscribe',{method:'POST',headers:{...headers(),'Content-Type':'application/json'},body:JSON.stringify(sub)});if(!r.ok)throw Error('Abonelik kaydedilemedi; panel girişini kontrol et.');out.textContent='Bildirimler etkin. Test bildirimi gönderiliyor…';await testPush();}catch(e){out.textContent=e.message}};
-for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getElementById(id).onclick=async()=>{const out=document.getElementById('testResult');out.textContent='Test yapılıyor';try{const r=await fetch('/bist/gemini-test?mode='+mode,{headers:headers()});out.textContent='HTTP '+r.status+'\n'+JSON.stringify(await r.json(),null,2)}catch(e){out.textContent=String(e)}};
-</script></body></html>`;
+function renderQueue(id,rows,trend){const box=el(id);box.replaceChildren();for(const [i,q] of rows.entries()){const n=node('div',null,'queue');n.append(node('b',(i+1)+'. '+q.symbol+(trend&&q.priority?' · berker3':'')),node('p','Puan '+q.score.toFixed(2)+' · '+q.reason),node('small','Son geçerlilik: '+stamp(q.expires_at)));box.append(n);}if(!rows.length)empty(box,'Hazır yedek yok.');}
+function renderHistory(){const box=el('historyRows');box.replaceChildren();for(const t of (data.exit_history||[]).filter(t=>filter==='ALL'||t.strategy===filter)){const n=node('article',null,'history');n.append(node('b',t.symbol+' · '+(t.strategy==='SCALP'?'Scalp':'Trend')+' · '+t.qty+' lot'),node('p',reasons[t.reason]||t.reason),node('span',money(t.pnl_net),t.pnl_net>=0?'gain':'loss'),node('p','Satış '+price(t.executed_price)+' TL · '+stamp(t.observed_at||t.exit_time),'muted'));box.append(n);}if(!box.children.length)empty(box,'Bu filtrede satış kaydı yok.');}
+function timers(){document.querySelectorAll('[data-entry]').forEach(n=>{const mins=Math.max(0,(clock()-Date.parse(n.dataset.entry))/60000),remain=Math.max(0,60-mins);n.textContent=Math.floor(mins)+'/60 dk · Kalan '+Math.ceil(remain)+' dk'+(remain===0?' · Çıkış fiyatı bekleniyor':'');});}
+function render(){el('capital').textContent=money(data.total_capital);el('equity').textContent=money(data.equity);el('realised').textContent=money(data.realised_pnl);el('scalpCash').textContent=money(data.scalp_cash)+' boş nakit · '+data.scalp_slots+'/2 dolu slot';el('trendCash').textContent=money(data.swing_cash)+' boş nakit · '+data.trend_slots+'/2 dolu slot';el('connection').textContent=data.scanner_live?'Veri aktif':'Veri bekleniyor';el('freshness').textContent='Panel '+stamp(data.server_time)+' · Son tam tarama '+stamp(data.last_scan_at)+' · '+data.last_scan_fetched+' hisse';renderOpen('scalpOpen','SCALP');renderOpen('trendOpen','SWING');renderQueue('scalpQueue',data.scalp_sniper_queue||[],false);renderQueue('trendQueue',data.trend_radar_queue||[],true);renderHistory();timers();}
+async function refresh(){if(loading)return;loading=true;try{const r=await fetch('/bist/overview');if(!r.ok)throw Error(r.status===401?'Ayarlar bölümünden giriş yap.':'Panel güncellenemedi.');data=await r.json();offset=Date.parse(data.server_time)-Date.now();render();el('loginStatus').textContent='Bağlantı hazır.';}catch(e){el('freshness').textContent=e.message+' Son gösterilen kayıtlar güncel olmayabilir.';}finally{loading=false;}}
+el('login').onclick=async()=>{const token=el('token').value.trim();try{if(token){const r=await fetch('/bist/session',{method:'POST',headers:{Authorization:'Bearer '+token}});if(!r.ok)throw Error('Erişim tokenı hatalı.');el('token').value='';}await refresh();await loadSettings();}catch(e){el('loginStatus').textContent=e.message;}};
+async function loadSettings(){try{const r=await fetch('/bist/connections');if(r.ok){const d=await r.json();el('aiStatus').textContent='Scalp AI: Gemini '+d.gemini.connection+' · GPT '+d.openai.connection+' | Trend: EMA200 / SüperTrend / VWAP sayısal onayı';}const b=await fetch('/bist/strategy/berker3');if(b.ok&&!el('berker3').matches(':focus'))el('berker3').value=(await b.json()).symbols.join(', ');}catch{}}
+el('saveBerker3').onclick=async()=>{try{const symbols=[...new Set(el('berker3').value.toUpperCase().split(/[\s,;]+/).filter(Boolean))];const r=await fetch('/bist/strategy/berker3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbols})});if(!r.ok)throw Error('Liste kaydedilemedi; sembolleri kontrol et.');el('berker3Status').textContent='Öncelik listesi kaydedildi; sinyal kuralları her hisse için geçerli.';}catch(e){el('berker3Status').textContent=e.message;}};
+el('filters').querySelectorAll('button').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;el('filters').querySelectorAll('button').forEach(x=>x.classList.toggle('active',x===b));if(data)renderHistory();});
+el('copyReport').onclick=async()=>{if(!data)return;const text='BIST AVCI sanal işlem karnesi\n'+JSON.stringify(data,null,2);el('report').value=text;try{await navigator.clipboard.writeText(text);el('reportStatus').textContent='Kopyalandı.';}catch{el('report').focus();el('report').select();el('reportStatus').textContent='Metin seçildi; Kopyala seçebilirsin.';}};
+async function testPush(){try{if(!('serviceWorker'in navigator)||!('PushManager'in window))throw Error('Paneli ana ekrandan açıp bildirimleri etkinleştir.');const reg=await Promise.race([navigator.serviceWorker.ready,new Promise((_,reject)=>setTimeout(()=>reject(Error('Sayfayı yenileyip tekrar dene.')),20000))]);const sub=await reg.pushManager.getSubscription();if(!sub)throw Error('Önce bildirimleri etkinleştir.');const r=await fetch('/push/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint:sub.endpoint})});const x=await r.json();if(!r.ok||!x.accepted)throw Error('Test gönderilemedi; bildirimleri yeniden etkinleştir.');el('pushStatus').textContent='Test bildirim servisine iletildi. Telefonda görünmüyorsa bildirim ve Odak ayarlarını kontrol et.';}catch(e){el('pushStatus').textContent=e.message;}}
+el('pushTest').onclick=testPush;
+el('pushOn').onclick=async()=>{try{if(!('Notification'in window)||!('PushManager'in window))throw Error('Safari → Paylaş → Ana Ekrana Ekle; paneli ana ekrandan aç.');if(await Notification.requestPermission()!=='granted')throw Error('Bildirim izni verilmedi. iPhone bildirim ayarlarını kontrol et.');await navigator.serviceWorker.register('/sw.js');const reg=await Promise.race([navigator.serviceWorker.ready,new Promise((_,reject)=>setTimeout(()=>reject(Error('Sayfayı yenileyip tekrar dene.')),20000))]);const r=await fetch('/push/key');if(!r.ok)throw Error('Bildirim servisi hazır değil; panel girişini kontrol et.');const x=await r.json(),base=x.key.replace(/-/g,'+').replace(/_/g,'/'),key=Uint8Array.from(atob(base.padEnd(Math.ceil(base.length/4)*4,'=')),c=>c.charCodeAt(0));let sub=await reg.pushManager.getSubscription();if(sub?.options.applicationServerKey){const prev=new Uint8Array(sub.options.applicationServerKey);if(prev.length!==key.length||prev.some((v,i)=>v!==key[i])){await sub.unsubscribe();sub=null;}}sub=sub||await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:key});const saved=await fetch('/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(sub)});if(!saved.ok)throw Error('Abonelik kaydedilemedi.');await testPush();}catch(e){el('pushStatus').textContent=e.message;}};
+if('serviceWorker'in navigator)void navigator.serviceWorker.register('/sw.js').catch(()=>{});void refresh();void loadSettings();setInterval(()=>{if(!document.hidden)void refresh();},5000);setInterval(()=>{if(!document.hidden)timers();},1000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)void refresh();});
+</script></body></html>
+`;
  if((u.pathname==="/"||u.pathname==="/bist")&&request.method==="GET")return new Response(dashboard,{headers:{"Content-Type":"text/html; charset=utf-8","Cache-Control":"no-store","Content-Security-Policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'","X-Content-Type-Options":"nosniff","Referrer-Policy":"no-referrer"}});
  if(u.pathname==="/manifest.json")return new Response(JSON.stringify({name:"BIST AVCI",short_name:"BIST AVCI",start_url:"/",scope:"/",display:"standalone",background_color:"#0c1220",theme_color:"#0c1220",icons:[{src:"/icon.svg",sizes:"any",type:"image/svg+xml",purpose:"any maskable"}]}),{headers:{"Content-Type":"application/manifest+json","Cache-Control":"max-age=300"}});
  if(u.pathname==="/icon.svg")return new Response('<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192"><rect width="192" height="192" rx="36" fill="#0c1220"/><path d="M30 140 L65 105 L92 121 L135 59 L165 72" fill="none" stroke="#58d0a0" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/><text x="26" y="50" fill="white" font-size="27" font-family="sans-serif">BIST</text></svg>',{headers:{"Content-Type":"image/svg+xml","Cache-Control":"max-age=86400"}});
@@ -645,12 +286,15 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
    return new Response(JSON.stringify({ok:true,expires_at:new Date(Number(exp)).toISOString()}),{status:200,headers:{"Content-Type":"application/json","Cache-Control":"no-store","Set-Cookie":"bist_session="+exp+"."+await sign(exp)+"; Max-Age=1209600; Path=/; HttpOnly; Secure; SameSite=Strict"}});
  }
  if(u.pathname==="/bist/logout"&&request.method==="POST")return new Response(JSON.stringify({ok:true}),{headers:{"Content-Type":"application/json","Set-Cookie":"bist_session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict"}});
- if(['/bist/feed/ingest','/bist/feed/risk','/bist/feed/monitor','/bist/feed/report','/bist/feed/finalize','/bist/feed/daily','/bist/feed/audit','/bist/feed/probe','/bist/feed/gemini'].includes(u.pathname)){
-  if(u.pathname==='/bist/feed/gemini'?!['GET','POST'].includes(request.method):['/bist/feed/monitor','/bist/feed/daily'].includes(u.pathname)?request.method!=='GET':request.method!=='POST')return reply({error:'METHOD_NOT_ALLOWED'},405);
+ if(['/bist/feed/trend','/bist/feed/quote','/bist/feed/trend-universe','/bist/feed/ingest','/bist/feed/risk','/bist/feed/monitor','/bist/feed/report','/bist/feed/finalize','/bist/feed/daily','/bist/feed/audit','/bist/feed/probe','/bist/feed/gemini'].includes(u.pathname)){
+  if(u.pathname==='/bist/feed/gemini'?!['GET','POST'].includes(request.method):['/bist/feed/monitor','/bist/feed/daily','/bist/feed/trend-universe'].includes(u.pathname)?request.method!=='GET':request.method!=='POST')return reply({error:'METHOD_NOT_ALLOWED'},405);
   const ingestToken=env.BIST_INGEST_TOKEN||env.ACCESS_TOKEN;
   if(!ingestToken)return reply({error:'INGEST_TOKEN_NOT_CONFIGURED'},503);
   if(!provided || !await secureEqual(provided,ingestToken))return reply({error:'Unauthorized'},401);
-  try{if(u.pathname.endsWith('/gemini'))return await geminiDecision(request,env);
+  try{if(u.pathname.endsWith('/trend-universe'))return await trendUniverse(env.DB);
+   if(u.pathname.endsWith('/quote'))return await quoteIngest(request,env);
+   if(u.pathname.endsWith('/trend'))return await trendIngest(request,env);
+   if(u.pathname.endsWith('/gemini'))return await geminiDecision(request,env);
    if(u.pathname.endsWith('/probe'))return await probeMini(env);
    if(u.pathname.endsWith('/daily'))return reply(await dailyReport(env.DB));
    if(u.pathname.endsWith('/audit'))return await externalAudit(request,env);
@@ -667,23 +311,12 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
  if(u.pathname==='/bist/connections')return reply({mode:'CLOUD_BRIDGE_AI_REFEREE',external_fetch_enabled:true,market_data_fetch_enabled:false,gemini:await geminiStatus(env),openai:await aiStatus(env)});
  if(u.pathname==='/bist/ai/decisions')return reply({decisions:(await env.DB.prepare('SELECT symbol,bar_time,model,status,reason,completed_at,confidence,input_tokens,output_tokens FROM bist_ai_decisions ORDER BY created_at DESC LIMIT 100').all()).results});
  if(u.pathname==='/bist/report'){const report=await dailyReport(env.DB);const audit=await env.DB.prepare('SELECT * FROM bist_external_audits ORDER BY trt_date DESC LIMIT 1').first();return reply({...report,external_audit:audit?{...audit,report:JSON.parse(audit.report_json)}:null});}
- if(u.pathname==='/bist/overview'){
-  const [status,accounts,open,closed,signals,standby,sniperStates,counts,aiSignals]=await Promise.all([
-   feedStatus(env.DB),env.DB.prepare('SELECT * FROM paper_cash_accounts').all(),
-   env.DB.prepare("SELECT * FROM virtual_trades WHERE status='OPEN' ORDER BY entry_time DESC LIMIT 30").all(),
-   env.DB.prepare("SELECT * FROM virtual_trades WHERE status='CLOSED' ORDER BY exit_time DESC LIMIT 30").all(),
-   env.DB.prepare("SELECT c.symbol,'CLOUD_FEED' source,'SCALP' strategy,0 verified,c.observed_at created_at,d.status ai_status FROM bist_funnel_candidates c LEFT JOIN bist_ai_decisions d ON d.signal_key=c.symbol||':'||c.bar_time WHERE c.run_id=(SELECT run_id FROM bist_funnel_reports ORDER BY completed_at DESC LIMIT 1) ORDER BY c.score DESC,c.symbol").all(),
-   env.DB.prepare("SELECT * FROM bist_sniper_queue WHERE status='READY' ORDER BY score DESC,confidence DESC,symbol ASC").all(),
-   env.DB.prepare("SELECT s.* FROM bist_sniper_state s JOIN virtual_trades t ON t.id=s.trade_id WHERE t.status='OPEN'").all(),
-   env.DB.prepare("SELECT (SELECT count(DISTINCT symbol) FROM bist_ai_decisions WHERE status='APPROVED' AND date(completed_at,'+3 hours')=date('now','+3 hours')) approved,(SELECT count(*) FROM bist_feed_signals WHERE status='PENDING' AND expires_at>=strftime('%Y-%m-%dT%H:%M:%fZ','now')) pending_entries,(SELECT COALESCE(SUM(pnl_net),0) FROM virtual_trades WHERE status='CLOSED') realised_pnl").first(),
-   env.DB.prepare("SELECT d.symbol,d.bar_time,d.completed_at,d.confidence,d.reason,s.status signal_status,s.expires_at,t.strategy,t.status trade_status,t.executed_price,t.lot_count,t.entry_time,t.exit_time,t.pnl_net FROM bist_ai_decisions d LEFT JOIN bist_feed_signals s ON s.signal_key=d.signal_key LEFT JOIN virtual_trades t ON t.feed_entry_key=d.signal_key OR t.feed_entry_key='SNIPER:'||d.signal_key WHERE d.status='APPROVED' AND date(d.completed_at,'+3 hours')=date('now','+3 hours') ORDER BY d.completed_at DESC,d.symbol").all()]);
-  const account=Object.fromEntries((accounts.results||[]).map(x=>[x.strategy,x.available_cash]));
-  const openTrades=open.results||[];
-  return reply({...status,total_capital:5000,equity:(account.SCALP||0)+(account.SWING||0)+openTrades.reduce((s,t)=>s+t.executed_price*t.lot_count,0),
-   sniper_queue:(standby.results||[]).map(q=>({...q,fresh:fresh({bar_time:q.last_checked_bar,feed_type:'INDICATIVE_INTRADAY'},Date.now())})),sniper_state:sniperStates.results?.[0]||null,
-   scalp_cash:account.SCALP||0,swing_cash:account.SWING||0,open_trades:openTrades,closed_trades:closed.results||[],gemini:await geminiStatus(env),exit_audit:(await env.DB.prepare('SELECT * FROM bist_exit_audit ORDER BY exit_observed_at DESC LIMIT 30').all()).results||[],
-   scanned:status.scanned_symbols||status.active_symbols,approved:counts?.approved||0,candidates:status.stage1_hot||0,pending_entries:counts?.pending_entries||0,realised_pnl:counts?.realised_pnl||0,watchlist:signals.results,ai_signals:aiSignals.results||[],
-   latest_run:status.last_received?{phase:'CLOUD_BRIDGE',status:status.status,created_at:status.last_received}:null});
+ if(u.pathname==='/bist/overview')return reply({...await isolatedOverview(env.DB),gemini:await geminiStatus(env)});
+ if(u.pathname==='/bist/strategy/berker3'){if(request.method==='POST'&&request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);try{return await berker3Route(request,env);}catch{return reply({error:'LIST_UPDATE_FAILED'},503);}}
+ if(u.pathname==='/bist/strategy/close'){
+  if(request.method!=='POST')return reply({error:'METHOD_NOT_ALLOWED'},405);
+  if(request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);
+  try{return await manualStrategyClose(request,env);}catch{return reply({error:'CLOSE_FAILED',retry_safe:true},503);}
  }
  return reply({error:'DISABLED_IN_INGRESS_ONLY_MODE',external_fetch_enabled:false},410);
 },async scheduled(controller,env){const result=await enforceSessionClose(env.DB,Date.now());try{return {...result,push:await drainPush(env)};}catch{return {...result,push:{error:'DISPATCH_FAILED'}};}}};

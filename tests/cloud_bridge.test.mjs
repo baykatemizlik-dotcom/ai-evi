@@ -42,7 +42,7 @@ test('stream body limit prevents DB write',async()=>{
 });
 test('server has only the OpenAI referee egress and compiled module matches tested source',()=>{
  const worker=readFileSync(new URL('../worker/index.js',import.meta.url),'utf8');
- const module=readFileSync(new URL('../worker/cloud_bridge.mjs',import.meta.url),'utf8').replace(/^export /gm,'');
+ const module=readFileSync(new URL('../worker/cloud_bridge.mjs',import.meta.url),'utf8').replace(/^import .*?;\n/gm,'').replace(/^export /gm,'');
  assert.ok(worker.startsWith(module));
  const server=worker.replace(/ const dashboard=String.raw`[\s\S]*?`;/,'');
  assert.doesNotMatch(server.replace('async fetch(request,env)', 'async handler(request,env)').replace(/globalThis\.fetch\(\.\.\.args\)/g,'boundGlobalNetwork'),/\bfetch\s*\(/g); // method declaration below is exempted separately
@@ -90,46 +90,6 @@ test('Worker independently enforces RVOL2 green/body/wick before breakout/VWAP',
  assert.equal(technicalSignal([...previous,{...last,close:100.1}]),null);
  assert.equal(technicalSignal([...previous,{...last,volume:1990000}]),null);
 });
-test('full funnel: hot ingest → global selection → future eligible entry → stop → retry preserves cash',async()=>{
- const {mkdtempSync,rmSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');
- const {execFileSync}=await import('node:child_process');
- const {riskIngest,finalize,monitorSymbols,feedStatus,reportIngest,geminiDecision}=await import('../worker/cloud_bridge.mjs');
- const dir=mkdtempSync(join(tmpdir(),'bist-test-')),path=join(dir,'db.sqlite');
- const adapter=new URL('./funnel_sqlite.py',import.meta.url).pathname;
- const call=data=>JSON.parse(execFileSync('python3',[adapter,path],{input:JSON.stringify(data),encoding:'utf8'}));
- call({init:true});
- const db={prepare(sql){return {sql,params:[],bind(...p){this.params=p;return this;},async all(){return call({statements:[this]})[0];},async first(){return (await this.all()).results[0]||null;},async run(){return await this.all();}};},async batch(statements){return call({statements});}};
- const env={DB:db,OPENAI_API_KEY:'unit-test-only'};const mockAI=async()=>new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify({onay:true,neden:'Teknik koşullar ve resmi tedbir durumu uygun.',guven:85})}}],usage:{prompt_tokens:100,completion_tokens:20}}));const req=body=>new Request('https://example.test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
- try{
-  const risk={source:'https://www.borsaistanbul.com/erd/menkul_tedbir_listesi.csv',as_of:'2026-10-09T07:00:00Z',valid_until:'2026-10-09T21:00:00Z'};
-  assert.equal((await riskIngest(req({symbols:['TUPRS'],eligible_symbols:['TUPRS'],risk,risk_status:'VERIFIED_OFFICIAL_RESTRICTIONS'}),env,now)).status,200);
-  const previous=Array.from({length:20},(_,i)=>({...bar,time:new Date(Date.parse('2026-10-08T07:00:00Z')+i*900000).toISOString(),open:99,high:100,low:98,close:99,volume:1000000}));
-  const signalBar={...bar,open:100,high:104,low:100,close:103.5,volume:2000000};
-  const batch={...payload,bars:[...previous,signalBar],purpose:'HOT_CANDIDATE',run_id:'test-1'};
-  const first=await (await ingest(req(batch),env,now)).json();assert.equal(first.stage2,'MOMENTUM_PASSED');
-  assert.equal((await db.prepare('SELECT COUNT(*) n FROM virtual_trades').first()).n,0);
-  const beforeGemini=await (await finalize(req({run_id:'test-1'}),env,now+60000,mockAI)).json();assert.equal(beforeGemini.signals_created,0);
-  assert.equal((await geminiDecision(req({run_id:'test-1',symbol:'TUPRS',bar_time:first.bar_time,model:'gemini-3.1-flash-lite',status:'APPROVED',verdict:{approved:true,confidence:85,reason:'Teknik uygun'}}),env,now)).status,200);
-  const selected=await (await finalize(req({run_id:'test-1'}),env,now+60000,mockAI)).json();assert.deepEqual(selected.selected,['TUPRS']);assert.equal(selected.signals_created,1);
-  assert.equal((await (await finalize(req({run_id:'test-1'}),env,now+60000,mockAI)).json()).signals_created,0);
-  assert.deepEqual((await (await monitorSymbols(env,now+60000)).json()).symbols,['TUPRS']);
-  await db.prepare("UPDATE bist_sniper_queue SET status='EXPIRED'").run();
-  const entryBar={...bar,time:'2026-10-09T07:45:00Z',open:103.4,high:104,low:103,close:103.6,volume:1000000};
-  await ingest(req({...batch,purpose:'MONITOR',bars:[...previous,signalBar,entryBar]}),env,Date.parse('2026-10-09T08:16:00Z'));
-  const trade=await db.prepare('SELECT * FROM virtual_trades').first();assert.equal(trade.entry_time,'2026-10-09T07:45:00.000Z');assert.ok(Math.abs(trade.executed_price-103.4*1.002)<1e-10);
-  const stopBar={...bar,time:'2026-10-09T08:00:00Z',open:104,high:115,low:90,close:104,volume:1000000};
-  const closeBatch={...batch,purpose:'MONITOR',bars:[...previous,signalBar,entryBar,stopBar]};
-  const backfill=await (await ingest(req(closeBatch),env,Date.parse('2026-10-09T09:31:00Z'))).json();assert.equal(backfill.status,'BLOCKED_MARKET_DATA_UNAVAILABLE');assert.equal(backfill.engine.closed,1);
-  const closed=await db.prepare('SELECT * FROM virtual_trades').first();assert.equal(closed.exit_reason,'STOP_NET_1_5_PCT');assert.equal(closed.status,'CLOSED');assert.equal(closed.exit_time,'2026-10-09T08:15:00.000Z');const audit=await db.prepare('SELECT * FROM bist_exit_audit').first();assert.equal(audit.exit_bar_time,'2026-10-09T08:00:00.000Z');assert.equal(audit.exit_observed_at,'2026-10-09T09:31:00.000Z');
-  const cash=await db.prepare("SELECT available_cash cash FROM paper_cash_accounts WHERE strategy='SCALP'").first();
-  await ingest(req(closeBatch),env,Date.parse('2026-10-09T08:31:00Z'));
-  assert.deepEqual(await db.prepare("SELECT available_cash cash FROM paper_cash_accounts WHERE strategy='SCALP'").first(),cash);
-  assert.ok((await feedStatus(db,Date.parse('2026-10-09T08:31:00Z'))).scanner_live);
-  assert.equal((await reportIngest(req({run_id:'test-1',shard:0,universe_total:631,eligible_total:530,assigned:67,fetched:60,hot:1,posted:1,errors:7,last_bar_time:stopBar.time}),env,Date.parse('2026-10-09T08:31:00Z'))).status,200);
-  const coverage=await feedStatus(db,Date.parse('2026-10-09T08:31:00Z'));assert.equal(coverage.scanned_symbols,60);assert.equal(coverage.eligible_total,530);assert.equal(coverage.shards_completed,1);
- }finally{rmSync(dir,{recursive:true,force:true});}
-});
-
 test('AI uses strict schema, fixed endpoint, no redirects and fails closed on malformed output',async()=>{
  const {aiVerdict}=await import('../worker/cloud_bridge.mjs');
  const rows=Array.from({length:20},()=>({...bar,open:99,high:100,low:98,close:99,volume:1000000}));

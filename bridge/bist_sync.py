@@ -73,7 +73,7 @@ def normalize(symbol, timestamp, values, now):
         timestamp, UTC).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
         open=o, high=h, low=l, close=c, volume=v)
 
-def yahoo(symbol, now):
+def yahoo(symbol, now, with_quote=False):
     url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + symbol + '.IS?' + \
         urllib.parse.urlencode({'interval': '15m', 'range': '5d', 'includePrePost': 'false'})
     data = request_json(url)
@@ -99,7 +99,14 @@ def yahoo(symbol, now):
             bars.append(bar)
     if not bars:
         raise FeedError('YAHOO_NO_CLOSED_BARS')
-    return sorted(bars, key=lambda b: b['time'])[-100:]
+    bars = sorted(bars, key=lambda b: b['time'])[-100:]
+    if not with_quote:
+        return bars
+    quote_price=meta.get('regularMarketPrice')
+    quote=None
+    if isinstance(quote_price,(int,float)) and not isinstance(quote_price,bool) and math.isfinite(quote_price) and quote_price>0 and provider_time<=now:
+        quote={'symbol':symbol,'price':quote_price,'quote_time':dt.datetime.fromtimestamp(provider_time,UTC).isoformat(timespec='milliseconds').replace('+00:00','Z'),'source':'YAHOO_INDICATIVE'}
+    return {'bars':bars,'quote':quote,'source':'YAHOO_INDICATIVE','feed_type':'INDICATIVE_INTRADAY'}
 
 def twelve(symbol, now, key):
     # XIST is documented EOD: this fallback imports history, never marks it live.
@@ -121,7 +128,14 @@ def twelve(symbol, now, key):
             continue
     if not bars:
         raise FeedError('TWELVE_NO_CLOSED_BARS')
-    return sorted(bars, key=lambda b: b['time'])[-100:]
+    bars = sorted(bars, key=lambda b: b['time'])[-100:]
+    if not with_quote:
+        return bars
+    quote_price=meta.get('regularMarketPrice')
+    quote=None
+    if isinstance(quote_price,(int,float)) and not isinstance(quote_price,bool) and math.isfinite(quote_price) and quote_price>0 and provider_time<=now:
+        quote={'symbol':symbol,'price':quote_price,'quote_time':dt.datetime.fromtimestamp(provider_time,UTC).isoformat(timespec='milliseconds').replace('+00:00','Z'),'source':'YAHOO_INDICATIVE'}
+    return {'bars':bars,'quote':quote,'source':'YAHOO_INDICATIVE','feed_type':'INDICATIVE_INTRADAY'}
 
 def stage_one(all_bars, eligible_symbols):
     if not all_bars:return pd.DataFrame()
@@ -219,7 +233,13 @@ def main():
         return 0
     run_id=os.environ.get('BIST_RUN_ID') or dt.datetime.now(UTC).strftime('%Y%m%dT%H%M')
     if '--finalize' in sys.argv:
-        print('FINALIZE',worker_call('/bist/feed/finalize',{'run_id':run_id}))
+        result=worker_call('/bist/feed/finalize',{'run_id':run_id})
+        print('FINALIZE',result)
+        for symbol in result.get('selected',[]):
+            try:
+                packet=yahoo(symbol,time.time(),with_quote=True)
+                print('INSTANT_SCALP_REFRESH',symbol,worker_call('/bist/feed/ingest',{**packet,'purpose':'MONITOR'}).get('engine'))
+            except FeedError as exc:print('INSTANT_QUOTE_WAIT',symbol,str(exc))
         return 0
     raw_universe=os.environ.get('BIST_UNIVERSE_JSON')
     universe=json.loads(raw_universe) if raw_universe else restrict_universe(load_universe())
@@ -242,12 +262,12 @@ def main():
     for symbol in symbols:
         try:
             try:
-                bars=yahoo(symbol,time.time());source='YAHOO_INDICATIVE';feed_type='INDICATIVE_INTRADAY'
+                packet=yahoo(symbol,time.time(),with_quote=True);bars=packet['bars'];quote=packet['quote'];source='YAHOO_INDICATIVE';feed_type='INDICATIVE_INTRADAY'
             except FeedError:
                 if not key or shard!=0 or fallback_count>=6:raise FeedError('YAHOO_UNAVAILABLE_NO_USABLE_FALLBACK') from None
                 time.sleep(max(0,12-(time.monotonic()-last_twelve)));last_twelve=time.monotonic();fallback_count+=1
-                bars=twelve(symbol,time.time(),key);source='TWELVE_DATA_XIST_EOD';feed_type='EOD'
-            fetched[symbol]={'bars':bars,'source':source,'feed_type':feed_type}
+                bars=twelve(symbol,time.time(),key);quote=None;source='TWELVE_DATA_XIST_EOD';feed_type='EOD'
+            fetched[symbol]={'bars':bars,'quote':quote,'source':source,'feed_type':feed_type}
             # Close/entry monitoring cannot depend on whether today's candle stays hot.
             if symbol in monitors:
                 worker_call('/bist/feed/ingest',{**fetched[symbol],'run_id':run_id,'purpose':'MONITOR'})

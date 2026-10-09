@@ -18,7 +18,7 @@ class Monitoring(unittest.TestCase):
         def worker(path, body=None):
             calls.append((path, body))
             return {"symbols":["RTALB","RTALB"]} if body is None else {"bar_time":"2026-10-09T12:15:00Z","engine":{"opened":1}}
-        with patch.object(monitor,"session_open",return_value=True), patch.object(monitor.feed,"worker_config"), patch.object(monitor.feed,"worker_call",side_effect=worker), patch.object(monitor.feed,"yahoo",return_value=[{"symbol":"RTALB"}]) as yahoo, patch.object(monitor.time,"sleep"):
+        with patch.object(monitor,"session_open",return_value=True), patch.object(monitor.feed,"worker_config"), patch.object(monitor.feed,"worker_call",side_effect=worker), patch.object(monitor.feed,"yahoo",return_value={"bars":[{"symbol":"RTALB"}],"quote":None,"source":"YAHOO_INDICATIVE","feed_type":"INDICATIVE_INTRADAY"}) as yahoo, patch.object(monitor.time,"sleep"):
             self.assertEqual(monitor.poll_once(),0)
         self.assertEqual(yahoo.call_count,1)
         self.assertEqual(len(calls),2)

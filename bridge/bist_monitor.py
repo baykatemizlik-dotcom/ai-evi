@@ -6,6 +6,7 @@ import sys
 import time
 from zoneinfo import ZoneInfo
 import bist_sync as feed
+from bist_trend import trend_history
 
 def session_open(now):
     local = dt.datetime.fromtimestamp(now, ZoneInfo("Europe/Istanbul"))
@@ -16,16 +17,21 @@ def poll_once():
         print("MONITOR_OUTSIDE_SESSION")
         return 0
     feed.worker_config()
-    symbols = sorted(set(feed.worker_call("/bist/feed/monitor").get("symbols", [])))
+    state=feed.worker_call("/bist/feed/monitor")
+    symbols = sorted(set(state.get("symbols", [])))
+    trend_symbols={x["symbol"] for x in state.get("targets",[]) if x.get("strategy")=="SWING"}
     if any(not isinstance(s, str) or not re.fullmatch(r"[A-Z0-9]{3,6}", s) for s in symbols):
         raise feed.FeedError("INVALID_MONITOR_SYMBOL")
     errors = 0
     for symbol in symbols:
         try:
-            bars = feed.yahoo(symbol, time.time())
+            packet = feed.yahoo(symbol, time.time(),with_quote=True)
             result = feed.worker_call("/bist/feed/ingest", {
-                "bars": bars, "source": "YAHOO_INDICATIVE",
-                "feed_type": "INDICATIVE_INTRADAY", "purpose": "MONITOR"})
+                **packet, "purpose": "MONITOR"})
+            if symbol in trend_symbols:
+                hourly=trend_history(symbol,'60m',time.time())
+                daily=trend_history(symbol,'1d',time.time())
+                feed.worker_call('/bist/feed/trend',{'symbol':symbol,'source':'YAHOO_INDICATIVE','quote':packet['quote'],'hour':hourly,'daily':daily})
             print("TARGET_MONITOR", symbol, "bar=", result.get("bar_time"),
                   "status=", result.get("status"), "scalp=", result.get("engine"),
                   "sniper=", result.get("sniper"), flush=True)
