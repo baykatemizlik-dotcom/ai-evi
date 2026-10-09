@@ -1,0 +1,35 @@
+name: BIST Cloud Bridge
+on:
+  schedule:
+    - cron: '0,15,30,45 7-14 * * 1-5'
+    - cron: '0,15 15 * * 1-5'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/bist_sync.yml
+      - bridge/bist_sync.py
+permissions:
+  contents: read
+concurrency:
+  group: bist-cloud-feed
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test bridge and paper accounting
+        run: |
+          python3 -m unittest discover -s tests -p 'test_cloud_bridge.py'
+          node --test tests/cloud_bridge.test.mjs
+      - name: Feed closed 15m bars
+        env:
+          BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
+          BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python3 bridge/bist_sync.py
