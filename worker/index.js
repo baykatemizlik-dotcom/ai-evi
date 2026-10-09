@@ -159,7 +159,7 @@ const nightRadar=async(env)=>{
    await env.DB.prepare("INSERT INTO watchlist_pool(trade_day,symbol,source,verified,created_at,strategy,metrics_json,radar_status,updated_at) VALUES(?,?,?,0,?,'SWING',?,'RADAR_ONLY',?) ON CONFLICT(trade_day,symbol) DO UPDATE SET metrics_json=excluded.metrics_json,updated_at=excluded.updated_at,radar_status='RADAR_ONLY'")
     .bind(date,c.symbol,"Bridge D1 daily / unverified",new Date().toISOString(),JSON.stringify(c),new Date().toISOString()).run();
  }
- const status=(!names.length||errors.some(x=>x.reason==="YAHOO_HTTP_429"))?"BLOCKED_MARKET_DATA_UNAVAILABLE":!kap.ready?"NIGHT_OHLCV_OK_KAP_BLOCKED":"NIGHT_OHLCV_OK_KAP_UNVERIFIED";
+ const status=(!names.length||candidates.length===0&&errors.length>0||errors.some(x=>x.reason==="YAHOO_HTTP_429"))?"BLOCKED_MARKET_DATA_UNAVAILABLE":!kap.ready?"NIGHT_OHLCV_OK_KAP_BLOCKED":"NIGHT_OHLCV_OK_KAP_UNVERIFIED";
  const summary={status,provider,scanned:Math.min(names.length,errors.length+candidates.length),universe_count:names.length,market_data_success:Math.max(0,Math.min(names.length,errors.length+candidates.length)-errors.length),candidates:candidates.slice(0,5),errors,kap,approved_signals:0};
  await env.DB.prepare("INSERT OR REPLACE INTO bist_scan_runs(run_id,phase,status,created_at,details) VALUES(?,?,?,?,?)").bind("NIGHT:"+date,"NIGHT_WATCH",status,new Date().toISOString(),JSON.stringify(summary)).run();
  return summary;
