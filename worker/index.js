@@ -244,7 +244,7 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
    try{return reply(await ingestTwelve(env,"1day",1))}catch(e){return reply({status:"PROVIDER_ERROR",detail:String(e.message||e).slice(0,120)},503)}
  }
  if(u.pathname==="/bist/bridge/status"&&request.method==="GET"){const [u,b]=await Promise.all([env.DB.prepare("SELECT COUNT(*) n FROM bist_universe WHERE active=1 AND liquidity_tl>30000000").first(),env.DB.prepare("SELECT COUNT(*) n,MAX(received_at) last_received FROM bist_bridge_bars").first()]);return reply({universe:u?.n||0,bars:b?.n||0,last_received:b?.last_received||null,ready:(u?.n||0)>0&&(b?.n||0)>0})}
- if(u.pathname==="/bist/bridge/import"&&request.method==="POST"){
+ if(["/bist/bridge/import","/bist/feed/ingest"].includes(u.pathname)&&request.method==="POST"){
   if(!env.DB)return reply({error:"DB_MISSING"},503);
   const cl=Number(request.headers.get("Content-Length")||0);if(cl>400000)return reply({error:"PAYLOAD_TOO_LARGE"},413);
   let data;try{data=await request.json()}catch{return reply({error:"BAD_JSON"},400)}
