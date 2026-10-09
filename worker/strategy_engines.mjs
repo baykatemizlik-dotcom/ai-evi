@@ -28,30 +28,39 @@ export function trendSignal(hour,daily,intraday,now){
  return {ema200_hour:eh,ema200_daily:ed,supertrend_hour:sh,supertrend_daily:sd,vwap,initial_stop:sh.stop,score:100*(h.close/eh-1)+100*(d.close/ed-1),bar_time:h.bar_time};
 }
 export function strategyThresholds(t){const unit=t.executed_price+t.commission/t.lot_count;return {breakeven:unit/(.998*.998),tp:unit*(t.strategy==='SCALP'?1.03:1.04)/(.998*.998),sl:unit*.985/(.998*.998)};}
-export async function sellLeg(db,t,qty,raw,reason,quoteTime,now){
+export async function sellLeg(db,t,qty,raw,reason,quoteTime,now,activationTime=null){
  if(!Number.isInteger(qty)||qty<=0||!Number.isFinite(raw)||raw<=0)return false;
  const price=raw*.998,fee=price*qty*.002,pnl=price*qty-fee-(t.executed_price+t.commission/t.lot_count)*qty;
- const key=t.id+':'+(reason==='TREND_TP1'?'TP1':'FINAL');
- const r=await db.prepare(`INSERT OR IGNORE INTO strategy_exit_legs(event_key,trade_id,strategy,symbol,qty,executed_price,commission,exit_time,quote_time,observed_at,reason,pnl_net) SELECT ?,id,strategy,symbol,?,?,?,?,?,?,?,? FROM virtual_trades WHERE id=? AND status='OPEN' AND remaining_lots=? AND tp1_done=?`).bind(key,qty,price,fee,iso(now),quoteTime,iso(now),reason,pnl,t.id,t.remaining_lots,t.tp1_done).run();return r.meta.changes>0;
+ const key=t.id+':'+(reason==='TREND_TP1'?'TP1':reason==='SCALP_TP1'?'SCALP_TP1':'FINAL');
+ const r=await db.prepare(`INSERT OR IGNORE INTO strategy_exit_legs(event_key,trade_id,strategy,symbol,qty,executed_price,commission,exit_time,quote_time,observed_at,reason,pnl_net,activation_time) SELECT ?,id,strategy,symbol,?,?,?,?,?,?,?,?,? FROM virtual_trades WHERE id=? AND status='OPEN' AND remaining_lots=? AND tp1_done=?`).bind(key,qty,price,fee,iso(now),quoteTime,iso(now),reason,pnl,activationTime,t.id,t.remaining_lots,t.tp1_done).run();return r.meta.changes>0;
 }
 export function scalpExit(t,bars,q,now){
- const levels=strategyThresholds(t),deadline=Date.parse(t.entry_time)+3600000,eod=Date.parse(trtDate(Date.parse(t.entry_time))+'T14:40:00.000Z'),cutoff=Math.min(deadline,eod);let last=null;
- for(const b of [...bars].sort((a,b)=>a.bar_time.localeCompare(b.bar_time))){const start=Date.parse(b.bar_time),end=start+900000;if(start<Date.parse(t.entry_time)||end>now||end>cutoff)continue;last=b;
-  if(b.low<=levels.sl)return {raw:Math.min(b.open,levels.sl),reason:'SL_NET_1_5',time:b.bar_time};
-  if(b.high>=levels.tp)return {raw:levels.tp,reason:'TP_NET_3',time:b.bar_time};
+ const levels=strategyThresholds(t),entry=Date.parse(t.entry_time),eod=Date.parse(trtDate(entry)+'T14:40:00.000Z');
+ const runner=!!t.tp1_done,active=runner?Date.parse(t.scalp_runner_started_at):entry,deadline=entry+3600000,cutoff=runner?eod:Math.min(deadline,eod);let last=null;
+ if(!Number.isFinite(active))return null; // Never retroactively infer runner activation.
+ const stop=runner?levels.breakeven:levels.sl,stopReason=runner?'SCALP_RUNNER_BE':'SL_NET_1_5';
+ const tp=(raw,time,activation)=>({raw,reason:t.lot_count>=2?'SCALP_TP1':'TP_NET_3',time,activation,qty:t.lot_count>=2?Math.floor(t.lot_count*.7):t.remaining_lots});
+ for(const b of [...bars].sort((a,b)=>a.bar_time.localeCompare(b.bar_time))){const start=Date.parse(b.bar_time),end=start+900000;if(start<active||end>now||end>cutoff)continue;last=b;
+  if(b.low<=stop)return {raw:Math.min(b.open,stop),reason:stopReason,time:b.bar_time};
+  if(!runner&&b.high>=levels.tp)return tp(levels.tp,b.bar_time,iso(end));
  }
- const quoteValid=usableQuote(q,now)&&Date.parse(q.quote_time)>=Date.parse(t.entry_time);
+ const quoteValid=usableQuote(q,now)&&Date.parse(q.quote_time)>=active;
  if(quoteValid&&Date.parse(q.quote_time)<=cutoff){
-  if(q.price<=levels.sl)return {raw:q.price,reason:'SL_NET_1_5',time:q.quote_time};
-  if(q.price>=levels.tp)return {raw:q.price,reason:'TP_NET_3',time:q.quote_time};
+  if(q.price<=stop)return {raw:q.price,reason:stopReason,time:q.quote_time};
+  if(!runner&&q.price>=levels.tp)return tp(q.price,q.quote_time,q.quote_time);
  }
- if(now>=cutoff){const reason=eod<deadline?'SCALP_EOD_1740':'TIME_EXIT';
-  if(quoteValid)return {raw:q.price,reason,time:q.quote_time};
-  if(reason==='TIME_EXIT'&&last&&now-(Date.parse(last.bar_time)+900000)<=900000)return {raw:last.close,reason,time:last.bar_time};
+ if(now>=cutoff){const reason=runner?'SCALP_RUNNER_EOD':eod<=deadline?'SCALP_EOD_1740':'TIME_EXIT';
+  if(quoteValid&&Date.parse(q.quote_time)>=cutoff)return {raw:q.price,reason,time:q.quote_time};
+  if(last&&Date.parse(last.bar_time)+900000>=cutoff&&now-(Date.parse(last.bar_time)+900000)<=900000)return {raw:last.close,reason,time:last.bar_time};
  }return null;
 }
-export async function manageScalp(db,now){const rows=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN' AND engine_version=2").all();let closed=0;
- for(const t of rows.results||[]){const q=await db.prepare('SELECT * FROM strategy_quotes WHERE symbol=?').bind(t.symbol).first(),bars=await symbolBars(db,t.symbol,now),exit=scalpExit(t,bars,q,now);if(exit&&await sellLeg(db,t,t.remaining_lots,exit.raw,exit.reason,exit.time,now))closed++;}return closed;
+export async function manageScalp(db,now){const rows=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN' AND engine_version=2").all();let closed=0,partial=0;
+ for(let t of rows.results||[]){const q=await db.prepare('SELECT * FROM strategy_quotes WHERE symbol=?').bind(t.symbol).first(),bars=await symbolBars(db,t.symbol,now);
+  // A historical TP1 and a later runner exit may be observed in one monitor tick.
+  for(let step=0;step<2;step++){const exit=scalpExit(t,bars,q,now);if(!exit||!await sellLeg(db,t,exit.qty??t.remaining_lots,exit.raw,exit.reason,exit.time,now,exit.activation||null))break;
+   if(exit.reason!=='SCALP_TP1'){closed++;break;}partial++;t=await db.prepare('SELECT * FROM virtual_trades WHERE id=?').bind(t.id).first();
+  }
+ }return {closed,partial};
 }
 export async function trendHistories(db,symbol,now){const r=await db.prepare('SELECT * FROM trend_bars WHERE symbol=? AND bar_time<=? ORDER BY bar_time').bind(symbol,iso(now)).all();return {hour:(r.results||[]).filter(b=>b.interval==='60m'&&Date.parse(b.bar_time)+3600000<=now).slice(-350),daily:(r.results||[]).filter(b=>b.interval==='1d'&&trtDate(Date.parse(b.bar_time))<trtDate(now)).slice(-350)};}
 export async function manageTrend(db,now){const rows=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SWING' AND status='OPEN' AND engine_version=2").all();let closed=0,partial=0;
@@ -87,13 +96,13 @@ export async function fillStrategy(db,strategy,now){const table=QUEUES[strategy]
    // For an already approved scalp, do not require another breakout candle.
    const m=JSON.parse(q.metrics_json);if(quote.price<=m.resistance||quote.price<=m.vwap){await db.prepare(`UPDATE ${table} SET status='INVALID',reason='BREAKOUT_OR_VWAP_LOST' WHERE signal_key=? AND status='READY'`).bind(q.signal_key).run();continue;}
   }else{const {hour,daily}=await trendHistories(db,q.symbol,now),m=trendSignal(hour,daily,await symbolBars(db,q.symbol,now),now);if(!m||quote.price<=m.vwap||quote.price<=m.ema200_hour){await db.prepare(`UPDATE ${table} SET status='INVALID',reason='TREND_RECHECK_FAILED' WHERE signal_key=? AND status='READY'`).bind(q.signal_key).run();continue;}stop=m.initial_stop;if(quote.price<=stop)continue;}
-  const account=await db.prepare('SELECT available_cash FROM paper_cash_accounts WHERE strategy=?').bind(strategy).first(),plan=entryPlan(account?.available_cash||0,quote.price);if(plan.qty<(strategy==='SWING'?2:1))continue;
+  const account=await db.prepare('SELECT available_cash FROM paper_cash_accounts WHERE strategy=?').bind(strategy).first(),plan=entryPlan(account?.available_cash||0,quote.price);if(plan.qty<2)continue;
   try{const key=(strategy==='SCALP'?'SCALP:':'TREND:')+q.signal_key;const r=await db.prepare(`INSERT INTO virtual_trades(strategy,symbol,signal_price,executed_price,lot_count,commission,entry_time,status,slot_id,feed_entry_key,engine_version,remaining_lots,tp1_done,trailing_stop,entry_quote_time,entry_observed_at) VALUES(?,?,?,?,?,?,?,'OPEN',?,?,2,?,0,?,?,?) ON CONFLICT(feed_entry_key) DO NOTHING`).bind(strategy,q.symbol,quote.price,plan.executed,plan.qty,plan.commission,iso(now),slot,key,plan.qty,stop,quote.quote_time,iso(now)).run();opened+=r.meta.changes;}catch(e){if(!/PAPER_SLOT_BUSY|PAPER_INSUFFICIENT_CASH|PAPER_SIGNAL_NOT_ELIGIBLE|PAPER_QUOTE_OR_RISK_INVALID/.test(String(e)))throw e;}
  }return {opened};
 }
 export async function tickStrategies(db,now=Date.now()){
- const closed=await manageScalp(db,now),trend=await manageTrend(db,now),scalpFill=await fillStrategy(db,'SCALP',now),trendFill=await fillStrategy(db,'SWING',now);
- return {scalp:{closed,...scalpFill},trend:{...trend,...trendFill},paper_only:true};
+ const scalp=await manageScalp(db,now),trend=await manageTrend(db,now),scalpFill=await fillStrategy(db,'SCALP',now),trendFill=await fillStrategy(db,'SWING',now);
+ return {scalp:{...scalp,...scalpFill},trend:{...trend,...trendFill},paper_only:true};
 }
 export async function enqueueScalp(db,c,decision,observed){
  const stamp=iso(observed),expiry=iso(observed+900000);
@@ -128,8 +137,8 @@ export async function manualStrategyClose(request,env,now=Date.now()){
  return json({ok:closed,refill:await fillStrategy(env.DB,t.strategy,now),paper_only:true});
 }
 export async function isolatedOverview(db,now=Date.now()){
- const [status,cash,open,legs,old,scalp,trend]=await Promise.all([feedStatus(db,now),db.prepare('SELECT * FROM paper_cash_accounts').all(),db.prepare(`SELECT t.*,q.price current_price,q.quote_time FROM virtual_trades t LEFT JOIN strategy_quotes q ON q.symbol=t.symbol WHERE t.status='OPEN' ORDER BY t.strategy,t.slot_id`).all(),db.prepare('SELECT * FROM strategy_exit_legs ORDER BY observed_at DESC LIMIT 200').all(),db.prepare("SELECT id, strategy,symbol,lot_count qty,exit_price executed_price,exit_time,exit_reason reason,pnl_net FROM virtual_trades WHERE status='CLOSED' AND engine_version=1 ORDER BY exit_time DESC LIMIT 100").all(),db.prepare("SELECT * FROM scalp_sniper_queue WHERE status='READY' AND expires_at>? ORDER BY score DESC").bind(iso(now)).all(),db.prepare("SELECT * FROM trend_radar_queue WHERE status='READY' AND expires_at>? ORDER BY priority DESC,score DESC").bind(iso(now)).all()]);
- const accounts=Object.fromEntries((cash.results||[]).map(x=>[x.strategy,x.available_cash])),trades=(open.results||[]).map(t=>{const qty=t.remaining_lots??t.lot_count,unit=t.executed_price+t.commission/t.lot_count,price=t.current_price||t.executed_price;const q={price,quote_time:t.quote_time,source:'YAHOO_INDICATIVE'};return {...t,remaining_lots:qty,current_price:price,quote_fresh:usableQuote(q,now),unrealised_net:price*qty*.998*.998-unit*qty,unrealised_pct:100*(price*.998*.998/unit-1),elapsed_minutes:Math.max(0,(now-Date.parse(t.entry_time))/60000),remaining_minutes:Math.max(0,60-(now-Date.parse(t.entry_time))/60000),thresholds:strategyThresholds(t)};});
+ const [status,cash,open,legs,old,scalp,trend]=await Promise.all([feedStatus(db,now),db.prepare('SELECT * FROM paper_cash_accounts').all(),db.prepare(`SELECT t.*,q.price current_price,q.quote_time FROM virtual_trades t LEFT JOIN strategy_quotes q ON q.symbol=t.symbol WHERE t.status='OPEN' ORDER BY t.strategy,t.slot_id`).all(),db.prepare('SELECT * FROM strategy_exit_legs ORDER BY observed_at DESC LIMIT 200').all(),db.prepare("SELECT id, strategy,symbol,lot_count qty,exit_price executed_price,exit_time,exit_reason reason,pnl_net FROM virtual_trades WHERE status='CLOSED' AND engine_version=1 ORDER BY exit_time DESC LIMIT 100").all(),db.prepare("SELECT s.*,q.price indicative_price,q.quote_time FROM scalp_sniper_queue s LEFT JOIN strategy_quotes q ON q.symbol=s.symbol WHERE s.status='READY' AND s.expires_at>? ORDER BY s.score DESC").bind(iso(now)).all(),db.prepare("SELECT * FROM trend_radar_queue WHERE status='READY' AND expires_at>? ORDER BY priority DESC,score DESC").bind(iso(now)).all()]);
+ const accounts=Object.fromEntries((cash.results||[]).map(x=>[x.strategy,x.available_cash])),trades=(open.results||[]).map(t=>{const qty=t.remaining_lots??t.lot_count,unit=t.executed_price+t.commission/t.lot_count,price=t.current_price||t.executed_price;const q={price,quote_time:t.quote_time,source:'YAHOO_INDICATIVE'};return {...t,remaining_lots:qty,current_price:price,quote_fresh:usableQuote(q,now),unrealised_net:price*qty*.998*.998-unit*qty,unrealised_pct:100*(price*.998*.998/unit-1),elapsed_minutes:Math.max(0,(now-Date.parse(t.entry_time))/60000),runner_active: t.strategy==='SCALP'&&!!t.tp1_done,remaining_minutes:Math.max(0,((t.strategy==='SCALP'&&t.tp1_done?Date.parse(trtDate(Date.parse(t.entry_time))+'T14:40:00.000Z'):Date.parse(t.entry_time)+3600000)-now)/60000),thresholds:strategyThresholds(t)};});
  const histories=[...(legs.results||[]),...(old.results||[]).map(t=>({...t,event_key:'legacy:'+t.id,observed_at:t.exit_time}))].sort((a,b)=>String(b.observed_at).localeCompare(String(a.observed_at)));
  const realised=await db.prepare("SELECT (SELECT COALESCE(SUM(pnl_net),0) FROM strategy_exit_legs)+(SELECT COALESCE(SUM(pnl_net),0) FROM virtual_trades WHERE status='CLOSED' AND engine_version=1) pnl").first();
  return {...status,total_capital:5000,equity:(accounts.SCALP||0)+(accounts.SWING||0)+trades.reduce((n,t)=>n+t.current_price*t.remaining_lots*.998*.998,0),equity_basis:'LAST_AVAILABLE_QUOTE_NET_LIQUIDATION_ESTIMATE',realised_pnl:realised?.pnl||0,scalp_cash:accounts.SCALP||0,swing_cash:accounts.SWING||0,open_trades:trades,exit_history:histories,closed_trades:histories,scalp_sniper_queue:scalp.results||[],trend_radar_queue:trend.results||[],scalp_slots:trades.filter(t=>t.strategy==='SCALP').length,trend_slots:trades.filter(t=>t.strategy==='SWING').length,engine_version:2};

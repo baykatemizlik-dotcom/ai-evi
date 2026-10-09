@@ -34,7 +34,7 @@ Miktar tam lota aşağı yuvarlanır. Trend minimum 2 lot ister. TP1, başlangı
 
 `scalp_sniper_queue` süresi ilk onaydan itibaren 15 dakikadır. Tekrar istekleri süreyi uzatmaz. Kırılım/VWAP kaybedilirse aday iptal olur. Slot boşalınca hazır adaylar puan sırasıyla değerlendirilir.
 
-Net +%3 TP / net −%1,5 SL maliyet, giriş/çıkış komisyonu ve kaymayı içerir. Bar içinde hem stop hem TP varsa stop önceliklidir. Girişten önce oluşmuş aynı barın high/low'u kullanılmaz. 60 dakika sonrasındaki bir TP, geçmiş TIME_EXIT'in yerini alamaz. 17:40 giriş kapanır; açık Scalp en son taze sağlayıcı fiyatıyla nakde çevrilir. Veri yoksa satış fiyatı uydurulmaz; yeni fiyat geldiğinde tekrar denenir.
+Scalp Runner: Net +%3 TP1’de lotların floor(%70)’i satılır; kalan lotlarda net maliyet stopu ve 17:40 çıkışı uygulanır. Net −%1,5 ilk SL bütün lotları kapatır. 60 dakika TIME_EXIT yalnız TP1 öncesinde geçerlidir. Ayrıntılar `SCALP_RUNNER.md` içindedir. Net eşikler maliyet, giriş/çıkış komisyonu ve kaymayı içerir. Bar içinde hem stop hem TP varsa stop önceliklidir. Girişten önce oluşmuş aynı barın high/low'u kullanılmaz. 60 dakika sonrasındaki bir TP, geçmiş TIME_EXIT'in yerini alamaz. 17:40 giriş kapanır; açık Scalp en son taze sağlayıcı fiyatıyla nakde çevrilir. Veri yoksa satış fiyatı uydurulmaz; yeni fiyat geldiğinde tekrar denenir.
 
 ## TREND
 
@@ -64,7 +64,7 @@ Yeni AL sinyali slot dolu olsa da bildirilir. Her sanal alım, TP1 ve nihai sat�
 
 1. Mevcut D1 yedeğini al; kaynak HEAD'i ve açık pozisyonları kaydet. Aktif besleme işlerini geçiş süresince duraklat.
 2. Migration 0017'yi **yalnız bir kez**, 0016 sonrası uygula. ALTER COLUMN adımları yeniden çalıştırılmaz. Mevcut açık pozisyonlar V2'ye taşınır; miktar/fiyat/nakit korunur. Eski, uzun ömürlü adaylar yeni 15 dakikalık kuyruklara taşınmaz; taze onay beklenir. Eski açık SWING varsa başlangıç stopu geçişte girişin %98'i olarak korunur; böyle bir işlem ayrıca kontrol edilmelidir.
-3. `python3 build_worker.py`; mevcut bindings / cron / VAPID / ACCESS_TOKEN / OPENAI / GEMINI secrets korunarak `worker/index.js` dağıt.
+3. Runner migration 0018’i 0017 ardından bir kez uygula. `python3 build_worker.py`; mevcut bindings / cron / VAPID / ACCESS_TOKEN / OPENAI / GEMINI secrets korunarak `worker/index.js` dağıt.
 4. Beslemeyi V2 Python dosyalarıyla yeniden aç; Trend workflow'unu etkinleştir. API `/bist/overview` engine_version=2, kasalar ve açık miktarların değişmediğini doğrula. Bildirim/test ve manuel kapatmayı sanal ortamda kontrol et.
 5. Eski Worker sürümüne tek başına geri dönme: trigger/kolon mimarisi birlikte değişir. Gerçek satış sonrası eski DB yedeğini geri yüklemek işlemleri kaybettirebilir; ilerleyen düzeltme migration'ı tercih et.
 

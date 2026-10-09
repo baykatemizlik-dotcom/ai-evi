@@ -10,6 +10,7 @@ class Migration(unittest.TestCase):
    db.execute("UPDATE paper_cash_accounts SET available_cash=1197.112284896877 WHERE strategy='SCALP'")
    before=db.execute('SELECT strategy,available_cash FROM paper_cash_accounts ORDER BY strategy').fetchall()
    db.executescript((root/'migrations/0017_strategy_isolation.sql').read_text())
+   db.executescript((root/'migrations/0018_scalp_runner.sql').read_text())
    self.assertEqual(before,db.execute('SELECT strategy,available_cash FROM paper_cash_accounts ORDER BY strategy').fetchall())
    self.assertEqual(db.execute("SELECT status,lot_count,remaining_lots,engine_version FROM virtual_trades WHERE symbol='RTALB'").fetchone(),('OPEN',486,486,2))
    with self.assertRaisesRegex(sqlite3.IntegrityError,'INVALID_FINAL_ACCOUNTING'):
