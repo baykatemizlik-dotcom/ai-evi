@@ -34,33 +34,6 @@ const settleScalpPaperExit=async(db,trade,marketPrice,marketTimestamp)=>{
 };
 
 
-// Deterministic paper-only execution. Real broker orders are never sent.
-// Requires independently verified price and official disclosure gates.
-const paperExecution=async(env,signal)=>{
- const {symbol,price,barTime,verified,kapVerified}=signal||{};
- if(!verified||!kapVerified||!/^[A-Z][A-Z0-9]{2,6}$/.test(symbol||"")||!(price>0)||!Number.isFinite(Date.parse(barTime)))return {ok:false,reason:"UNVERIFIED_INPUT"};
- if(Date.now()-Date.parse(barTime)>22*60000||Date.parse(barTime)>Date.now())return {ok:false,reason:"STALE_BAR"};
- const active=await env.DB.prepare("SELECT COUNT(*) n FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN' AND symbol=?").bind(symbol).first();
- if(active.n)return {ok:false,reason:"ALREADY_OPEN"};
- const slots=await env.DB.prepare("SELECT slot_id FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN'").all();
- const used=new Set(slots.results.map(x=>x.slot_id)),slot=[1,2].find(x=>!used.has(x));
- if(!slot)return {ok:false,reason:"SLOTS_FULL"};
- const cash=await env.DB.prepare("SELECT available_cash FROM paper_cash_accounts WHERE strategy='SCALP'").first();
- const budget=Math.min(1250,Number(cash?.available_cash||0));
- const plan=paperLotPlan(budget,price);
- if(!plan.lots)return {ok:false,reason:"INSUFFICIENT_CASH"};
- const entryFee=plan.lots*plan.executedPrice*0.002;
- const cost=plan.lots*plan.executedPrice+entryFee;
- if(cost>budget+1e-6)return {ok:false,reason:"OVER_BUDGET"};
- const ts=new Date().toISOString();
- // Conditional debit and trade insert in one D1 transaction. Abort if cash unavailable.
- const batch=await env.DB.batch([
-  env.DB.prepare("UPDATE paper_cash_accounts SET available_cash=available_cash-?,updated_at=? WHERE strategy='SCALP' AND available_cash>=?").bind(cost,ts,cost),
-  env.DB.prepare("INSERT INTO virtual_trades(strategy,symbol,signal_price,executed_price,lot_count,commission,entry_time,status,slot_id) SELECT 'SCALP',?,?,?,?,?,?,'OPEN',? WHERE EXISTS(SELECT 1 FROM paper_cash_accounts WHERE strategy='SCALP' AND updated_at=? AND available_cash>=0) AND NOT EXISTS(SELECT 1 FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN' AND (symbol=? OR slot_id=?))").bind(symbol,price,plan.executedPrice,plan.lots,entryFee,ts,slot,ts,symbol,slot)
- ]);
- if(batch[0]?.meta?.changes!==1||batch[1]?.meta?.changes!==1)throw Error("PAPER_TRANSACTION_RECONCILIATION_FAILED");
- return {ok:true,symbol,slot,quantity:plan.lots,spent:cost};
-};
 const yahooOHLCV=async(symbol,interval="15m")=>{
  if(!/^[A-Z0-9]{3,7}$/.test(symbol))throw Error("invalid_symbol");
  const period=interval==="1d"?"6mo":"1mo";
