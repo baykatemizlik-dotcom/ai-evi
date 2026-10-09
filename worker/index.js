@@ -10,20 +10,16 @@ const paperLotPlan=(budget,marketPrice,{slippage=0.002,commission=0.002}={})=>{
  return {lots,executedPrice,estimatedEntryCost:lots*executedPrice*(1+commission),firstTakeProfitLots,remainingLots:lots-firstTakeProfitLots,partialExitPossible:firstTakeProfitLots>0,priceCap:null};
 };
 // Internal paper-only SCALP exit rule. Call only after verified, fresh market pricing.
-const scalpExitDecision=(trade,verifiedMarketPrice)=>{
- const entry=Number(trade?.executed_price),qty=Number(trade?.lot_count),fee=Number(trade?.commission||0),market=Number(verifiedMarketPrice);
- if(!Number.isFinite(entry)||entry<=0||!Number.isInteger(qty)||qty<=0||!Number.isFinite(fee)||fee<0||!Number.isFinite(market)||market<=0)return null;
- const invested=entry*qty+fee;
- const sell=market*0.998;
- const netProceeds=sell*qty*(1-0.002);
- const netReturn=(netProceeds-invested)/invested;
- if(netReturn>=0.03)return "TP_NET_3PCT";
- if(netReturn<=-0.015)return "STOP_NET_1P5PCT";
+const scalpExitDecision=(entryPrice,verifiedMarketPrice)=>{
+ const entry=Number(entryPrice),price=Number(verifiedMarketPrice);
+ if(!Number.isFinite(entry)||entry<=0||!Number.isFinite(price)||price<=0)return null;
+ if(price>=entry*1.03)return "TP_FULL_3PCT";
+ if(price<=entry*0.985)return "STOP_FULL_1P5PCT";
  return null;
 };
 const settleScalpPaperExit=async(db,trade,marketPrice,marketTimestamp)=>{
  if(!db||trade?.strategy!=="SCALP"||trade.status!=="OPEN"||!marketTimestamp||!Number.isFinite(Date.parse(marketTimestamp)))throw Error("Verified SCALP trade and timestamp required");
- const reason=scalpExitDecision(trade,marketPrice);
+ const reason=scalpExitDecision(trade.executed_price,marketPrice);
  if(!reason)return {closed:false};
  const sell=Number(marketPrice)*0.998,qty=Number(trade.lot_count),commission=sell*qty*0.002;
  if(!Number.isInteger(qty)||qty<=0)throw Error("Invalid lots");
