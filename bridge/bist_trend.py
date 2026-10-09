@@ -24,7 +24,7 @@ def trend_history(symbol,interval,now):
     for i,t in enumerate(x.get('timestamp') or []):
         values=[(quotes.get(k) or [])[i] if i<len(quotes.get(k) or []) else None for k in ('open','high','low','close','volume')]
         if not isinstance(t,(int,float)) or isinstance(t,bool) or not math.isfinite(t) or t>confirmed:continue
-        if interval=='60m' and (t%3600 or t+3600>confirmed):continue
+        if interval=='60m' and (t%3600 not in (0,1800) or t+3600>confirmed):continue
         if interval=='1d' and dt.datetime.fromtimestamp(t,ZoneInfo('Europe/Istanbul')).date()>=today:continue
         if any(not isinstance(v,(int,float)) or isinstance(v,bool) or not math.isfinite(v) for v in values):continue
         o,h,l,c,v=values

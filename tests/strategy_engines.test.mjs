@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {mkdtempSync,rmSync,readFileSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';import {execFileSync} from 'node:child_process';import {Script} from 'node:vm';
-import {enqueueScalp,fillStrategy,sellLeg,manageTrend,tickStrategies,usableQuote,saveQuote,scalpExit,strategyThresholds,strategyEntryWindow,isolatedOverview,manualStrategyClose,trendSignal,trendIngest,validateTrendBars} from '../worker/strategy_engines.mjs';
+import {enqueueScalp,fillStrategy,sellLeg,manageTrend,tickStrategies,usableQuote,saveQuote,scalpExit,strategyThresholds,strategyEntryWindow,isolatedOverview,manualStrategyClose,trendSignal,trendIngest,validateTrendBars,trendUniverse} from '../worker/strategy_engines.mjs';
 import {ingest,riskIngest,geminiDecision,finalize} from '../worker/cloud_bridge.mjs';
 const now=Date.parse('2026-10-09T12:00:00.000Z'),iso=t=>new Date(t).toISOString();const req=b=>new Request('https://example.test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
 function database(){const dir=mkdtempSync(join(tmpdir(),'isolated-')),path=join(dir,'db.sqlite'),adapter=new URL('./funnel_sqlite.py',import.meta.url).pathname;const call=x=>JSON.parse(execFileSync('python3',[adapter,path],{input:JSON.stringify(x),encoding:'utf8'}));call({init:true});const db={prepare(sql){return {sql,params:[],bind(...p){this.params=p;return this;},async all(){return call({statements:[this]})[0];},async first(){return (await this.all()).results[0]||null;},async run(){return this.all();}};},async batch(s){return call({statements:s});}};return {db,clean:()=>rmSync(dir,{recursive:true,force:true})};}
@@ -33,7 +33,7 @@ test('TP1 sells floor-half once, credits only Trend cash; remaining basis, fees,
  assert.equal(await sellLeg(db,partial,6,threshold.breakeven,'TREND_TRAILING',iso(now+60000),now+60000),true);partial=await db.prepare('SELECT * FROM virtual_trades WHERE id=?').bind(t.id).first();assert.equal(partial.status,'CLOSED');assert.ok(Math.abs(partial.pnl_net-leg.pnl_net)<1e-8);const cash=(await db.prepare("SELECT available_cash FROM paper_cash_accounts WHERE strategy='SWING'").first()).available_cash;assert.ok(Math.abs(cash-2500-partial.pnl_net)<1e-8);assert.deepEqual(await db.prepare("SELECT available_cash FROM paper_cash_accounts WHERE strategy='SCALP'").first(),scalpBefore);const overview=await isolatedOverview(db,now+60000);assert.equal(overview.realised_pnl,partial.pnl_net);assert.equal(overview.trend_slots,0);assert.equal(overview.exit_history.length,2);
  }finally{clean();}});
 test('Scalp 15 minute expiry is fixed, stale quotes cannot fill, 17:40 closes Scalp but Trend remains overnight',async()=>{const {db,clean}=database();try{
- await scalpQueue(db,'TUPRS');await quote(db,'TUPRS',100,now-900001);assert.equal((await fillStrategy(db,'SCALP',now)).opened,0);await quote(db,'TUPRS',100);assert.equal((await fillStrategy(db,'SCALP',now+900000)).opened,0);assert.equal((await db.prepare('SELECT status FROM scalp_sniper_queue').first()).status,'EXPIRED');
+ await scalpQueue(db,'TUPRS');await quote(db,'TUPRS',100,now-1200001);assert.equal((await fillStrategy(db,'SCALP',now)).opened,0);await quote(db,'TUPRS',100);assert.equal((await fillStrategy(db,'SCALP',now+900000)).opened,0);assert.equal((await db.prepare('SELECT status FROM scalp_sniper_queue').first()).status,'EXPIRED');
  const eod=Date.parse('2026-10-09T14:40:00Z'),t=await trendFixture(db);await quote(db,t.symbol,111,eod);await scalpQueue(db,'REEDR',1,eod-5*60000);await quote(db,'REEDR',100,eod-5*60000);await fillStrategy(db,'SCALP',eod-5*60000);await quote(db,'REEDR',100,eod);await tickStrategies(db,eod);assert.equal((await db.prepare("SELECT status,exit_reason FROM virtual_trades WHERE strategy='SCALP'").first()).exit_reason,'SCALP_EOD_1740');assert.equal((await db.prepare("SELECT status FROM virtual_trades WHERE strategy='SWING'").first()).status,'OPEN');assert.equal(strategyEntryWindow('SCALP',eod),false);assert.equal(strategyEntryWindow('SWING',eod),true);
  }finally{clean();}});
 test('scalp deadline precedes later TP; same candle ambiguity stops first; pre-entry high/low is ignored',()=>{const t={strategy:'SCALP',executed_price:100,lot_count:10,remaining_lots:10,commission:2,entry_time:iso(now)},b=(i,high=100.5,low=100)=>({bar_time:iso(now+i*900000),open:100,high,low,close:100.2});assert.equal(scalpExit(t,[b(0),b(1),b(2),b(3),b(4,120)],null,now+70*60000).reason,'TIME_EXIT');assert.equal(scalpExit(t,[b(0,120,90)],null,now+900000).reason,'SL_NET_1_5');assert.equal(scalpExit({...t,entry_time:iso(now+60000)},[b(0,120,90)],null,now+900000),null);});
@@ -80,3 +80,16 @@ test('Scalp Runner EOD accounting sells remaining lots; initial stop still exits
  await assert.rejects(sellLeg(db,t,Math.floor(t.lot_count/2),level.tp,'SCALP_TP1',iso(now),now,iso(now)),/INVALID_SCALP_TP1/);
  await quote(db,t.symbol,level.tp,now+60000);await tickStrategies(db,now+60000);const eod=Date.parse('2026-10-09T14:40:00Z');await quote(db,t.symbol,110,eod);assert.equal((await tickStrategies(db,eod)).scalp.closed,1);t=await db.prepare('SELECT * FROM virtual_trades WHERE id=?').bind(t.id).first();assert.equal(t.exit_reason,'SCALP_RUNNER_EOD');assert.equal(t.remaining_lots,0);assert.equal((await db.prepare('SELECT SUM(qty) qty FROM strategy_exit_legs').first()).qty,t.lot_count);
  }finally{clean();}});
+
+
+test('Yahoo 15 minute feed delay plus transport tolerance accepts two Scalp slots; stale or future prices blocked',async()=>{const {db,clean}=database();try{
+ for(const symbol of ['TUPRS','CELHA']){await scalpQueue(db,symbol);await quote(db,symbol,100,now-16*60000);}
+ assert.equal((await fillStrategy(db,'SCALP',now)).opened,2);
+ assert.equal(usableQuote({source:'YAHOO_INDICATIVE',price:100,quote_time:iso(now-20*60000-1)},now),false);
+ assert.equal(usableQuote({source:'YAHOO_INDICATIVE',price:100,quote_time:iso(now+1)},now),false);
+ const symbols=await (await trendUniverse(db,now)).json();assert.ok(symbols.symbols.includes('TUPRS'));assert.ok(symbols.symbols.includes('CELHA'));assert.ok(symbols.priority.includes('ASTOR'));
+ }finally{clean();}});
+test('provider 60m bars retain half-hour start; irregular live timestamps rejected',()=>{
+ const b={time:iso(now-5400000),open:100,high:101,low:99,close:100,volume:1000};assert.equal(validateTrendBars('ASTOR','60m',[b],now)[0].time,b.time);
+ assert.throws(()=>validateTrendBars('ASTOR','60m',[{...b,time:iso(now-5400000+1000)}],now),/INVALID_TREND_BAR/);
+});

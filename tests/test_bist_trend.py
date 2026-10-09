@@ -32,3 +32,10 @@ class TrendFeed(unittest.TestCase):
   self.assertEqual(data['quote']['price'],101.5)
   self.assertEqual(dt.datetime.fromisoformat(data['quote']['quote_time'].replace('Z','+00:00')).timestamp(),now-900)
   self.assertEqual(data['bars'][-1]['close'],100)
+
+ def test_yahoo_hourly_half_hour_start_retains_provider_clock(self):
+  now=int(dt.datetime(2026,10,9,13,tzinfo=dt.timezone.utc).timestamp());packet=self.packet('60m',now)
+  packet['chart']['result'][0]['timestamp']=[t-1800 for t in packet['chart']['result'][0]['timestamp']]
+  with patch.object(feed,'request_json',return_value=packet):bars=trend.trend_history('ASTOR','60m',now)
+  self.assertGreaterEqual(len(bars),200)
+  self.assertTrue(all(dt.datetime.fromisoformat(b['time'].replace('Z','+00:00')).minute==30 for b in bars))

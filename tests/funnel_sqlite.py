@@ -7,8 +7,8 @@ if data.get('init'):
  CREATE TABLE paper_cash_accounts(strategy TEXT PRIMARY KEY,initial_cash REAL,available_cash REAL,updated_at TEXT);
  CREATE TABLE bist_bridge_bars(symbol TEXT,interval TEXT,bar_time TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,source TEXT,received_at TEXT,PRIMARY KEY(symbol,interval,bar_time));''')
  root=pathlib.Path(__file__).resolve().parents[1]
- for file in ['0010_cloud_bridge.sql','0011_dynamic_funnel.sql','0012_ai_referee.sql','0013_sniper.sql','0014_external_audit.sql','0015_gemini_and_exit_audit.sql','0016_web_push.sql','0017_strategy_isolation.sql','0018_scalp_runner.sql']:
-  if file in ('0017_strategy_isolation.sql','0018_scalp_runner.sql') and data.get('pre_isolation'):continue
+ for file in ['0010_cloud_bridge.sql','0011_dynamic_funnel.sql','0012_ai_referee.sql','0013_sniper.sql','0014_external_audit.sql','0015_gemini_and_exit_audit.sql','0016_web_push.sql','0017_strategy_isolation.sql','0018_scalp_runner.sql','0019_quote_delay_tolerance.sql']:
+  if file in ('0017_strategy_isolation.sql','0018_scalp_runner.sql','0019_quote_delay_tolerance.sql') and data.get('pre_isolation'):continue
   db.executescript((root/'migrations'/file).read_text())
  db.execute("INSERT OR IGNORE INTO paper_cash_accounts VALUES('SWING',2500,2500,'2026-10-09T00:00:00Z')");db.commit();print('{}');sys.exit()
 db.row_factory=sqlite3.Row

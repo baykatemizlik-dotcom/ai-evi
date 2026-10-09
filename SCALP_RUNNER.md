@@ -31,3 +31,8 @@ Emir Kurulum Kartı kullanıcı isteğine göre brüt `executed_price * .985`, `
 
 ## Yayına alma
 Önce 0017 (henüz uygulanmadıysa), ardından 0018 D1 migrasyonları uygulanmalı; sonrasında bu dalın üretilmiş Worker'ı yayınlanmalıdır. Migrasyon/Worker birlikte planlanmalıdır: eski Worker yeni Scalp TP1 davranışını çalıştırmaz. Canlı işlemlere veya gerçek aracı kurum hesabına bağlantı yoktur.
+
+
+## Canlı besleme düzeltmesi
+Yahoo fiyatı 15 dakika gecikmeli olduğundan, sanal icrada sağlayıcı zamanı değiştirilmeden en fazla 20 dakika fiyat yaşı kabul edilir (15 dakika veri gecikmesi + 5 dakika aktarım toleransı). Daha eski/gelecek/tarih dışı fiyatlar reddedilir. Scalp kuyruğu hâlâ onaydan itibaren 15 dakika geçerlidir. Migration 0019 aynı sınırı D1 giriş korumasına uygular. Panel fiyatı gecikmeli gösterge olarak etiketler.
+Yahoo BIST 60m barlarının :30 başlangıcı korunur; :00 varsayımıyla bütün barlar düşürülmez. Trend evreni eski boş bist_universe tablosunun yanında güncel, uygun bist_funnel_risk sembollerinden de okunur.
