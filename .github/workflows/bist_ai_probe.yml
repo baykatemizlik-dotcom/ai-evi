@@ -69,3 +69,20 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
               summary.write("Gemini strict JSON probe passed: " + selected + ". No orders or D1 writes.\n")
           PY
+
+      - name: Verify Web Push encryption and outbox
+        run: |
+          node --test tests/push.test.mjs
+          python3 -m unittest discover -s tests -p 'test_push_outbox.py'
+      - name: Verify deployed push configuration without sending to a device
+        env:
+          BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
+          BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
+        run: |
+          PYTHONPATH=bridge python3 - <<'PY'
+          from bist_sync import worker_call
+          state = worker_call('/push/status')
+          print('LIVE_PUSH_STATUS', state)
+          if state.get('configured') is not True:
+              raise SystemExit('PUSH_NOT_CONFIGURED')
+          PY
