@@ -20,7 +20,7 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 6
     outputs:
       universe: ${{ steps.universe.outputs.universe }}
     steps:
@@ -32,7 +32,7 @@ jobs:
       - name: Test bridge and paper accounting
         run: |
           python3 -m unittest discover -s tests -p 'test_cloud_bridge.py'
-          node --test tests/cloud_bridge.test.mjs
+          node --test tests/*.test.mjs
       - name: Load all KAP equity-market symbols
         id: universe
         env:

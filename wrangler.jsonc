@@ -4,7 +4,7 @@
   "compatibility_date": "2026-10-08",
   "workers_dev": true,
   "vars": {
-    "OPENAI_MODEL": "gpt-5.4",
+    "OPENAI_MODEL": "gpt-4o-mini",
     "GEMINI_MODEL": "gemini-3.8-flash",
     "ALLOWED_ORIGIN": "https://baykatemizlik-dotcom.github.io"
   },
@@ -14,5 +14,10 @@
       "database_name": "ai-evi-v05-test",
       "database_id": "08339ed0-2dfc-49d1-a4a4-52552ae25966"
     }
-  ]
+  ],
+  "triggers": {
+    "crons": [
+      "* 6-16 * * 1-5"
+    ]
+  }
 }

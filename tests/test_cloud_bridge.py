@@ -126,4 +126,17 @@ class Accounting(unittest.TestCase):
         self.assertEqual(self.cash(),100)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM virtual_trades').fetchone()[0],0)
 
+class ExternalReview(unittest.TestCase):
+    def test_schema_rejects_invalid_review(self):
+        import bist_review
+        valid={'summary':'Denetim tamamlandı','issues':[],'calibration':['Ölçüm gerekli']}
+        self.assertEqual(bist_review.validate_review(valid),valid)
+        with self.assertRaises(bist_review.FeedError):bist_review.validate_review({**valid,'issues':[123]})
+    def test_missing_external_key_records_status_without_google_call(self):
+        import bist_review
+        with patch.dict('os.environ',{'GEMINI_API_KEY':''}),patch.object(bist_review,'worker_call',return_value={}) as worker,patch.object(bist_review,'request_json') as google:
+            self.assertEqual(bist_review.main(),0)
+            google.assert_not_called()
+            self.assertEqual(worker.call_args.args[1]['status'],'MISSING_KEY')
+
 if __name__=='__main__':unittest.main()

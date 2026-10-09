@@ -9,7 +9,9 @@ The existing mobile dashboard and ACCESS_TOKEN sessions remain available.
 1. Apply `migrations/0010_cloud_bridge.sql` **once** to the existing D1 database.
    It preserves existing cash/trades and adds the idempotent, atomic paper triggers.
    Apply additive `migrations/0011_dynamic_funnel.sql` for risk, candidate and scan-report tables,
-   then `migrations/0012_ai_referee.sql` for the idempotent AI decision cache.
+   then `migrations/0012_ai_referee.sql` for the idempotent AI decision cache,
+   `0013_sniper.sql` for Sniper state/atomic two-engine triggers and
+   `0014_external_audit.sql` for external Gemini reports. Apply each migration once.
 2. Deploy `worker/index.js` (self-contained). `worker/cloud_bridge.mjs` is its tested
    source module; it does not need a separate upload when using the dashboard editor.
 3. GitHub repository Settings → Secrets and variables → Actions:
@@ -67,7 +69,7 @@ patterns can prove absence of manipulation or wash trading.
 3. After the shard jobs finish, finalize ranks fresh momentum candidates globally
    and sends the **entire eligible momentum pool** to GPT-4o-mini, without a
    candidate-count cap. Five concurrent calls throttle transport only. Only
-   strict-schema `{"onay":true,"neden":"..."}` approvals create pending paper signals;
+   strict-schema `{"onay":true,"neden":"...","guven":85}` approvals create pending paper signals;
    it never fabricates trades merely to fill the two slots.
 
 Previously imported off-grid rows are preserved for audit and excluded from
@@ -90,11 +92,11 @@ previously imported Yahoo candles prevent duplicate debits/credits on retries.
 ## Verification
 
 `python3 -m unittest discover -s tests -p test_cloud_bridge.py`
-`node --test tests/cloud_bridge.test.mjs`
+`node --test tests/*.test.mjs`
 
 Tests use synthetic bars in isolated temporary databases, never production data.
 
-Current automated suite: 13 Python and 15 Node tests, including full isolated
+Current automated suite: 15 Python and 20 Node tests, including full isolated
 risk → hot ingest → selection → future entry → stop → idempotent retry flow.
 
 ## AI referee
@@ -113,3 +115,61 @@ timeout. API usage tokens and the approval/rejection reason are stored in
 `bist_ai_decisions`. Authenticated GET `/bist/ai/decisions` shows recent decisions.
 `/bist/connections` reports CONFIGURED before the first real decision; CONNECTED
 requires a successful actual model reply, never just a present secret.
+
+## Sniper / standby / session close
+
+The existing SWING cash account is used as the separate Sniper account; its
+balance is preserved. One Sniper slot uses the available account cash in whole
+lots (fees/slippage included). The two SCALP slots remain separate. D1 triggers
+prevent duplicate symbols across both engines, a second Sniper slot, overspending
+and duplicate credits. Only mini-approved candidates join the ranked standby
+queue; the entire dynamic pool is retained without forcing 2–5 names. New
+approvals supersede an older standby signal for the same symbol.
+
+Standby is monitored even when a symbol is no longer hot. Each newly closed
+candle must satisfy the same RVOL>=2/green/body>=0.6/wick<=0.2 filters and session
+VWAP; otherwise that standby is invalidated. Stronger fresh candidates move up.
+Panel Adaylar shows all READY standby names in score order, confidence, freshness,
+last check reason and candle time. Stale candidates are labelled and cannot fill
+at an entry time where their prior health state was stale. The best eligible
+standby waits for an open AFTER approval/health observation and any prior Sniper
+exit observation; replacement never backdates a fill to a price before the
+previous slot release was actually known. Cash reuse is atomic.
+
+Sniper base stop is net -2%. Net +2.5% excursion arms a cost-covering stop.
+Trailing uses the previously observed peak minus 2%, never lowering the stop.
+No new peak for 60 minutes closes at the next observed closed-bar close. An
+adverse gap executes at the worse open. With OHLCV, intrabar order is unknown:
+a newly observed high changes the stop for the NEXT candle, not the earlier low
+of that same candle. Breakeven is a simulated cost threshold, not a guarantee
+against price gaps or stale data.
+
+Worker minute cron `* 6-16 * * 1-5` checks the 17:55 TRT lock independently
+of the Actions 15m feed. From 17:55 it blocks entries, expires standby/pending
+signals and closes feed-owned paper positions using the last stored CLOSED
+candle. Exit reason `SESSION_1755_INDICATIVE_LAST_CLOSED_BAR` explicitly identifies
+the indicative/stale price; Sniper state records the quote timestamp. This is
+NOT a verified executable 17:55 quote. Scheduled invocations can be delayed,
+so this cannot promise exact real-world liquidation time. Production records
+and balances are never reset.
+
+Mini output confidence is a model score, not a calibrated win probability.
+The network call uses a bound global fetch wrapper; new failure codes distinguish
+fetch, body reading, parsing, timeout and HTTP errors without exposing API keys.
+Old generic network-error decisions are eligible for one retry after this fix;
+approved/rejected decisions stay cached.
+
+## External Gemini audit
+
+`.github/workflows/bist_review.yml` runs at 18:20 TRT on weekdays or manually.
+Python `bridge/bist_review.py` reads the authenticated D1 daily report and the
+checked-out code, calls Gemini OUTSIDE the Worker, then posts its structured
+summary/issues/calibration to D1. It cannot alter trades or source code.
+GitHub Actions secret `GEMINI_API_KEY` is required for the actual Google request;
+the existing Cloudflare secret is NOT copied automatically. Without the GitHub
+key, it records MISSING_KEY while the paper engines continue working.
+Optional variable GEMINI_MODEL defaults to gemini-3.8-flash. No search tools.
+
+The Demo panel's Karneyi kopyala button copies current trades, AI token usage,
+account cash, standby counts and the latest external audit for sharing with
+Gemini manually. End-of-session reports are also persisted automatically in D1.

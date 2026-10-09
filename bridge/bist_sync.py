@@ -30,12 +30,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 OPENER = urllib.request.build_opener(NoRedirect)
 
-def request_json(url, payload=None, headers=None, timeout=20):
+def request_json(url, payload=None, headers=None, timeout=20, attempts=3):
     req = urllib.request.Request(url, data=None if payload is None else
         json.dumps(payload, separators=(',', ':'), allow_nan=False).encode(),
         headers={'User-Agent': 'BIST-Cloud-Bridge/1.0', 'Accept': 'application/json',
                  **(headers or {})}, method='GET' if payload is None else 'POST')
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
             with OPENER.open(req, timeout=timeout) as response:
                 raw = response.read(MAX_BYTES + 1)
@@ -45,10 +45,10 @@ def request_json(url, payload=None, headers=None, timeout=20):
         except urllib.error.HTTPError as exc:
             code = exc.code
             exc.close()
-            if code not in (429, 500, 502, 503, 504) or attempt == 2:
+            if code not in (429, 500, 502, 503, 504) or attempt == attempts-1:
                 raise FeedError(f'HTTP_{code}') from None
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, http.client.HTTPException):
-            if attempt == 2:
+            if attempt == attempts-1:
                 raise FeedError('NETWORK_OR_BAD_JSON') from None
         time.sleep(5 * (attempt + 1))
     raise FeedError('RETRIES_EXHAUSTED')
@@ -156,6 +156,7 @@ def main():
             raise FeedError('GITHUB_OUTPUT_REQUIRED')
         with open(output, 'a') as stream:
             stream.write('universe=' + json.dumps(universe, separators=(',', ':')) + '\n')
+        print('MINI_PROBE',worker_call('/bist/feed/probe',{}))
         print('UNIVERSE symbols=',len(universe['symbols']),'eligible=',len(universe['eligible_symbols']),'risk=',universe['risk_status'])
         return 0
     run_id=os.environ.get('BIST_RUN_ID') or dt.datetime.now(UTC).strftime('%Y%m%dT%H%M')
