@@ -70,14 +70,14 @@ jobs:
     needs: [prepare, sync]
     if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
       - name: Install numeric filters
         run: python3 -m pip install --disable-pip-version-check -r bridge/requirements.txt
-      - name: Rank momentum candidates and create up to four pending signals
+      - name: Review the entire momentum pool with GPT-4o-mini
         env:
           BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
           BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}

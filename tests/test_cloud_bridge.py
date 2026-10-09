@@ -64,6 +64,13 @@ class Universe(unittest.TestCase):
         result=parse_markets(html)
         self.assertEqual(set(result),set(symbols))
         self.assertNotIn('BOND',result)
+    def test_truncated_kap_response_uses_verified_snapshot(self):
+        import bist_universe
+        import http.client
+        with patch.object(bist_universe,'fetch_bytes',side_effect=http.client.IncompleteRead(b'partial')):
+            universe=bist_universe.load_universe()
+            self.assertTrue(universe['cached'])
+            self.assertEqual(len(universe['symbols']),631)
     def test_all_eight_partitions_cover_universe_once(self):
         from bist_universe import partition
         symbols=[f'T{i:04d}' for i in range(631)]

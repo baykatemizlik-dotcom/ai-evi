@@ -6,7 +6,7 @@ if data.get('init'):
  CREATE TABLE paper_cash_accounts(strategy TEXT PRIMARY KEY,initial_cash REAL,available_cash REAL,updated_at TEXT);
  CREATE TABLE bist_bridge_bars(symbol TEXT,interval TEXT,bar_time TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,source TEXT,received_at TEXT,PRIMARY KEY(symbol,interval,bar_time));''')
  root=pathlib.Path(__file__).resolve().parents[1]
- for file in ['0010_cloud_bridge.sql','0011_dynamic_funnel.sql']:db.executescript((root/'migrations'/file).read_text())
+ for file in ['0010_cloud_bridge.sql','0011_dynamic_funnel.sql','0012_ai_referee.sql']:db.executescript((root/'migrations'/file).read_text())
  print('{}');sys.exit()
 db.row_factory=sqlite3.Row
 results=[]

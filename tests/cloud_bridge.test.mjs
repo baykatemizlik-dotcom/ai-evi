@@ -40,7 +40,7 @@ test('stream body limit prevents DB write',async()=>{
  const response=await ingest(new Request('https://example.test/bist/feed/ingest',{method:'POST',headers:{'Content-Type':'application/json'},body:'x'.repeat(100001)}),{DB:{}},now);
  assert.equal(response.status,413);
 });
-test('server runtime has no outbound fetch and compiled module matches tested source',()=>{
+test('server has only the OpenAI referee egress and compiled module matches tested source',()=>{
  const worker=readFileSync(new URL('../worker/index.js',import.meta.url),'utf8');
  const module=readFileSync(new URL('../worker/cloud_bridge.mjs',import.meta.url),'utf8').replace(/^export /gm,'');
  assert.ok(worker.startsWith(module));
@@ -99,7 +99,7 @@ test('full funnel: hot ingest → global selection → future eligible entry →
  const call=data=>JSON.parse(execFileSync('python3',[adapter,path],{input:JSON.stringify(data),encoding:'utf8'}));
  call({init:true});
  const db={prepare(sql){return {sql,params:[],bind(...p){this.params=p;return this;},async all(){return call({statements:[this]})[0];},async first(){return (await this.all()).results[0]||null;},async run(){return await this.all();}};},async batch(statements){return call({statements});}};
- const env={DB:db};const req=body=>new Request('https://example.test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+ const env={DB:db,OPENAI_API_KEY:'unit-test-only'};const mockAI=async()=>new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify({onay:true,neden:'Teknik koşullar ve resmi tedbir durumu uygun.'})}}],usage:{prompt_tokens:100,completion_tokens:20}}));const req=body=>new Request('https://example.test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
  try{
   const risk={source:'https://www.borsaistanbul.com/erd/menkul_tedbir_listesi.csv',as_of:'2026-10-09T07:00:00Z',valid_until:'2026-10-09T21:00:00Z'};
   assert.equal((await riskIngest(req({symbols:['TUPRS'],eligible_symbols:['TUPRS'],risk,risk_status:'VERIFIED_OFFICIAL_RESTRICTIONS'}),env,now)).status,200);
@@ -108,8 +108,8 @@ test('full funnel: hot ingest → global selection → future eligible entry →
   const batch={...payload,bars:[...previous,signalBar],purpose:'HOT_CANDIDATE',run_id:'test-1'};
   const first=await (await ingest(req(batch),env,now)).json();assert.equal(first.stage2,'MOMENTUM_PASSED');
   assert.equal((await db.prepare('SELECT COUNT(*) n FROM virtual_trades').first()).n,0);
-  const selected=await (await finalize(req({run_id:'test-1'}),env,now+60000)).json();assert.deepEqual(selected.selected,['TUPRS']);assert.equal(selected.signals_created,1);
-  assert.equal((await (await finalize(req({run_id:'test-1'}),env,now+60000)).json()).signals_created,0);
+  const selected=await (await finalize(req({run_id:'test-1'}),env,now+60000,mockAI)).json();assert.deepEqual(selected.selected,['TUPRS']);assert.equal(selected.signals_created,1);
+  assert.equal((await (await finalize(req({run_id:'test-1'}),env,now+60000,mockAI)).json()).signals_created,0);
   assert.deepEqual((await (await monitorSymbols(env,now+60000)).json()).symbols,['TUPRS']);
   const entryBar={...bar,time:'2026-10-09T07:45:00Z',open:103.4,high:104,low:103,close:103.6,volume:100};
   await ingest(req({...batch,purpose:'MONITOR',bars:[...previous,signalBar,entryBar]}),env,Date.parse('2026-10-09T08:16:00Z'));
@@ -124,5 +124,31 @@ test('full funnel: hot ingest → global selection → future eligible entry →
   assert.ok((await feedStatus(db,Date.parse('2026-10-09T08:31:00Z'))).scanner_live);
   assert.equal((await reportIngest(req({run_id:'test-1',shard:0,universe_total:631,eligible_total:530,assigned:67,fetched:60,hot:1,posted:1,errors:7,last_bar_time:stopBar.time}),env,Date.parse('2026-10-09T08:31:00Z'))).status,200);
   const coverage=await feedStatus(db,Date.parse('2026-10-09T08:31:00Z'));assert.equal(coverage.scanned_symbols,60);assert.equal(coverage.eligible_total,530);assert.equal(coverage.shards_completed,1);
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('AI uses strict schema, fixed endpoint, no redirects and fails closed on malformed output',async()=>{
+ const {aiVerdict}=await import('../worker/cloud_bridge.mjs');
+ const rows=Array.from({length:20},()=>({...bar,open:99,high:100,low:98,close:99,volume:100}));
+ const c={symbol:'TUPRS',bar_time:bar.time,metrics_json:JSON.stringify(technicalSignal([...rows,{...bar,open:100,high:104,low:100,close:103.5,volume:200}]))};
+ const risk={eligible:1,source:'official',as_of:bar.time,valid_until:'2026-10-09T21:00:00Z'};
+ const mock=async(url,opts)=>{assert.equal(url,'https://api.openai.com/v1/chat/completions');assert.equal(opts.redirect,'error');const b=JSON.parse(opts.body);assert.equal(b.model,'gpt-4o-mini');assert.equal(b.response_format.json_schema.strict,true);assert.equal(b.max_completion_tokens,200);return new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:'{"onay":false,"neden":"Kırılım zayıf."}'}}]}));};
+ assert.equal((await aiVerdict({OPENAI_API_KEY:'unit-test-only'},c,risk,mock)).onay,false);
+ await assert.rejects(aiVerdict({},c,risk,mock),/OPENAI_KEY_MISSING/);
+ await assert.rejects(aiVerdict({OPENAI_API_KEY:'unit-test-only'},c,risk,async()=>new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:'{"onay":"true","neden":"bad"}'}}]}))),/OPENAI_BAD_VERDICT/);
+ await assert.rejects(aiVerdict({OPENAI_API_KEY:'unit-test-only'},c,risk,async()=>new Response('error',{status:429})),/OPENAI_HTTP_429/);
+});
+test('entire six-candidate pool reviewed; rejections excluded and retries never call AI again',async()=>{
+ const {mkdtempSync,rmSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');const {execFileSync}=await import('node:child_process');
+ const {finalize}=await import('../worker/cloud_bridge.mjs');const dir=mkdtempSync(join(tmpdir(),'bist-ai-')),path=join(dir,'db.sqlite');
+ const adapter=new URL('./funnel_sqlite.py',import.meta.url).pathname;const call=data=>JSON.parse(execFileSync('python3',[adapter,path],{input:JSON.stringify(data),encoding:'utf8'}));call({init:true});
+ const db={prepare(sql){return {sql,params:[],bind(...p){this.params=p;return this;},async all(){return call({statements:[this]})[0];},async first(){return (await this.all()).results[0]||null;},async run(){return await this.all();}};}};
+ try{
+  const previous=Array.from({length:20},()=>({...bar,open:99,high:100,low:98,close:99,volume:100}));const metrics=JSON.stringify(technicalSignal([...previous,{...bar,open:100,high:104,low:100,close:103.5,volume:200}]));
+  for(let i=0;i<6;i++){const symbol='TEST'+i;await db.prepare('INSERT INTO bist_funnel_risk VALUES(?,1,?,?,?)').bind(symbol,bar.time,'2026-10-09T21:00:00Z','https://www.borsaistanbul.com/erd/menkul_tedbir_listesi.csv').run();await db.prepare('INSERT INTO bist_funnel_candidates VALUES(?,?,?,?,?,?)').bind('six',symbol,bar.time,new Date(now).toISOString(),10-i,metrics).run();}
+  let calls=0;const mock=async()=>{const approved=++calls!==6;return new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify({onay:approved,neden:approved?'Teknik uygun.':'Kırılım zayıf.'})}}]}));};
+  const req=()=>new Request('https://example.test',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"run_id":"six"}'});const env={DB:db,OPENAI_API_KEY:'unit-test-only'};
+  const result=await (await finalize(req(),env,now,mock)).json();assert.equal(calls,6);assert.equal(result.candidates_reviewed,6);assert.equal(result.selected.length,5);assert.equal(result.rejected,1);
+  const retry=await (await finalize(req(),env,now,mock)).json();assert.equal(calls,6);assert.equal(retry.signals_created,0);
  }finally{rmSync(dir,{recursive:true,force:true});}
 });

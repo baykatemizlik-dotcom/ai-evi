@@ -1,13 +1,15 @@
 # BIST Cloud Bridge
 
-The Worker has zero outbound HTTP calls, including AI/provider/old cron routes.
+Market data is fetched only by GitHub Actions. The Worker calls only OpenAI for
+the GPT-4o-mini paper referee; provider fetching and old cron routes remain disabled.
 The existing mobile dashboard and ACCESS_TOKEN sessions remain available.
 
 ## Setup
 
 1. Apply `migrations/0010_cloud_bridge.sql` **once** to the existing D1 database.
    It preserves existing cash/trades and adds the idempotent, atomic paper triggers.
-   Apply additive `migrations/0011_dynamic_funnel.sql` for risk, candidate and scan-report tables.
+   Apply additive `migrations/0011_dynamic_funnel.sql` for risk, candidate and scan-report tables,
+   then `migrations/0012_ai_referee.sql` for the idempotent AI decision cache.
 2. Deploy `worker/index.js` (self-contained). `worker/cloud_bridge.mjs` is its tested
    source module; it does not need a separate upload when using the dashboard editor.
 3. GitHub repository Settings → Secrets and variables → Actions:
@@ -35,7 +37,7 @@ A validated recent closed candle enables ACTIVE for that symbol. After 35 minute
 without a newly closed candle, status becomes BLOCKED again. No authenticated
 provider/KAP/risk verification is claimed: `market_feed_verified=false`,
 `risk_verified=false`, `orders_sent=0` always. Signals and trades are technical
-paper simulations only; real broker orders and AI requests are disabled.
+paper simulations only; real broker orders are disabled; only the OpenAI paper-referee request is enabled.
 
 ## Three-stage dynamic funnel
 
@@ -63,7 +65,9 @@ patterns can prove absence of manipulation or wash trading.
    tolerance is 35 minutes from bar end. Each shard reports actual fetched
    coverage separately from the number of posted candidates.
 3. After the shard jobs finish, finalize ranks fresh momentum candidates globally
-   and selects **up to four**, possibly none. It creates pending paper signals;
+   and sends the **entire eligible momentum pool** to GPT-4o-mini, without a
+   candidate-count cap. Five concurrent calls throttle transport only. Only
+   strict-schema `{"onay":true,"neden":"..."}` approvals create pending paper signals;
    it never fabricates trades merely to fill the two slots.
 
 Previously imported off-grid rows are preserved for audit and excluded from
@@ -90,5 +94,22 @@ previously imported Yahoo candles prevent duplicate debits/credits on retries.
 
 Tests use synthetic bars in isolated temporary databases, never production data.
 
-Current automated suite: 12 Python and 13 Node tests, including full isolated
+Current automated suite: 13 Python and 15 Node tests, including full isolated
 risk → hot ingest → selection → future entry → stop → idempotent retry flow.
+
+## AI referee
+
+Worker secret `OPENAI_API_KEY` must contain an actual OpenAI API key, not the
+application access token. Existing secrets are inherited during deployment;
+GitHub does not need this key. No search tool or additional AI provider is called.
+Each symbol/bar decision is claimed and cached in D1 before the API call.
+Timeout, missing key, refusal, HTTP error, malformed output or expired restrictions
+blocks entry. Errors are logged without upstream response bodies or secret values.
+The model receives numeric metrics and dated official restrictions, not invented
+news checks. OHLCV cannot certify absence of wash trading or other sanctions.
+
+Each request uses strict JSON schema, 200 maximum output tokens and a 12-second
+timeout. API usage tokens and the approval/rejection reason are stored in
+`bist_ai_decisions`. Authenticated GET `/bist/ai/decisions` shows recent decisions.
+`/bist/connections` reports CONFIGURED before the first real decision; CONNECTED
+requires a successful actual model reply, never just a present secret.

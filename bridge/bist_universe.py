@@ -1,5 +1,7 @@
 """Official KAP equity-market discovery, with a dated checked-in fallback."""
 import datetime as dt
+import http.client
+import time
 import json
 import pathlib
 import re
@@ -8,6 +10,18 @@ import urllib.request
 KAP_URL = 'https://www.kap.org.tr/tr/Pazarlar'
 EQUITY_MARKETS = {'YILDIZ PAZAR', 'ANA PAZAR', 'ALT PAZAR',
                   'YAKIN İZLEME PAZARI', 'PİYASA ÖNCESİ İŞLEM PLATFORMU'}
+
+def fetch_bytes(url,limit):
+    for attempt in range(3):
+        try:
+            request=urllib.request.Request(url,headers={'User-Agent':'BIST-Cloud-Bridge/1.0','Accept-Encoding':'identity'})
+            with urllib.request.urlopen(request,timeout=25) as response:
+                raw=response.read(limit+1)
+            if len(raw)>limit:raise ValueError('OFFICIAL_RESPONSE_TOO_LARGE')
+            return raw
+        except (OSError,http.client.HTTPException):
+            if attempt==2:raise
+            time.sleep(2*(attempt+1))
 
 def parse_markets(html):
     decoder = json.JSONDecoder()
@@ -38,15 +52,11 @@ def parse_markets(html):
 
 def load_universe():
     try:
-        request = urllib.request.Request(KAP_URL, headers={'User-Agent':'BIST-Cloud-Bridge/1.0'})
-        with urllib.request.urlopen(request, timeout=25) as response:
-            raw = response.read(6_000_001)
-            if len(raw)>6_000_000:
-                raise ValueError('KAP_RESPONSE_TOO_LARGE')
+        raw=fetch_bytes(KAP_URL,6_000_000)
         markets = parse_markets(raw.decode('utf-8'))
         return {'symbols':sorted(markets), 'markets':markets, 'source':KAP_URL,
                 'verified_at':dt.datetime.now(dt.timezone.utc).isoformat(), 'cached':False}
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         cached = json.loads(pathlib.Path(__file__).with_name('bist_universe_snapshot.json').read_text())
         age = dt.datetime.now(dt.timezone.utc)-dt.datetime.fromisoformat(cached['verified_at'])
         if not dt.timedelta(0) <= age <= dt.timedelta(days=7):
@@ -88,15 +98,12 @@ def parse_restrictions(text, now=None):
 
 def restrict_universe(universe):
     try:
-        req=urllib.request.Request(RISK_URL,headers={'User-Agent':'BIST-Cloud-Bridge/1.0'})
-        with urllib.request.urlopen(req,timeout=25) as response:
-            raw=response.read(1_000_001)
-            if len(raw)>1_000_000:raise ValueError('RESTRICTIONS_TOO_LARGE')
+        raw=fetch_bytes(RISK_URL,1_000_000)
         risk=parse_restrictions(raw.decode('utf-8-sig'))
         eligible=[s for s in universe['symbols'] if universe['markets'].get(s) in {'YILDIZ PAZAR','ANA PAZAR'}
                   and s not in risk['excluded']]
         universe.update(eligible_symbols=eligible,risk=risk,risk_status='VERIFIED_OFFICIAL_RESTRICTIONS')
-    except (OSError,ValueError,IndexError):
+    except (OSError,ValueError,IndexError,http.client.HTTPException):
         # Never invent a clean risk list when the official list is unavailable.
         universe.update(eligible_symbols=[],risk_status='BLOCKED_RESTRICTIONS_UNAVAILABLE')
     return universe

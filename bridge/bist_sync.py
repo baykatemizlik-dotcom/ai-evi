@@ -2,6 +2,7 @@
 """Standard-library cloud bridge. Never prints keys or provider response bodies."""
 import datetime as dt
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -29,14 +30,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 OPENER = urllib.request.build_opener(NoRedirect)
 
-def request_json(url, payload=None, headers=None):
+def request_json(url, payload=None, headers=None, timeout=20):
     req = urllib.request.Request(url, data=None if payload is None else
         json.dumps(payload, separators=(',', ':'), allow_nan=False).encode(),
         headers={'User-Agent': 'BIST-Cloud-Bridge/1.0', 'Accept': 'application/json',
                  **(headers or {})}, method='GET' if payload is None else 'POST')
     for attempt in range(3):
         try:
-            with OPENER.open(req, timeout=20) as response:
+            with OPENER.open(req, timeout=timeout) as response:
                 raw = response.read(MAX_BYTES + 1)
                 if len(raw) > MAX_BYTES:
                     raise FeedError('RESPONSE_TOO_LARGE')
@@ -46,7 +47,7 @@ def request_json(url, payload=None, headers=None):
             exc.close()
             if code not in (429, 500, 502, 503, 504) or attempt == 2:
                 raise FeedError(f'HTTP_{code}') from None
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, http.client.HTTPException):
             if attempt == 2:
                 raise FeedError('NETWORK_OR_BAD_JSON') from None
         time.sleep(5 * (attempt + 1))
@@ -142,7 +143,7 @@ def worker_config():
 
 def worker_call(path,body=None):
     base,token=worker_config()
-    return request_json(base+path,body,{'Authorization':'Bearer '+token,'Content-Type':'application/json'})
+    return request_json(base+path,body,{'Authorization':'Bearer '+token,'Content-Type':'application/json'},timeout=1800 if path.endswith('/finalize') else 20)
 
 
 def main():

@@ -1,4 +1,4 @@
-// Ingress-only runtime: no network client, AI request, provider fetch or broker call.
+// Market data is ingress-only. The only outbound request is the OpenAI paper referee.
 const validSymbol = symbol => typeof symbol==='string' && /^[A-Z0-9]{3,6}$/.test(symbol);
 const FRESH_MS = 35 * 60000;
 const json = (body, status=200) => new Response(JSON.stringify(body), {
@@ -70,6 +70,7 @@ function technicalSignal(bars) {
  const resistance=Math.max(...prev.map(x=>x.high));
  return total>0 && b.close>vwap && b.close>resistance ? {...metrics,vwap,resistance,
   score:metrics.rvol+100*(b.close/resistance-1)+100*(b.close/vwap-1),
+  last_candle:{open:b.open,high:b.high,low:b.low,close:b.close,volume:b.volume},
   classification:'TECHNICAL_PAPER_ONLY',risk_verified:false}:null;
 }
 async function restrictionClear(db,symbol,now) {
@@ -94,7 +95,7 @@ async function runPaper(db, symbol, now) {
    .bind(exit.executed,exit.time,exit.pnl,exit.reason,trade.id).first();result.closed+=r?1:0;}
  }
  const pending=await db.prepare("SELECT * FROM bist_feed_signals WHERE symbol=? AND status='PENDING' AND expires_at>=? ORDER BY observed_at DESC LIMIT 1").bind(symbol,new Date(now).toISOString()).first();
- if(pending && await restrictionClear(db,symbol,now)){
+ if(pending && await restrictionClear(db,symbol,now) && await db.prepare("SELECT signal_key FROM bist_ai_decisions WHERE signal_key=? AND status='APPROVED' AND model='gpt-4o-mini'").bind(pending.signal_key).first()){
   const next=eligibleEntryBar(pending,bars);
   // Never fill a signal at a price observed before it was generated.
   if(next){
@@ -197,18 +198,79 @@ async function reportIngest(request,env,now=Date.now()) {
   VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,shard) DO UPDATE SET fetched=excluded.fetched,hot=excluded.hot,posted=excluded.posted,errors=excluded.errors,last_bar_time=excluded.last_bar_time,completed_at=excluded.completed_at`)
   .bind(b.run_id,...fields.map(k=>b[k]),b.last_bar_time,new Date(now).toISOString()).run();return json({ok:true});
 }
-async function finalize(request,env,now=Date.now()) {
+const AI_MODEL='gpt-4o-mini';
+async function aiVerdict(env,candidate,risk,network=globalThis.fetch) {
+ if(!env.OPENAI_API_KEY)throw Error('OPENAI_KEY_MISSING');
+ const m=JSON.parse(candidate.metrics_json);
+ if(!Number.isFinite(m.rvol)||m.rvol<2||!Number.isFinite(m.body)||m.body<.6||!Number.isFinite(m.upper_wick)||m.upper_wick>.2||risk?.eligible!==1||!m.last_candle||!(m.last_candle.close>m.last_candle.open&&m.last_candle.close>m.vwap&&m.last_candle.close>m.resistance))
+  throw Error('AI_INPUT_NOT_ELIGIBLE');
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),12000);
+ try{
+  const response=await network('https://api.openai.com/v1/chat/completions',{
+   method:'POST',redirect:'error',signal:controller.signal,
+   headers:{Authorization:'Bearer '+env.OPENAI_API_KEY,'Content-Type':'application/json'},
+   body:JSON.stringify({model:AI_MODEL,temperature:0,max_completion_tokens:200,
+    messages:[{role:'system',content:'Sanal BIST scalp teknik tetik hakemisin. Sadece verilen doğrulanmış sayısal veriyi değerlendir. RVOL>=2, yeşil mum, gövde>=0.60, üst fitil<=0.20, 20-bar breakout ve seans VWAP üstü kapanış gereklidir. Resmi VBTS/tedbir listesi güncel ve uygun değilse onay verme. Haber/ceza/mutlak manipülasyon yokluğu için dış araştırma yapılmadı; bunu uydurma, kesin güvence verme. OHLCV wash trade kanıtı değildir. Veriler tutarsız/eksikse veya teknik kırılım zayıfsa onay=false. Diğer durumda teknik sanal takip için onay verebilirsin. Kısa Türkçe neden yaz. Gerçek emir verme, gelecekteki bar hakkında tahmin uydurma.'},
+     {role:'user',content:JSON.stringify({symbol:candidate.symbol,bar_time:candidate.bar_time,metrics:m,green_candle:true,breakout_passed:true,vwap_passed:true,
+      vbts:{eligible:risk.eligible===1,source:risk.source,as_of:risk.as_of,valid_until:risk.valid_until},other_penalty_news_checked:false})}],
+    response_format:{type:'json_schema',json_schema:{name:'bist_paper_verdict',strict:true,schema:{type:'object',properties:{onay:{type:'boolean'},neden:{type:'string'}},required:['onay','neden'],additionalProperties:false}}}})
+  });
+  if(!response.ok){await response.body?.cancel();throw Error('OPENAI_HTTP_'+response.status);}
+  // Bound even an unexpected upstream response; never log its body or credentials.
+  const reader=response.body.getReader();let size=0,text='';const decoder=new TextDecoder();
+  while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>64000){await reader.cancel();throw Error('OPENAI_RESPONSE_TOO_LARGE');}text+=decoder.decode(value,{stream:true});}
+  text+=decoder.decode();const data=JSON.parse(text),choice=data.choices?.[0];
+  if(choice?.finish_reason!=='stop'||choice.message?.refusal)throw Error('OPENAI_REFUSAL_OR_INCOMPLETE');
+  const result=JSON.parse(choice.message.content);
+  if(!result||typeof result.onay!=='boolean'||typeof result.neden!=='string'||!result.neden.trim()||result.neden.length>1000||Object.keys(result).sort().join(',')!=='neden,onay')throw Error('OPENAI_BAD_VERDICT');
+  return {...result,input_tokens:Number.isInteger(data.usage?.prompt_tokens)?data.usage.prompt_tokens:0,
+   output_tokens:Number.isInteger(data.usage?.completion_tokens)?data.usage.completion_tokens:0};
+ }finally{clearTimeout(timer);}
+}
+async function judgeCandidate(env,c,now,network) {
+ const key=c.symbol+':'+c.bar_time,wallStart=Date.now();
+ const claimed=await env.DB.prepare("INSERT OR IGNORE INTO bist_ai_decisions(signal_key,run_id,symbol,bar_time,model,status,reason,created_at) VALUES(?,?,?,?,?,'PENDING','AWAITING_VERDICT',?)")
+  .bind(key,c.run_id,c.symbol,c.bar_time,AI_MODEL,new Date(now).toISOString()).run();
+ if(claimed.meta.changes){
+  let status='ERROR',reason='AI_UNAVAILABLE',input=0,output=0;
+  try{
+   const risk=await env.DB.prepare('SELECT * FROM bist_funnel_risk WHERE symbol=? AND eligible=1 AND valid_until>?').bind(c.symbol,new Date(now).toISOString()).first();
+   if(!risk)throw Error('RESTRICTIONS_EXPIRED');
+   const verdict=await aiVerdict(env,c,risk,network);status=verdict.onay?'APPROVED':'REJECTED';reason=verdict.neden;input=verdict.input_tokens;output=verdict.output_tokens;
+  }catch(e){reason=/^(OPENAI_[A-Z_0-9]+|AI_INPUT_NOT_ELIGIBLE|RESTRICTIONS_EXPIRED)$/.test(e.message)?e.message:'OPENAI_NETWORK_OR_INVALID_RESPONSE';}
+  await env.DB.prepare("UPDATE bist_ai_decisions SET status=?,reason=?,completed_at=?,input_tokens=?,output_tokens=? WHERE signal_key=? AND status='PENDING'")
+   .bind(status,reason,new Date(now+Math.max(0,Date.now()-wallStart)).toISOString(),input,output,key).run();
+  console.log(JSON.stringify({event:'BIST_AI_DECISION',symbol:c.symbol,status,model:AI_MODEL}));
+ }
+ return await env.DB.prepare('SELECT * FROM bist_ai_decisions WHERE signal_key=?').bind(key).first();
+}
+async function finalize(request,env,now=Date.now(),network=globalThis.fetch) {
  const b=await readBody(request);if(!validRunId(b.run_id))return json({error:'INVALID_RUN'},422);
+ if(!env.OPENAI_API_KEY)return json({error:'OPENAI_KEY_MISSING',signals_created:0},503);
  const rows=await env.DB.prepare(`SELECT c.* FROM bist_funnel_candidates c JOIN bist_funnel_risk r ON r.symbol=c.symbol
   WHERE c.run_id=? AND r.eligible=1 AND r.valid_until>? AND c.bar_time>=?
-  ORDER BY c.score DESC,c.symbol ASC LIMIT 40`).bind(b.run_id,new Date(now).toISOString(),new Date(now-50*60000).toISOString()).all();
- const selected=(rows.results||[]).filter(c=>fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now)).slice(0,4);
- let created=0;
- for(const c of selected){const key=c.symbol+':'+c.bar_time;
+  ORDER BY c.score DESC,c.symbol ASC`).bind(b.run_id,new Date(now).toISOString(),new Date(now-50*60000).toISOString()).all();
+ // No candidate-count cap: five concurrent calls are transport throttling only.
+ const candidates=(rows.results||[]).filter(c=>fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now));
+ const decisions=new Array(candidates.length);let cursor=0;
+ await Promise.all(Array.from({length:Math.min(5,candidates.length)},async()=>{
+  while(cursor<candidates.length){const index=cursor++;decisions[index]=await judgeCandidate(env,candidates[index],now,network);}
+ }));
+ let created=0;const selected=[];
+ for(let i=0;i<candidates.length;i++){
+  const c=candidates[i],decision=decisions[i];if(decision?.status!=='APPROVED')continue;
+  // After a slow API response, recheck freshness/risk. Never use request-start time for entry.
+  const observed=Math.max(now,Date.parse(decision.completed_at)||now);
+  if(!fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},observed)||!await restrictionClear(env.DB,c.symbol,observed))continue;
   const result=await env.DB.prepare("INSERT OR IGNORE INTO bist_feed_signals(signal_key,symbol,bar_time,observed_at,expires_at,source,metrics_json) VALUES(?,?,?,?,?,'YAHOO_INDICATIVE',?)")
-   .bind(key,c.symbol,c.bar_time,new Date(now).toISOString(),new Date(now+60*60000).toISOString(),c.metrics_json).run();created+=result.meta.changes;
+   .bind(decision.signal_key,c.symbol,c.bar_time,new Date(observed).toISOString(),new Date(observed+60*60000).toISOString(),c.metrics_json).run();created+=result.meta.changes;selected.push(c.symbol);
  }
- return json({ok:true,run_id:b.run_id,selected:selected.map(c=>c.symbol),signals_created:created,orders_sent:0});
+ return json({ok:true,run_id:b.run_id,model:AI_MODEL,candidates_reviewed:candidates.length,selected,signals_created:created,
+  rejected:decisions.filter(d=>d?.status==='REJECTED').length,errors:decisions.filter(d=>d?.status==='ERROR'||d?.status==='PENDING').length,orders_sent:0});
+}
+async function aiStatus(env) {
+ const last=await env.DB.prepare("SELECT symbol,status,reason,completed_at FROM bist_ai_decisions WHERE status!='PENDING' ORDER BY completed_at DESC LIMIT 1").first();
+ return {model:AI_MODEL,connection:!env.OPENAI_API_KEY?'MISSING_KEY':last&&['APPROVED','REJECTED'].includes(last.status)?'CONNECTED':last?.status==='ERROR'?'ERROR':'CONFIGURED',last_decision:last||null};
 }
 async function feedStatus(db,now=Date.now()) {
  const [rows,reports]=await Promise.all([db.prepare('SELECT * FROM bist_feed_state').all(),
@@ -258,7 +320,7 @@ document.querySelectorAll('[data-candidate-filter]').forEach(b=>b.onclick=()=>{d
 document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-filter]').forEach(x=>x.classList.toggle('active',x===b));});
 function setDot(which,state,text){document.getElementById(which+'Dot').className='dot '+state;document.getElementById(which+'Text').textContent=text}
 async function checkApis(){if(pending)return;pending=true;setDot('gemini','wait','Kontrol');setDot('gpt','wait','Kontrol');try{
-const [a,b,c]=await Promise.all([fetch('/bist/connections',{headers:headers()}),fetch('/bist/overview',{headers:headers()}),fetch('/bist/status',{headers:headers()})]);const x=await a.json(),o=await b.json(),status=await c.json();if(a.status===401){setDot('gemini','','Oturum gerekli');setDot('gpt','','Oturum gerekli');document.getElementById('checkResult').textContent='Bir defa erişim tokenı girerek oturum aç.';return}document.getElementById('checkResult').textContent=JSON.stringify(x,null,2);for(const [label,field] of [['gemini','gemini'],['gpt','openai']]){const ok=a.ok&&x[field]&&x[field].connection==='CONNECTED';setDot(label,ok?'ok':'bad',ok?'Bağlı':'Bulut köprü modunda kapalı')}if(b.ok){lastData=o;renderOverview(o)}document.getElementById('mainState').textContent=status.scanner_live?'Bulut radar aktif':'Veri bekleniyor';
+const [a,b,c]=await Promise.all([fetch('/bist/connections',{headers:headers()}),fetch('/bist/overview',{headers:headers()}),fetch('/bist/status',{headers:headers()})]);const x=await a.json(),o=await b.json(),status=await c.json();if(a.status===401){setDot('gemini','','Oturum gerekli');setDot('gpt','','Oturum gerekli');document.getElementById('checkResult').textContent='Bir defa erişim tokenı girerek oturum aç.';return}document.getElementById('checkResult').textContent=JSON.stringify(x,null,2);for(const [label,field] of [['gemini','gemini'],['gpt','openai']]){const ok=a.ok&&x[field]&&x[field].connection==='CONNECTED';setDot(label,ok?'ok':'bad',ok?'Bağlı':(field==='openai'?(x.openai?.connection==='CONFIGURED'?'Mini hazır · ilk karar bekleniyor':x.openai?.connection==='ERROR'?'Mini API hatası':'Mini anahtarı eksik'):'Bulut köprü modunda kapalı'))}if(b.ok){lastData=o;renderOverview(o)}document.getElementById('mainState').textContent=status.scanner_live?'Bulut radar aktif':'Veri bekleniyor';
 }catch(e){setDot('gemini','bad','Hata');setDot('gpt','bad','Hata');document.getElementById('checkResult').textContent=String(e.message)}finally{pending=false}}
 function renderOverview(d){const cap=Number(d.equity||d.total_capital||5000);document.getElementById('total').textContent=money(cap);document.getElementById('demoTotal').textContent=money(cap);document.getElementById('scalpCash').textContent=money(d.scalp_cash);document.getElementById('swingCash').textContent=money(d.swing_cash);document.getElementById('approved').textContent=String(d.approved||0);document.getElementById('candidates').textContent=String(d.candidates||0);document.getElementById('scanned').textContent=String(d.scanned||0);document.getElementById('lastRun').textContent=d.latest_run?'Son görev: '+d.latest_run.phase+' · '+d.latest_run.status:'Son tarama: bekleniyor';document.getElementById('marketState').textContent=d.scanner_live?'Bulut verisi aktif · gösterge niteliğinde':'Taze 15m veri bekleniyor';document.getElementById('xuState').textContent='Veri bekleniyor';document.getElementById('watchlist').textContent=d.candidates>0?'Havuzdaki '+d.candidates+' adayı görmek için dokun →':'Henüz teknik koşulları sağlayan aday yok.';
 const list=document.getElementById('candidateList');list.replaceChildren();const candidateFilter=document.querySelector('[data-candidate-filter].active')?.dataset.candidateFilter||'ALL';
@@ -306,7 +368,8 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
  if(!authenticated)return reply({error:"Unauthorized"},401);
 
  if(u.pathname==='/bist/status'||u.pathname==='/bist/bridge/status')return reply(await feedStatus(env.DB));
- if(u.pathname==='/bist/connections')return reply({mode:'INGRESS_ONLY',external_fetch_enabled:false,gemini:{connection:'DISABLED'},openai:{connection:'DISABLED'}});
+ if(u.pathname==='/bist/connections')return reply({mode:'CLOUD_BRIDGE_AI_REFEREE',external_fetch_enabled:true,market_data_fetch_enabled:false,gemini:{connection:'DISABLED'},openai:await aiStatus(env)});
+ if(u.pathname==='/bist/ai/decisions')return reply({decisions:(await env.DB.prepare('SELECT symbol,bar_time,model,status,reason,completed_at,input_tokens,output_tokens FROM bist_ai_decisions ORDER BY created_at DESC LIMIT 100').all()).results});
  if(u.pathname==='/bist/overview'){
   const [status,accounts,open,closed,signals]=await Promise.all([
    feedStatus(env.DB),env.DB.prepare('SELECT * FROM paper_cash_accounts').all(),
@@ -317,8 +380,8 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
   const openTrades=open.results||[];
   return reply({...status,total_capital:5000,equity:(account.SCALP||0)+(account.SWING||0)+openTrades.reduce((s,t)=>s+t.executed_price*t.lot_count,0),
    scalp_cash:account.SCALP||0,swing_cash:account.SWING||0,open_trades:openTrades,closed_trades:closed.results||[],
-   scanned:status.scanned_symbols||status.active_symbols,approved:0,candidates:signals.results.length,watchlist:signals.results,
+   scanned:status.scanned_symbols||status.active_symbols,approved:signals.results.length,candidates:signals.results.length,watchlist:signals.results,
    latest_run:status.last_received?{phase:'CLOUD_BRIDGE',status:status.status,created_at:status.last_received}:null});
  }
  return reply({error:'DISABLED_IN_INGRESS_ONLY_MODE',external_fetch_enabled:false},410);
-},async scheduled(){ /* Egress intentionally disabled. GitHub Actions supplies the bars. */ }};
+},async scheduled(){ /* Market-data egress disabled. Actions supplies bars; finalize calls only OpenAI. */ }};
