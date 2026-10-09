@@ -1,6 +1,6 @@
 # Scalp Runner — sanal işlem
 
-Bu güncelleme dual-engine taslak dalını genişletir. Production'a yayınlanmamış ve D1 migrasyonu uygulanmamıştır.
+9 Ekim 2026’da canlı sanal işlem sistemine yayınlandı. D1 0017, 0018 ve 0019 uygulandı; gerçek aracı kurum emri gönderilmez. Mevcut kasa, açık lotlar ve geçmiş korunmuştur.
 
 ## Dosyalar
 - `worker/strategy_engines.mjs`: Scalp TP1/Runner, kısmi satış muhasebesi ve panel API alanları. Trend motorunun fonksiyonları değişmez.
@@ -36,3 +36,8 @@ Emir Kurulum Kartı kullanıcı isteğine göre brüt `executed_price * .985`, `
 ## Canlı besleme düzeltmesi
 Yahoo fiyatı 15 dakika gecikmeli olduğundan, sanal icrada sağlayıcı zamanı değiştirilmeden en fazla 20 dakika fiyat yaşı kabul edilir (15 dakika veri gecikmesi + 5 dakika aktarım toleransı). Daha eski/gelecek/tarih dışı fiyatlar reddedilir. Scalp kuyruğu hâlâ onaydan itibaren 15 dakika geçerlidir. Migration 0019 aynı sınırı D1 giriş korumasına uygular. Panel fiyatı gecikmeli gösterge olarak etiketler.
 Yahoo BIST 60m barlarının :30 başlangıcı korunur; :00 varsayımıyla bütün barlar düşürülmez. Trend evreni eski boş bist_universe tablosunun yanında güncel, uygun bist_funnel_risk sembollerinden de okunur.
+
+
+## Panel ve mevcut pozisyonlar
+Eski altı sekmeli mobil panel (Ana/Adaylar/Radar/Sinyaller/Demo/Ayarlar) korunur. Yeni iki strateji odası, Runner/emir kartları ve çıkış filtresi Demo bölümündedir. Gün içindeki eski adaylar durumlarıyla gösterilir; bu gösterim süresi dolmuş adayı alıma uygun hale getirmez.
+Eski motordan kalan CELHA 34 lot SCALP slot 2 ve TSKB 249 lot SWING slot 1 korunarak taşındı. Eski TSKB bütçesi ~2.497 TL olduğundan kalan Trend nakdi 2,53 TL idi; yeni 1.250 TL tavanı yeni girişlere uygulanır, eski pozisyon zorla küçültülmedi. Scalp'ın iki slotu aynı fillStrategy yolunu kullanır; slot bazında farklı onay veya ek tarama şartı yoktur.

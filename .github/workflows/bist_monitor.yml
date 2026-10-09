@@ -6,6 +6,7 @@ on:
   push:
     branches: [main]
     paths:
+      - worker/index.js
       - bridge/bist_monitor.py
       - tests/test_bist_monitor.py
       - .github/workflows/bist_monitor.yml
@@ -26,6 +27,20 @@ jobs:
         run: python3 -m pip install --disable-pip-version-check -r bridge/requirements.txt
       - name: Verify targeted monitoring
         run: python3 -m unittest discover -s tests -p 'test_bist_monitor.py'
+      - name: Verify live strategy state
+        env:
+          BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
+          BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
+        run: |
+          PYTHONPATH=bridge python3 - <<'PY'
+          import bist_sync as feed
+          feed.worker_config()
+          state=feed.worker_call('/bist/overview')
+          assert state.get('engine_version')==2, 'LIVE_ENGINE_VERSION_MISMATCH'
+          print('LIVE_STRATEGY_STATE', {k:state.get(k) for k in ['server_time','scalp_cash','swing_cash','scalp_slots','trend_slots']})
+          print('LIVE_OPEN_TRADES', [{k:t.get(k) for k in ['symbol','strategy','slot_id','remaining_lots','quote_fresh','quote_age_minutes']} for t in state.get('open_trades',[])])
+          print('LIVE_SCALP_READY', [q['symbol'] for q in state.get('scalp_sniper_queue',[])])
+          PY
       - name: Monitor approved candidates and open paper positions every minute
         env:
           BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}

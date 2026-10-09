@@ -1,6 +1,6 @@
 # BIST AVCI — SCALP / TREND V2 teslimi
 
-Temel sürüm: `082ec96bb1f34ff87d1d5517e786bd1560acbe4c`. Bu paket çalışan iki ayrı motor, D1 migration, deterministik Worker derlemesi ve PWA içerir. **Canlı Worker/D1'e uygulanmamıştır.** Tüm icralar sanaldır.
+Temel sürüm: `082ec96bb1f34ff87d1d5517e786bd1560acbe4c`. Bu paket çalışan iki ayrı motor, D1 migration, deterministik Worker derlemesi ve PWA içerir. **9 Ekim 2026’da canlı sanal Worker/D1’e uygulandı; 0017–0019 migrasyonları tamamlandı.** Tüm icralar sanaldır.
 
 ## Dosyalar
 
