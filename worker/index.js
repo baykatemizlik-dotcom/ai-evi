@@ -395,7 +395,7 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
          await env.DB.prepare("INSERT INTO watchlist_pool(trade_day,symbol,source,verified,created_at,strategy,metrics_json,radar_status,updated_at) VALUES(?,?,?,0,?,'SCALP',?,'RADAR_ONLY',?) ON CONFLICT(trade_day,symbol) DO UPDATE SET metrics_json=excluded.metrics_json,updated_at=excluded.updated_at,radar_status='RADAR_ONLY'").bind(tradeDay,symbol,"Bridge D1 intraday / unverified",new Date().toISOString(),JSON.stringify(m),new Date().toISOString()).run();
        }catch(e){const reason=String(e.message||e);console.log("FEED_SKIP",symbol,reason.slice(0,80));if(reason==="YAHOO_HTTP_429")break}
      }
-     status=!symbols.length||results.length===0?"BLOCKED_MARKET_DATA_UNAVAILABLE":kap.ready?"TECHNICAL_RADAR_KAP_UNVERIFIED":"TECHNICAL_RADAR_KAP_BLOCKED";
+     status=!symbols.length?"BLOCKED_MARKET_DATA_UNAVAILABLE":kap.ready?"TECHNICAL_RADAR_KAP_UNVERIFIED":"TECHNICAL_RADAR_KAP_BLOCKED";
    }else status="BLOCKED_MISSING_VERIFIED_FEED";
    try{
     await env.DB.prepare("INSERT OR IGNORE INTO bist_scan_runs(run_id,phase,status,created_at,details) VALUES(?,?,?,?,?)")
