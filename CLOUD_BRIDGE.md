@@ -1,5 +1,114 @@
 # BIST Cloud Bridge
 
+## Gemini için güncel denetim notu — 9 Ekim 2026
+
+Bu belge uygulanan mimariyi anlatır; aşağıdaki canlı kanıtlar ile henüz
+doğrulanmamış davranışlar birbirinden ayrılmalıdır. İncelenecek kod tabanı:
+`4dfd59d09a1aede5c925027358e43e3e66c4ccbd`. Bu bölüm yalnızca dokümantasyon güncellemesidir.
+
+### Uygulanan kapsam
+
+| Bileşen | Güncel davranış |
+| --- | --- |
+| Evren | Son doğrulamada 631 saf pay; pazar/brüt takas ve resmi tedbir elemelerinden sonra 530 uygun hisse. Sayılar hedef veya sabit kota değildir. |
+| Veri | Actions üzerinde 8 parça, 15m Yahoo OHLCV; yalnız kapanmış ve 900 saniyeye hizalı barlar. Worker piyasa sağlayıcısını çağırmaz. |
+| Huni | Python RVOL≥2, yeşil mum, gövde≥%60, üst fitil≤%20; Worker önceki 20 bar kırılımı ve seans VWAP doğrulaması. |
+| Mini | Teknik aşamaları geçen dinamik havuzun tamamı; 3 aday sınırı yok. Eşzamanlı 5 çağrı yalnız taşıma sınırıdır. |
+| Karar | GPT-4o-mini katı JSON onay/ret, neden ve 0–100 güven skoru. Resmi, tarihli tedbir kaydı verilir; modelden bilinmeyen haber veya cezayı uydurması istenmez. |
+| Scalp | 2 slot, net TP +%3 / SL -%1,5; aynı mumda stop önceliği; giriş ve çıkış maliyetleri dahil. |
+| Sniper | Mevcut SWING kasasıyla 1 slot; net taban stop -%2, net +%2,5 sonrası maliyeti karşılayan stop, önceki tepeye göre %2 takip, 60 dakika yeni tepe yoksa çıkış. |
+| Yedekler | Onaylı dinamik havuz, panelde sıralama/güven/tazelik/neden; her yeni kapanmış barda sağlık kontrolü, bozulana INVALID. |
+| Seans sonu | 17:55 TRT giriş kilidi; bağımsız Worker dakika cron'u, son kayıtlı kapanmış barla sanal kapanış. |
+| Gemini | Dış Actions denetçisi; rapor ve kod inceler, otomatik kod/işlem değişikliği yapmaz. |
+
+Açık pozisyonların, bekleyen girişlerin ve READY yedeklerin izleme barları,
+ilk huni filtresinden artık geçmeseler bile gönderilir. Yalnız sıcak adayları
+göndermek stop ve yedek izlemesini keserdi.
+
+### Mini hatası: kök neden ve gerçek doğrulama
+
+Hata model seçimi veya ChatGPT sohbet ayarı değildi. Bizim OpenAI HTTP
+isteğimizdeki `redirect: "error"` seçeneği canlı Cloudflare runtime'ında
+TypeError üretiyordu. Hata metni bu redirect değerinin edge'de uygulanmadığını
+bildirdi. İstek `redirect: "manual"` olarak düzeltildi; 3xx dahil tüm başarısız
+HTTP yanıtları reddedilir, başka adrese kimlik bilgisi yönlendirilmez.
+
+Gerçek OpenAI çağrısı D1'e **MARMR / APPROVED / güven 85 / 524 giriş ve
+74 çıkış tokenı** olarak kaydedildi. Başarılı bağlantı testi Actions run:
+`37907005038`. Bu **yalnız bağlantı testi** idi: aynı günün geçmiş adayı da
+kullanılabilir; sinyal, yedek veya sanal emir oluşturmaz. MARMR için canlı AL
+veya gerçekleşmiş işlem kanıtı olarak yorumlanmamalıdır. Eski ERROR kayıtları
+denetim izi olarak korunur; onların varlığı tek başına bağlantının halen bozuk
+olduğunu göstermez.
+
+Bu hatadan Worker'ın tüm dış HTTP bağlantılarının kalıcı olarak çöktüğü sonucu
+çıkarılamaz. Güncel tasarımda yalnız piyasa verisi Actions'a taşındı; OpenAI
+karar çağrısı kullanıcı talebiyle Worker içindedir.
+
+### Kanıtlar ve kalan doğrulamalar
+
+- 35 otomatik test geçti: 15 Python, 20 Node. İzole geçici veritabanları ve
+  sentetik barlar kullanılır; üretim D1'i sıfırlanmadı.
+- Canlı panelde Dinamik Yedek Havuz ve Karneyi kopyala alanları doğrulandı.
+- Gerçek mini yanıtı doğrulandı; yeni Sniper'ın üretimde tüm giriş → takip →
+  çıkış → yedek değişim döngüsü henüz bu kanıtlarla doğrulanmış sayılmaz.
+- GitHub tarafında `GEMINI_API_KEY` ve başarılı dış Gemini yanıtı ayrıca
+  doğrulanmalıdır. Cloudflare'daki aynı isimli secret otomatik taşınmaz.
+- Güven skoru kalibre edilmiş kazanma olasılığı değildir. OHLCV oranları wash
+  trade olmadığını kanıtlamaz. Yahoo gösterge verisidir, lisanslı gerçek zamanlı
+  işlem fiyatı doğrulaması değildir. Tüm işlemler sanaldır; gerçek broker emri yoktur.
+- Bu not canlı tablo sayaçlarının anlık fotoğrafı değildir. Yeni taramanın
+  aday, karar ve işlem sayıları tarih/saatli D1 kayıtlarıyla ayrıca okunmalıdır.
+
+### Gemini'den özellikle istenen denetim
+
+1. **Lookahead ve gecikmeli giriş:** Sinyal barı kapanışı, gerçek onay zamanı,
+   yedek sağlık gözlem zamanı ve önceki Sniper çıkışının öğrenilme zamanı
+   birlikte giriş sınırını belirliyor mu? N+1 açılışı geçmişse daha sonraki
+   uygun bar beklenmeli; geçmiş fiyatla geriye dönük karar verilmemeli.
+   Scalp ve Sniper için ayrı kontrol et.
+2. **Bar içi belirsizlik:** Aynı mumda TP/SL stop önceliğini, kötü gap açılışını,
+   net maliyet hesaplarını kontrol et. Yeni görülen tepe takip/breakeven
+   stopunu sonraki mum için yükseltir; aynı mumun daha önce oluşmuş olabilecek
+   low'una uygulanmamalı. OHLCV ile anlık, kesin risksiz çıkış vaat edilmemeli.
+3. **Atomiklik ve çift motor:** İki eşzamanlı ingest/finalize, tekrar gönderim,
+   API karar önbelleği ve slot boşalması yarışlarında 2 Scalp/1 Sniper sınırı,
+   aynı sembolde mükerrer pozisyon ve kasa bakiyesi D1 trigger'larıyla korunuyor mu?
+   Kapanış tekrarında çift nakit kredisi olmamalı.
+4. **Yedek sağlık ve tazelik:** READY isimlerin tamamı izleniyor mu?
+   35 dakika toleransı bar başlangıcından değil bar sonundan ölçülmeli.
+   Yedek uygunluğu gerçek giriş anında değerlendirilmelidir. Her yeni barda
+   RVOL≥2 koşulunu tekrar istemenin iyi trendleri çok erken eleme etkisini
+   kalibrasyon bulgusu olarak belirt; filtreleri sessizce gevşetme.
+5. **17:55 ve kesinti:** Kapanış zamanı cron'un nominal zamanı değil gerçek
+   çalıştırılma zamanıdır. Son kayıtlı barla kapanış gösterge fiyatıdır;
+   doğrulanmış 17:55 piyasa fiyatı değildir. Cron gecikmesi, hiç kullanılabilir
+   bar bulunmaması veya servis kesintisi halinde geceye pozisyon kalması ve
+   sonraki gün toparlanma davranışını ayrıca incele. Mutlak kapanış garantisi
+   varmış gibi raporlama.
+6. **Evren ve tedbir:** KAP sınıflandırması/şirket tipi ve sembol filtresinin
+   birlikte çalışmasını, 7 günlük snapshot sınırını, günlük resmi tedbir
+   listesinin geçerliliğini kontrol et. Tedbir kaynağı yoksa yeni girişler
+   bloklanmalı, açık pozisyon izlemesi sürmeli.
+7. **AI ve dış denetim:** Şema dışı yanıt, ret, zaman aşımı ve eksik secret
+   giriş açmamalı. Bağlantı testi canlı sinyal üretmemeli. Dış Gemini audit
+   başarısızlığı motor durumuna veya geçmiş kayıtlara müdahale etmemeli.
+   Mevcut günlük karne özet ağırlıklıdır; ayrıntılı işlem incelemesi için
+   gerekli satırların raporda eksik olup olmadığını belirt.
+
+İnceleme dosyaları: `bridge/bist_sync.py`, `bridge/bist_universe.py`,
+`worker/cloud_bridge.mjs`, dağıtılan `worker/index.js`,
+`migrations/0010_cloud_bridge.sql`–`0014_external_audit.sql`,
+`.github/workflows/bist_sync.yml`, `bist_ai_probe.yml`, `bist_review.yml`,
+`bridge/bist_review.py` ve `tests/`.
+
+İstenen çıktı: Her bulgu için **dosya/fonksiyon → tekrar üretme koşulu →
+etki → düzeltme önerisi**. Canlı işlem doğruluğu hatalarını strateji
+kalibrasyonundan ayır. Kanıt olmadan “tam eksiksiz / kârlı / canlıda doğrulandı”
+sonucu verme; bu denetim aşamasında D1'i sıfırlama veya stratejiyi kendiliğinden değiştirme.
+
+---
+
 Market data is fetched only by GitHub Actions. The Worker calls only OpenAI for
 the GPT-4o-mini paper referee; provider fetching and old cron routes remain disabled.
 The existing mobile dashboard and ACCESS_TOKEN sessions remain available.
