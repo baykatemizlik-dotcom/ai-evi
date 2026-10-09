@@ -56,7 +56,7 @@ const paperExecution=async(env,signal)=>{
  // Conditional debit and trade insert in one D1 transaction. Abort if cash unavailable.
  const batch=await env.DB.batch([
   env.DB.prepare("UPDATE paper_cash_accounts SET available_cash=available_cash-?,updated_at=? WHERE strategy='SCALP' AND available_cash>=?").bind(cost,ts,cost),
-  env.DB.prepare("INSERT INTO virtual_trades(strategy,symbol,signal_price,executed_price,lot_count,commission,entry_time,status,slot_id) SELECT 'SCALP',?,?,?,?,?,'OPEN',? WHERE EXISTS(SELECT 1 FROM paper_cash_accounts WHERE strategy='SCALP' AND updated_at=? AND available_cash>=0) AND NOT EXISTS(SELECT 1 FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN' AND (symbol=? OR slot_id=?))").bind(symbol,price,plan.executedPrice,plan.lots,entryFee,ts,slot,ts,symbol,slot)
+  env.DB.prepare("INSERT INTO virtual_trades(strategy,symbol,signal_price,executed_price,lot_count,commission,entry_time,status,slot_id) SELECT 'SCALP',?,?,?,?,?,?,'OPEN',? WHERE EXISTS(SELECT 1 FROM paper_cash_accounts WHERE strategy='SCALP' AND updated_at=? AND available_cash>=0) AND NOT EXISTS(SELECT 1 FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN' AND (symbol=? OR slot_id=?))").bind(symbol,price,plan.executedPrice,plan.lots,entryFee,ts,slot,ts,symbol,slot)
  ]);
  if(batch[0]?.meta?.changes!==1||batch[1]?.meta?.changes!==1)throw Error("PAPER_TRANSACTION_RECONCILIATION_FAILED");
  return {ok:true,symbol,slot,quantity:plan.lots,spent:cost};
