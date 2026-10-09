@@ -147,6 +147,10 @@ def worker_call(path,body=None):
 
 
 def main():
+    if '--probe' in sys.argv:
+        probe=worker_call('/bist/feed/probe',{})
+        print('MINI_PROBE',probe)
+        return 1 if probe.get('status')=='ERROR' else 0
     if '--prepare' in sys.argv:
         universe = restrict_universe(load_universe())
         worker_call('/bist/feed/risk', {'symbols':universe['symbols'],'eligible_symbols':universe['eligible_symbols'],
