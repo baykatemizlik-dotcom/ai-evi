@@ -12,6 +12,8 @@ on:
       - bridge/bist_universe.py
       - bridge/bist_universe_snapshot.json
       - bridge/requirements.txt
+      - worker/cloud_bridge.mjs
+      - worker/index.js
 permissions:
   contents: read
 concurrency:
