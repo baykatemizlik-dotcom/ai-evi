@@ -45,8 +45,8 @@ function entryPlan(cash, price) {
 function exitPlan(trade, bars) {
  const cost=trade.executed_price*trade.lot_count+trade.commission;
  const tp=cost*1.03/(trade.lot_count*.998*.998), sl=cost*.985/(trade.lot_count*.998*.998);
- for(const b of [...bars].sort((a,b)=>Date.parse(a.bar_time)-Date.parse(b.bar_time))) {
-  if(Date.parse(b.bar_time)<Date.parse(trade.entry_time))continue;
+ const eligible=[...bars].filter(b=>Date.parse(b.bar_time)>=Date.parse(trade.entry_time)).sort((a,b)=>Date.parse(a.bar_time)-Date.parse(b.bar_time));
+ for(const b of eligible) {
   // Stop wins when both thresholds occur in a candle; gap stops use the worse open.
   let raw,reason;
   if(b.low<=sl){raw=Math.min(b.open,sl);reason='STOP_NET_1_5_PCT';}
@@ -55,6 +55,12 @@ function exitPlan(trade, bars) {
   const executed=raw*.998;
   return {executed,reason,quote_time:b.bar_time,time:new Date(Date.parse(b.bar_time)+900000).toISOString(),
    pnl:executed*trade.lot_count*.998-cost};
+ }
+ // Recover historical TP/SL first; otherwise use the latest available closed candle.
+ const last=eligible.at(-1);
+ if(last && Date.parse(last.bar_time)+900000-Date.parse(trade.entry_time)>=3600000 && Number.isFinite(last.close) && last.close>0){
+  const executed=last.close*.998;
+  return {executed,reason:'TIME_EXIT',quote_time:last.bar_time,time:new Date(Date.parse(last.bar_time)+900000).toISOString(),pnl:executed*trade.lot_count*.998-cost};
  }
  return null;
 }

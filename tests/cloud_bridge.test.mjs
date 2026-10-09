@@ -196,3 +196,18 @@ test('backfill loads entry history beyond 100 bars and excludes future/unclosed 
   assert.equal(exit.quote_time,data[1].time);assert.equal(exit.reason,'TP_NET_3_PCT');
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
+
+test('Scalp timeout uses latest closed candle at 60m; TP/SL history takes priority',()=>{
+ const t={executed_price:100,lot_count:10,commission:2,entry_time:'2026-10-09T10:00:00Z'};
+ const b=(minute,changes={})=>({bar_time:new Date(Date.parse(t.entry_time)+minute*60000).toISOString(),open:100,high:100.5,low:100,close:100.2,...changes});
+ assert.equal(exitPlan(t,[b(0),b(15),b(30)]),null);
+ assert.equal(exitPlan(t,[]),null);
+ assert.equal(exitPlan(t,[b(-15)]),null);
+ const at60=exitPlan(t,[b(0),b(15),b(30),b(45)]);
+ assert.equal(at60.reason,'TIME_EXIT');assert.equal(at60.time,'2026-10-09T11:00:00.000Z');
+ const latest=exitPlan(t,[b(75,{close:100.3}),b(0),b(45)]);
+ assert.equal(latest.reason,'TIME_EXIT');assert.equal(latest.time,'2026-10-09T11:30:00.000Z');assert.equal(latest.executed,100.3*.998);
+ assert.ok(Math.abs(latest.pnl-(100.3*.998*10*.998-1002))<1e-9);
+ assert.equal(exitPlan(t,[b(0),b(15,{high:110}),b(75)]).reason,'TP_NET_3_PCT');
+ assert.equal(exitPlan(t,[b(0),b(15,{low:90,high:110}),b(75)]).reason,'STOP_NET_1_5_PCT');
+});
