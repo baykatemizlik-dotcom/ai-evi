@@ -1,0 +1,33 @@
+name: BIST Approved Candidate Monitor
+on:
+  schedule:
+    - cron: '2-57/5 7-15 * * 1-5'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - bridge/bist_monitor.py
+      - tests/test_bist_monitor.py
+      - .github/workflows/bist_monitor.yml
+permissions:
+  contents: read
+concurrency:
+  group: bist-target-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install existing bridge dependencies
+        run: python3 -m pip install --disable-pip-version-check -r bridge/requirements.txt
+      - name: Verify targeted monitoring
+        run: python3 -m unittest discover -s tests -p 'test_bist_monitor.py'
+      - name: Monitor approved candidates and open paper positions every minute
+        env:
+          BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
+          BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
+        run: python3 bridge/bist_monitor.py --watch
