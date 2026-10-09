@@ -101,15 +101,17 @@ const scanUniverse=async(env)=>{
 const loadBridgeUniverse=async(env)=>{const r=await env.DB.prepare("SELECT symbol FROM bist_universe WHERE active=1 AND market IN ('YILDIZ','ANA') AND liquidity_tl>30000000 ORDER BY liquidity_tl DESC LIMIT 1000").all();return r.results.map(x=>x.symbol)};
 const bridgeBars=async(env,symbol,interval)=>{const r=await env.DB.prepare("SELECT bar_time,open,high,low,close,volume,received_at FROM bist_bridge_bars WHERE symbol=? AND interval=? ORDER BY bar_time DESC LIMIT 90").bind(symbol,interval).all();const rows=r.results.reverse();if(rows.length<30)throw Error("BRIDGE_INSUFFICIENT_BARS");const last=rows.at(-1);if(Date.now()-Date.parse(last.bar_time)>4*86400000||Date.now()-Date.parse(last.received_at)>4*86400000)throw Error("BRIDGE_STALE");return rows.map(x=>({t:Math.floor(Date.parse(x.bar_time)/1000),o:x.open,h:x.high,l:x.low,c:x.close,v:x.volume}))};
 // Optional licensed Twelve Data provider: ingest a bounded number per run, never invent OHLCV.
+const TWELVE_PILOT_SYMBOLS="THYAO,ASELS,TUPRS,BIMAS,AKBNK,GARAN,ISCTR,KCHOL,SAHOL,SISE,EREGL,TCELL,TTKOM,PGSUS,TOASO,FROTO,ENKAI,KOZAL,ASTOR,TAVHL".split(",");
 const ingestTwelve=async(env,interval="1day",limit=4)=>{
  if(!env.TWELVE_DATA_API_KEY)return {status:"NOT_CONFIGURED",fetched:0,errors:[]};
  const q=await env.DB.prepare("SELECT symbol FROM bist_universe WHERE active=1 AND market IN ('YILDIZ','ANA') AND liquidity_tl>30000000 ORDER BY symbol LIMIT 1000").all();
- const names=(q.results||[]).map(x=>x.symbol);
- if(!names.length)return {status:"NO_VERIFIED_UNIVERSE",fetched:0,errors:[]};
+ const names=(q.results||[]).map(x=>x.symbol).filter(x=>TWELVE_PILOT_SYMBOLS.includes(x));
+ const pilot=names.length?names:TWELVE_PILOT_SYMBOLS;
+ if(!pilot.length)return {status:"NO_PILOT_SYMBOLS",fetched:0,errors:[]};
  // Rotate through the verified universe over time without exceeding bounded daily provider limits.
  const day=new Date().toISOString().slice(0,10),cursor=await env.DB.prepare("SELECT value FROM bist_settings WHERE key=?").bind("TWELVE_CURSOR_"+interval).first();
- const start=Math.max(0,Number(cursor?.value||0))%names.length;
- const symbols=Array.from({length:Math.min(limit,names.length)},(_,i)=>names[(start+i)%names.length]);
+ const start=Math.max(0,Number(cursor?.value||0))%pilot.length;
+ const symbols=Array.from({length:Math.min(limit,3,pilot.length)},(_,i)=>pilot[(start+i)%pilot.length]);
  let fetched=0;const errors=[];
  for(const symbol of symbols){
    try{
@@ -135,11 +137,11 @@ const ingestTwelve=async(env,interval="1day",limit=4)=>{
      if(entries.length){await env.DB.batch(entries);fetched++}
    }catch(e){errors.push({symbol,error:String(e.message||e).slice(0,100)});if(String(e.message||e).includes("429")||String(e.message||e).includes("API credits"))break}
  }
- await env.DB.prepare("INSERT INTO bist_settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind("TWELVE_CURSOR_"+interval,String((start+fetched+errors.length)%names.length),new Date().toISOString()).run();
+ await env.DB.prepare("INSERT INTO bist_settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind("TWELVE_CURSOR_"+interval,String((start+symbols.length)%pilot.length),new Date().toISOString()).run();
  return {status:errors.length?"PARTIAL_OR_BLOCKED":"FETCH_DONE",requested:symbols.length,fetched,errors,day};
 };
 const nightRadar=async(env)=>{
- const provider=await ingestTwelve(env,"1day",4);
+ const provider=await ingestTwelve(env,"1day",2);
  const names=await loadBridgeUniverse(env);
  const date=new Intl.DateTimeFormat("sv-SE",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
  const kap=await kapPreflight(env),candidates=[],errors=[];
@@ -380,7 +382,7 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
    let status="BLOCKED_MISSING_VERIFIED_FEED",results=[],kap={ready:false};
    if(phase==="NIGHT_WATCH"){await nightRadar(env);return}
    if(phase==="INTRADAY_SCAN"){
-     const provider=await ingestTwelve(env,"15min",4);
+     const provider=await ingestTwelve(env,"15min",3);
      const symbols=await loadBridgeUniverse(env);
      kap=await kapPreflight(env);
      for(const symbol of symbols){
@@ -393,7 +395,7 @@ for(const [id,mode] of [['plain','plain'],['ground','grounding']])document.getEl
          await env.DB.prepare("INSERT INTO watchlist_pool(trade_day,symbol,source,verified,created_at,strategy,metrics_json,radar_status,updated_at) VALUES(?,?,?,0,?,'SCALP',?,'RADAR_ONLY',?) ON CONFLICT(trade_day,symbol) DO UPDATE SET metrics_json=excluded.metrics_json,updated_at=excluded.updated_at,radar_status='RADAR_ONLY'").bind(tradeDay,symbol,"Bridge D1 intraday / unverified",new Date().toISOString(),JSON.stringify(m),new Date().toISOString()).run();
        }catch(e){const reason=String(e.message||e);console.log("FEED_SKIP",symbol,reason.slice(0,80));if(reason==="YAHOO_HTTP_429")break}
      }
-     status=kap.ready?"TECHNICAL_RADAR_KAP_UNVERIFIED":"TECHNICAL_RADAR_KAP_BLOCKED";
+     status=!symbols.length||results.length===0?"BLOCKED_MARKET_DATA_UNAVAILABLE":kap.ready?"TECHNICAL_RADAR_KAP_UNVERIFIED":"TECHNICAL_RADAR_KAP_BLOCKED";
    }else status="BLOCKED_MISSING_VERIFIED_FEED";
    try{
     await env.DB.prepare("INSERT OR IGNORE INTO bist_scan_runs(run_id,phase,status,created_at,details) VALUES(?,?,?,?,?)")
