@@ -1,0 +1,25 @@
+name: BIST One-time 25000 TL Paper Start
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [bridge/start_demo_20261012.py, .github/workflows/bist_demo_start.yml]
+permissions:
+  contents: read
+concurrency:
+  group: bist-demo-epoch-reset
+  cancel-in-progress: false
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: python3 -m pip install --disable-pip-version-check -r bridge/requirements.txt
+      - name: Apply archived paper reset once and verify fresh cash
+        env:
+          BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
+          BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
+        run: python3 bridge/start_demo_20261012.py

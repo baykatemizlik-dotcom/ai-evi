@@ -50,6 +50,11 @@ export default {async fetch(request,env){
  if(u.pathname==='/bist/ai/decisions')return reply({decisions:(await env.DB.prepare('SELECT symbol,bar_time,model,status,reason,completed_at,confidence,input_tokens,output_tokens FROM bist_ai_decisions ORDER BY created_at DESC LIMIT 100').all()).results});
  if(u.pathname==='/bist/report'){const report=await dailyReport(env.DB);const audit=await env.DB.prepare('SELECT * FROM bist_external_audits ORDER BY trt_date DESC LIMIT 1').first();return reply({...report,external_audit:audit?{...audit,report:JSON.parse(audit.report_json)}:null});}
  if(u.pathname==='/bist/overview')return reply({...await isolatedOverview(env.DB),gemini:await geminiStatus(env)});
+ if(u.pathname==='/bist/demo/start-20261012'){
+  if(request.method!=='POST')return reply({error:'METHOD_NOT_ALLOWED'},405);
+  if(request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);
+  try{return await startDemo20261012(request,env);}catch{return reply({error:'DEMO_START_FAILED',retry_safe:true},503);}
+ }
  if(u.pathname==='/bist/strategy/berker3'){if(request.method==='POST'&&request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);try{return await berker3Route(request,env);}catch{return reply({error:'LIST_UPDATE_FAILED'},503);}}
  if(u.pathname==='/bist/strategy/close'){
   if(request.method!=='POST')return reply({error:'METHOD_NOT_ALLOWED'},405);
