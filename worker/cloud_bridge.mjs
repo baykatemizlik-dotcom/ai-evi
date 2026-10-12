@@ -39,8 +39,8 @@ export function validate(data, now=Date.now()) {
  if(symbols.size!==1)throw Error('ONE_SYMBOL_PER_REQUEST');
  return {purpose:data.purpose||'MONITOR',run_id:data.run_id||null,source:data.source,feed_type:data.feed_type,bars:bars.sort((a,b)=>a.time.localeCompare(b.time))};
 }
-export function entryPlan(cash, price) {
- const executed=price*1.002, qty=Math.floor(Math.min(1250,cash)/(executed*1.002));
+export function entryPlan(cash, price, slotBudget=1250) {
+ const executed=price*1.002, qty=Math.floor(Math.min(slotBudget,cash)/(executed*1.002));
  return {qty,executed,commission:executed*qty*.002};
 }
 export function exitPlan(trade, bars) {

@@ -38,8 +38,8 @@ function validate(data, now=Date.now()) {
  if(symbols.size!==1)throw Error('ONE_SYMBOL_PER_REQUEST');
  return {purpose:data.purpose||'MONITOR',run_id:data.run_id||null,source:data.source,feed_type:data.feed_type,bars:bars.sort((a,b)=>a.time.localeCompare(b.time))};
 }
-function entryPlan(cash, price) {
- const executed=price*1.002, qty=Math.floor(Math.min(1250,cash)/(executed*1.002));
+function entryPlan(cash, price, slotBudget=1250) {
+ const executed=price*1.002, qty=Math.floor(Math.min(slotBudget,cash)/(executed*1.002));
  return {qty,executed,commission:executed*qty*.002};
 }
 function exitPlan(trade, bars) {
@@ -506,7 +506,7 @@ async function fillStrategy(db,strategy,now){const table=QUEUES[strategy];if(!ta
    // For an already approved scalp, do not require another breakout candle.
    const m=JSON.parse(q.metrics_json);if(quote.price<=m.resistance||quote.price<=m.vwap){await db.prepare(`UPDATE ${table} SET status='INVALID',reason='BREAKOUT_OR_VWAP_LOST' WHERE signal_key=? AND status='READY'`).bind(q.signal_key).run();continue;}
   }else{const {hour,daily}=await trendHistories(db,q.symbol,now),m=trendSignal(hour,daily,await symbolBars(db,q.symbol,now),now);if(!m||quote.price<=m.vwap||quote.price<=m.ema200_hour){await db.prepare(`UPDATE ${table} SET status='INVALID',reason='TREND_RECHECK_FAILED' WHERE signal_key=? AND status='READY'`).bind(q.signal_key).run();continue;}stop=m.initial_stop;if(quote.price<=stop)continue;}
-  const account=await db.prepare('SELECT available_cash FROM paper_cash_accounts WHERE strategy=?').bind(strategy).first(),plan=entryPlan(account?.available_cash||0,quote.price);if(plan.qty<2)continue;
+  const account=await db.prepare('SELECT initial_cash,available_cash FROM paper_cash_accounts WHERE strategy=?').bind(strategy).first(),plan=entryPlan(account?.available_cash||0,quote.price,Math.max(0,Number(account?.initial_cash||0)/2));if(plan.qty<2)continue;
   try{const key=(strategy==='SCALP'?'SCALP:':'TREND:')+q.signal_key;const r=await db.prepare(`INSERT INTO virtual_trades(strategy,symbol,signal_price,executed_price,lot_count,commission,entry_time,status,slot_id,feed_entry_key,engine_version,remaining_lots,tp1_done,trailing_stop,entry_quote_time,entry_observed_at) VALUES(?,?,?,?,?,?,?,'OPEN',?,?,2,?,0,?,?,?) ON CONFLICT(feed_entry_key) DO NOTHING`).bind(strategy,q.symbol,quote.price,plan.executed,plan.qty,plan.commission,iso(now),slot,key,plan.qty,stop,quote.quote_time,iso(now)).run();opened+=r.meta.changes;}catch(e){if(!/PAPER_SLOT_BUSY|PAPER_INSUFFICIENT_CASH|PAPER_SIGNAL_NOT_ELIGIBLE|PAPER_QUOTE_OR_RISK_INVALID/.test(String(e)))throw e;}
  }return {opened};
 }
@@ -555,7 +555,7 @@ async function isolatedOverview(db,now=Date.now()){
  const accounts=Object.fromEntries((cash.results||[]).map(x=>[x.strategy,x.available_cash])),trades=(open.results||[]).map(t=>{const qty=t.remaining_lots??t.lot_count,unit=t.executed_price+t.commission/t.lot_count,price=t.current_price||t.executed_price;const q={price,quote_time:t.quote_time,source:'YAHOO_INDICATIVE'};return {...t,remaining_lots:qty,current_price:price,quote_fresh:usableQuote(q,now),quote_age_minutes:t.quote_time?Math.max(0,(now-Date.parse(t.quote_time))/60000):null,unrealised_net:price*qty*.998*.998-unit*qty,unrealised_pct:100*(price*.998*.998/unit-1),elapsed_minutes:Math.max(0,(now-Date.parse(t.entry_time))/60000),runner_active: t.strategy==='SCALP'&&!!t.tp1_done,remaining_minutes:Math.max(0,((t.strategy==='SCALP'&&t.tp1_done?Date.parse(trtDate(Date.parse(t.entry_time))+'T14:40:00.000Z'):Date.parse(t.entry_time)+3600000)-now)/60000),thresholds:strategyThresholds(t)};});
  const histories=[...(legs.results||[]),...(old.results||[]).map(t=>({...t,event_key:'legacy:'+t.id,observed_at:t.exit_time}))].sort((a,b)=>String(b.observed_at).localeCompare(String(a.observed_at)));
  const realised=await db.prepare("SELECT (SELECT COALESCE(SUM(pnl_net),0) FROM strategy_exit_legs)+(SELECT COALESCE(SUM(pnl_net),0) FROM virtual_trades WHERE status='CLOSED' AND engine_version=1) pnl").first();
- return {...status,ai_signals:ai.results||[],watchlist:watch.results||[],approved:counts?.approved||0,candidates:status.stage1_hot||0,pending_entries:(scalp.results||[]).length+(trend.results||[]).length,total_capital:5000,equity:(accounts.SCALP||0)+(accounts.SWING||0)+trades.reduce((n,t)=>n+t.current_price*t.remaining_lots*.998*.998,0),equity_basis:'LAST_AVAILABLE_QUOTE_NET_LIQUIDATION_ESTIMATE',realised_pnl:realised?.pnl||0,scalp_cash:accounts.SCALP||0,swing_cash:accounts.SWING||0,open_trades:trades,exit_history:histories,closed_trades:histories,scalp_sniper_queue:scalp.results||[],trend_radar_queue:trend.results||[],scalp_slots:trades.filter(t=>t.strategy==='SCALP').length,trend_slots:trades.filter(t=>t.strategy==='SWING').length,engine_version:2};
+ return {...status,ai_signals:ai.results||[],watchlist:watch.results||[],approved:counts?.approved||0,candidates:status.stage1_hot||0,pending_entries:(scalp.results||[]).length+(trend.results||[]).length,total_capital:(cash.results||[]).reduce((n,a)=>n+Number(a.initial_cash),0),equity:(accounts.SCALP||0)+(accounts.SWING||0)+trades.reduce((n,t)=>n+t.current_price*t.remaining_lots*.998*.998,0),equity_basis:'LAST_AVAILABLE_QUOTE_NET_LIQUIDATION_ESTIMATE',realised_pnl:realised?.pnl||0,scalp_cash:accounts.SCALP||0,swing_cash:accounts.SWING||0,open_trades:trades,exit_history:histories,closed_trades:histories,scalp_sniper_queue:scalp.results||[],trend_radar_queue:trend.results||[],scalp_slots:trades.filter(t=>t.strategy==='SCALP').length,trend_slots:trades.filter(t=>t.strategy==='SWING').length,engine_version:2};
 }
 async function quoteIngest(request,env,now=Date.now()){
  let b;try{b=await boundedBody(request);}catch(e){return json({error:e.message},422);}

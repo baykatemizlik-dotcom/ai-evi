@@ -46,6 +46,17 @@ test('invalid Trend data, missing EMA200 and no provider quote fail closed; Work
  const html=await (await worker.fetch(new Request('https://example.test/'),{})).text();for(const script of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))new Script(script[1]);for(const id of ['scalpRoom','trendRoom','scalpQueue','trendQueue','historyRows'])assert.ok(html.includes('id="'+id+'"'));
 });
 
+test('25k demo capital: two 6250 TL scalp slots, dynamic overview and unchanged cash guards',async()=>{const {db,clean}=database();try{
+ await db.prepare('UPDATE paper_cash_accounts SET initial_cash=12500,available_cash=12500').run();
+ for(const symbol of ['THYAO','TUPRS']){await scalpQueue(db,symbol);await quote(db,symbol,100);}
+ assert.equal((await fillStrategy(db,'SCALP',now)).opened,2);
+ const rows=(await db.prepare("SELECT * FROM virtual_trades WHERE status='OPEN'").all()).results;
+ assert.equal(rows.length,2);assert.ok(rows.every(t=>t.lot_count===62&&t.executed_price*t.lot_count+t.commission<=6250));
+ const overview=await isolatedOverview(db,now);assert.equal(overview.total_capital,25000);
+ assert.ok(overview.scalp_cash>=0&&overview.scalp_cash<100);assert.equal(overview.swing_cash,12500);
+ await scalpQueue(db,'ASELS');await quote(db,'ASELS',100);assert.equal((await fillStrategy(db,'SCALP',now)).opened,0);
+}finally{clean();}});
+
 test('post TP1 two completed lows ratchet stop; later gap sells only the remainder',async()=>{const {db,clean}=database();try{
  const t=await trendFixture(db);const bars=[{time:iso(now),open:111,high:122,low:110.8,close:120,volume:1e6},{time:iso(now+3600000),open:120,high:123,low:119,close:122,volume:1e6},{time:iso(now+7200000),open:122,high:124,low:120,close:123,volume:1e6}];
  await db.prepare("INSERT INTO trend_bars SELECT 'ASTOR','60m',json_extract(value,'$.time'),json_extract(value,'$.open'),json_extract(value,'$.high'),json_extract(value,'$.low'),json_extract(value,'$.close'),json_extract(value,'$.volume'),'YAHOO_INDICATIVE',? FROM json_each(?)").bind(iso(now+10800000),JSON.stringify(bars)).run();await manageTrend(db,now+10800000);let state=await db.prepare('SELECT * FROM virtual_trades WHERE id=?').bind(t.id).first();assert.equal(state.tp1_done,1);assert.equal(state.remaining_lots,6);assert.equal(state.trailing_stop,119);assert.equal(state.status,'OPEN');
