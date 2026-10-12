@@ -49,6 +49,10 @@ export default {async fetch(request,env){
    return await ingest(request,env);}catch{return reply({error:'INGEST_OR_ENGINE_FAILED',retry_safe:true},503);}
  }
  if(!authenticated)return reply({error:"Unauthorized"},401);
+ if(u.pathname==='/bist/opportunities'){
+  if(request.method!=='GET')return reply({error:'METHOD_NOT_ALLOWED'},405);
+  try{return reply(await opportunitiesOverview(env.DB,u.searchParams.get('date')||trtDate(Date.now())));}catch{return reply({error:'OPPORTUNITIES_UNAVAILABLE'},503);}
+ }
  if(u.pathname==='/bist/trials'){
   if(request.method!=='GET')return reply({error:'METHOD_NOT_ALLOWED'},405);
   try{return reply(await trialOverview(env.DB));}catch{return reply({error:'TRIAL_STATUS_UNAVAILABLE'},503);}

@@ -105,7 +105,7 @@ test('AI uses strict schema, fixed endpoint, no redirects and fails closed on ma
 test('entire six-candidate pool reviewed; rejections excluded and retries never call AI again',async()=>{
  const {mkdtempSync,rmSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');const {execFileSync}=await import('node:child_process');
  const {finalize}=await import('../worker/cloud_bridge.mjs');const dir=mkdtempSync(join(tmpdir(),'bist-ai-')),path=join(dir,'db.sqlite');
- const adapter=new URL('./funnel_sqlite.py',import.meta.url).pathname;const call=data=>JSON.parse(execFileSync('python3',[adapter,path],{input:JSON.stringify(data),encoding:'utf8'}));call({init:true});
+ const adapter=new URL('./funnel_sqlite.py',import.meta.url).pathname;const call=data=>JSON.parse(execFileSync('python3',[adapter,path],{input:JSON.stringify(data),encoding:'utf8'}));call({init:true});for(const symbol of ['TEST0','TEST1','TEST2','TEST3','TEST4','TEST5'])call({statements:[{sql:'INSERT INTO strategy_market_context VALUES(?,?,?,?,?)',params:[symbol,'2026-10-09',100,'2026-10-08T07:00:00Z','2026-10-09T07:00:00Z']}]});
  const db={prepare(sql){return {sql,params:[],bind(...p){this.params=p;return this;},async all(){return call({statements:[this]})[0];},async first(){return (await this.all()).results[0]||null;},async run(){return await this.all();}};},async batch(statements){return call({statements});}};
  try{
   const previous=Array.from({length:20},()=>({...bar,open:99,high:100,low:98,close:99,volume:1000000}));const metrics=JSON.stringify(technicalSignal([...previous,{...bar,open:100,high:104,low:100,close:103.5,volume:2000000}]));

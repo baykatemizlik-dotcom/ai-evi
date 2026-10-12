@@ -1,3 +1,4 @@
+import {saveMarketContext,captureOpportunity,scalpPremiumGuard,capturePremium,highMomentumRadar} from './opportunities.mjs';
 import {tickStrategies,fillStrategy,enqueueScalp,strategyMonitor,saveQuote} from './strategy_engines.mjs';
 // Market data is ingress-only. The only outbound request is the OpenAI paper referee.
 export const validSymbol = symbol => typeof symbol==='string' && /^[A-Z0-9]{3,6}$/.test(symbol);
@@ -128,7 +129,7 @@ export async function dailyReport(db,now=Date.now()){
   db.prepare("SELECT strategy,COUNT(*) exits,SUM(pnl_net) pnl,SUM(CASE WHEN pnl_net>0 THEN 1 ELSE 0 END) wins FROM strategy_exit_legs WHERE datetime(exit_time,'+3 hours') BETWEEN ? AND ? GROUP BY strategy").bind(start.replace('T',' '),end.replace('T',' ')).all(),
   db.prepare("SELECT status,COUNT(*) n,SUM(input_tokens) input_tokens,SUM(output_tokens) output_tokens FROM bist_ai_decisions WHERE substr(datetime(created_at,'+3 hours'),1,10)=? GROUP BY status").bind(date).all(),
   db.prepare('SELECT strategy,available_cash FROM paper_cash_accounts').all(),db.prepare("SELECT 'SCALP' strategy,status,COUNT(*) n FROM scalp_sniper_queue GROUP BY status UNION ALL SELECT 'SWING',status,COUNT(*) n FROM trend_radar_queue GROUP BY status").all()]);
- const report={trt_date:date,generated_at:new Date(now).toISOString(),paper_only:true,trades:trades.results,ai:ai.results,cash:cash.results,standby:queue.results};
+ const report={trt_date:date,generated_at:new Date(now).toISOString(),paper_only:true,high_momentum_radar:await highMomentumRadar(db,now),trades:trades.results,ai:ai.results,cash:cash.results,standby:queue.results};
  await db.prepare('INSERT INTO bist_daily_reports(trt_date,generated_at,report_json) VALUES(?,?,?) ON CONFLICT(trt_date) DO UPDATE SET generated_at=excluded.generated_at,report_json=excluded.report_json').bind(date,report.generated_at,JSON.stringify(report)).run();return report;
 }
 
@@ -164,14 +165,20 @@ export async function ingest(request, env, now=Date.now()) {
  const active=fresh({...latest,feed_type:data.feed_type},now);
  // Save only the independently timestamped provider quote. A bar close is not a live quote.
  await saveQuote(env.DB,symbol,body.quote,now);
+ await saveMarketContext(env.DB,symbol,body.previous_session_close,now);
  const engines=await tickStrategies(env.DB,now),engine=engines.scalp,sniper=engines.trend,session={scalp_close_at:'17:40',trend_overnight:true};
  let stage2='NOT_HOT';
  if(active && data.purpose==='HOT_CANDIDATE' && validRunId(data.run_id)) {
   const rows=await env.DB.prepare("SELECT * FROM bist_bridge_bars WHERE symbol=? AND source='YAHOO_INDICATIVE' AND interval='15m' AND bar_time<=? AND CAST(strftime('%s',bar_time) AS INTEGER)%900=0 ORDER BY bar_time DESC LIMIT 100").bind(symbol,latest.time).all();
-  const metrics=technicalSignal((rows.results||[]).reverse());
+  const history=(rows.results||[]).reverse(),metrics=technicalSignal(history),hot=stageOneMetrics(history);
+  if(hot)await captureOpportunity(env.DB,'SCALP',symbol,symbol+':'+latest.time,'HOT',latest.time,{...hot,last_candle:latest},now);
   if(!await restrictionClear(env.DB,symbol,now))stage2='BLOCKED_RESTRICTIONS';
-  else if(metrics){await env.DB.prepare('INSERT OR IGNORE INTO bist_funnel_candidates(run_id,symbol,bar_time,observed_at,score,metrics_json) VALUES(?,?,?,?,?,?)')
-   .bind(data.run_id,symbol,latest.time,received,metrics.score,JSON.stringify(metrics)).run();stage2='MOMENTUM_PASSED';}
+  else if(metrics){const quote=await env.DB.prepare('SELECT * FROM strategy_quotes WHERE symbol=?').bind(symbol).first();
+   const guard=await scalpPremiumGuard(env.DB,symbol,Math.max(latest.close,quote?.price||0),now);metrics.daily_change_pct=guard.daily_change_pct;metrics.decision_hour_trt=+trtParts(now).hour;metrics.premium_guard=guard.reason||null;
+   await env.DB.prepare('INSERT OR IGNORE INTO bist_funnel_candidates(run_id,symbol,bar_time,observed_at,score,metrics_json) VALUES(?,?,?,?,?,?)')
+   .bind(data.run_id,symbol,latest.time,received,metrics.score,JSON.stringify(metrics)).run();
+   if(guard.blocked){await capturePremium(env.DB,symbol,symbol+':'+latest.time,latest.time,metrics,guard,now);stage2=guard.reason==='MORNING_PREMIUM_6_5'?'REJECTED_HIGH_PREMIUM':'BLOCKED_PREVIOUS_CLOSE_MISSING';}
+   else stage2='MOMENTUM_PASSED';}
   else stage2='MOMENTUM_REJECTED';
  }
  return json({ok:true,status:active?'ACTIVE':'BLOCKED_MARKET_DATA_UNAVAILABLE',bar_time:latest.time,
@@ -221,6 +228,7 @@ export async function geminiDecision(request,env,now=Date.now()){
   r=await env.DB.prepare('SELECT * FROM bist_funnel_risk WHERE symbol=?').bind(b.symbol).first();
   if(!c||!fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now)||!await restrictionClear(env.DB,b.symbol,now)||JSON.parse(c.metrics_json).daily_turnover_tl_estimate<MIN_DAILY_TURNOVER_TL)return json({error:'GEMINI_CANDIDATE_NOT_ELIGIBLE'},409);
  }
+ if(c){const quote=await env.DB.prepare('SELECT * FROM strategy_quotes WHERE symbol=?').bind(c.symbol).first();const m=JSON.parse(c.metrics_json),guard=await scalpPremiumGuard(env.DB,c.symbol,Math.max(m.last_candle?.close||0,quote?.price||0),now);if(guard.blocked){await capturePremium(env.DB,c.symbol,key,c.bar_time,m,guard,now);return json({error:guard.reason,status:'REJECTED'},409);}}
  const cached=await env.DB.prepare('SELECT * FROM bist_gemini_decisions WHERE signal_key=?').bind(key).first();
  if(request.method==='GET')return json({cached:cached?.model===GEMINI_MODEL?cached:null,candidate:c?{symbol:c.symbol,bar_time:c.bar_time,metrics:JSON.parse(c.metrics_json),vbts:r}:null,model:GEMINI_MODEL});
  if(cached&&cached.model===GEMINI_MODEL&&cached.status!=='ERROR')return json({ok:true,cached:true,status:cached.status});
@@ -249,7 +257,7 @@ export async function aiVerdict(env,candidate,risk,network=(...args)=>globalThis
    method:'POST',redirect:'manual',signal:controller.signal,
    headers:{Authorization:'Bearer '+apiKey,'Content-Type':'application/json'},
    body:JSON.stringify({model:AI_MODEL,temperature:0,max_completion_tokens:200,
-    messages:[{role:'system',content:'Sanal BIST scalp teknik tetik hakemisin. Sadece verilen doğrulanmış sayısal veriyi değerlendir. RVOL>=2, yeşil mum, gövde>=0.60, üst fitil<=0.20, 20-bar breakout ve seans VWAP üstü kapanış gereklidir. Resmi VBTS/tedbir listesi güncel ve uygun değilse onay verme. Haber/ceza/mutlak manipülasyon yokluğu için dış araştırma yapılmadı; bunu uydurma, kesin güvence verme. OHLCV wash trade kanıtı değildir. Veriler tutarsız/eksikse veya teknik kırılım zayıfsa onay=false. Diğer durumda teknik sanal takip için onay verebilirsin. Kısa Türkçe neden ve 0-100 arasında guven skoru yaz. Guven bir model değerlendirmesidir, kalibre edilmiş başarı olasılığı değildir. Gerçek emir verme, gelecekteki bar hakkında tahmin uydurma.'},
+    messages:[{role:'system',content:'Sanal BIST scalp teknik tetik hakemisin. Sadece verilen doğrulanmış sayısal veriyi değerlendir. RVOL>=2, yeşil mum, gövde>=0.60, üst fitil<=0.20, 20-bar breakout ve seans VWAP üstü kapanış gereklidir. Saat 13:00 TRT öncesi daily_change_pct >= 6.50 ise otomatik işlem için reddet; ayrı Yüksek Prim radarı izler. Önceki işlem günü kapanışı eksikse sabah giriş onayı verme. Resmi VBTS/tedbir listesi güncel ve uygun değilse onay verme. Haber/ceza/mutlak manipülasyon yokluğu için dış araştırma yapılmadı; bunu uydurma, kesin güvence verme. OHLCV wash trade kanıtı değildir. Veriler tutarsız/eksikse veya teknik kırılım zayıfsa onay=false. Diğer durumda teknik sanal takip için onay verebilirsin. Kısa Türkçe neden ve 0-100 arasında guven skoru yaz. Guven bir model değerlendirmesidir, kalibre edilmiş başarı olasılığı değildir. Gerçek emir verme, gelecekteki bar hakkında tahmin uydurma.'},
      {role:'user',content:JSON.stringify({symbol:candidate.symbol,bar_time:candidate.bar_time,metrics:m,green_candle:true,breakout_passed:true,vwap_passed:true,
       vbts:{eligible:risk.eligible===1,source:risk.source,as_of:risk.as_of,valid_until:risk.valid_until},other_penalty_news_checked:false})}],
     response_format:{type:'json_schema',json_schema:{name:'bist_paper_verdict',strict:true,schema:{type:'object',properties:{onay:{type:'boolean'},neden:{type:'string'},guven:{type:'integer',minimum:0,maximum:100}},required:['onay','neden','guven'],additionalProperties:false}}}})
@@ -292,7 +300,7 @@ export async function finalize(request,env,now=Date.now(),network=(...args)=>glo
   ORDER BY c.score DESC,c.symbol ASC`).bind(b.run_id,new Date(now).toISOString(),new Date(now-50*60000).toISOString()).all();
  // No candidate-count cap: five concurrent calls are transport throttling only.
  const candidates=[];
- for(const c of rows.results||[]){const m=JSON.parse(c.metrics_json);if(fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now)&&Number.isFinite(m.daily_turnover_tl_estimate)&&m.daily_turnover_tl_estimate>=MIN_DAILY_TURNOVER_TL&&await env.DB.prepare("SELECT signal_key FROM bist_gemini_decisions WHERE signal_key=? AND status='APPROVED' AND model=?").bind(c.symbol+':'+c.bar_time,GEMINI_MODEL).first())candidates.push(c);}
+ for(const c of rows.results||[]){const m=JSON.parse(c.metrics_json),q=await env.DB.prepare('SELECT * FROM strategy_quotes WHERE symbol=?').bind(c.symbol).first(),guard=await scalpPremiumGuard(env.DB,c.symbol,Math.max(m.last_candle?.close||0,q?.price||0),now);if(guard.blocked){await capturePremium(env.DB,c.symbol,c.symbol+':'+c.bar_time,c.bar_time,m,guard,now);continue;}if(fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now)&&Number.isFinite(m.daily_turnover_tl_estimate)&&m.daily_turnover_tl_estimate>=MIN_DAILY_TURNOVER_TL&&await env.DB.prepare("SELECT signal_key FROM bist_gemini_decisions WHERE signal_key=? AND status='APPROVED' AND model=?").bind(c.symbol+':'+c.bar_time,GEMINI_MODEL).first())candidates.push(c);}
  const decisions=new Array(candidates.length);let cursor=0;
  await Promise.all(Array.from({length:Math.min(5,candidates.length)},async()=>{
   while(cursor<candidates.length){const index=cursor++;decisions[index]=await judgeCandidate(env,candidates[index],now,network);}

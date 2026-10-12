@@ -108,6 +108,21 @@ def yahoo(symbol, now, with_quote=False):
         quote={'symbol':symbol,'price':quote_price,'quote_time':dt.datetime.fromtimestamp(provider_time,UTC).isoformat(timespec='milliseconds').replace('+00:00','Z'),'source':'YAHOO_INDICATIVE'}
     return {'bars':bars,'quote':quote,'source':'YAHOO_INDICATIVE','feed_type':'INDICATIVE_INTRADAY'}
 
+def previous_session_close(symbol,now):
+    # chartPreviousClose on a 5d intraday chart is the range's start, not yesterday.
+    data=request_json('https://query1.finance.yahoo.com/v8/finance/chart/'+symbol+'.IS?'+urllib.parse.urlencode({'interval':'1d','range':'10d','includePrePost':'false'}))
+    result=(data.get('chart') or {}).get('result') or []
+    if not result:raise FeedError('PREVIOUS_SESSION_CLOSE_MISSING')
+    x=result[0];meta=x.get('meta',{})
+    if meta.get('currency')!='TRY' or meta.get('instrumentType')!='EQUITY':raise FeedError('INVALID_PREVIOUS_CLOSE_SOURCE')
+    today=dt.datetime.fromtimestamp(now,TRT).date();closes=((x.get('indicators') or {}).get('quote') or [{}])[0].get('close') or []
+    rows=[(t,closes[i]) for i,t in enumerate(x.get('timestamp') or []) if i<len(closes) and isinstance(t,(int,float)) and t<=now and dt.datetime.fromtimestamp(t,TRT).date()<today and isinstance(closes[i],(int,float)) and not isinstance(closes[i],bool) and math.isfinite(closes[i]) and closes[i]>0]
+    if not rows:raise FeedError('PREVIOUS_SESSION_CLOSE_MISSING')
+    t,close=max(rows)
+    if now-t>7*86400:raise FeedError('PREVIOUS_SESSION_CLOSE_STALE')
+    return {'close':close,'bar_time':dt.datetime.fromtimestamp(t,UTC).isoformat(timespec='milliseconds').replace('+00:00','Z'),'source':'YAHOO_INDICATIVE'}
+
+
 def twelve(symbol, now, key):
     # XIST is documented EOD: this fallback imports history, never marks it live.
     data = request_json('https://api.twelvedata.com/time_series?' +
@@ -172,6 +187,7 @@ def evaluate_with_gemini(symbol, metrics):
                 'RVOL>=2, yeşil mum, gövde>=0.60, üst fitil<=0.20, seans VWAP üstü, 20 bar kırılımı ve '+
                 'kapanmış seans barlarından tahmini hacim>=40000000 TL gereklidir. Resmi VBTS uygun olmalı. '+
                 'Eksik/tutarsız veride reddet. Haber veya wash trade yokluğu uydurma; dış arama yapma. '+
+                'Saat 13:00 TRT öncesi günlük prim >=%6.50 ise işlem için REJECT et; ayrı yüksek prim radarında izlenir. Günlük prim önceki işlem günü kapanışına göre hesaplanır. '+
                 'Güven başarı olasılığı değildir. PROBE yalnız bağlantı testidir, işlem onayı değildir. '+
                 json.dumps({'symbol':symbol,'data':metrics},ensure_ascii=False,allow_nan=False),
                 config={'response_mime_type':'application/json','response_json_schema':schema,
@@ -279,7 +295,10 @@ def main():
     posted=0;gemini_candidates=[]
     for symbol in sorted(hot_symbols):
         try:
-            result=worker_call('/bist/feed/ingest',{**fetched[symbol],'run_id':run_id,'purpose':'HOT_CANDIDATE'})
+            context=None
+            try:context=previous_session_close(symbol,time.time())
+            except FeedError:print('PREVIOUS_CLOSE_WAIT',symbol,flush=True)
+            result=worker_call('/bist/feed/ingest',{**fetched[symbol],'previous_session_close':context,'run_id':run_id,'purpose':'HOT_CANDIDATE'})
             posted+=1;print(symbol,'stage2=',result.get('stage2'),'engine=',result.get('engine'))
             if result.get('stage2')=='MOMENTUM_PASSED':
                 gemini_candidates.append((symbol,result['bar_time']))

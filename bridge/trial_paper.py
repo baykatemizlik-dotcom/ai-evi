@@ -188,6 +188,9 @@ def main():
         elif now-(latest-180)*60>35*60:s['status']='BLOCKED_STALE_DATA'
         else:
             s['status']='RUNNING_DELAYED_PAPER' if risk else 'BLOCKED_RISK_DATA'
+            diagnostics=dict(s.get('daily_diagnostics') or {})
+            if diagnostics.get('day')!=day:diagnostics={'day':day,'technical_pass':0,'risk_rejected':0,'model_rejected':0,'entry_candidates':0,'processed_minutes':0}
+            poll={'technical_pass':0,'risk_rejected':0,'model_rejected':0,'entry_candidates':0,'processed_minutes':0}
             minimum=max(s.get('cursor') or 0,s['source_start_minute'])
             for m in eligible_minutes:
                 if m<minimum or m<= (s.get('cursor') or 0):continue
@@ -198,8 +201,9 @@ def main():
                             f=features(sym,b,refs[sym],m,ratio)
                             if f:cache[m].append(f)
                 candidates=[]
+                poll['processed_minutes']+=1;poll['technical_pass']+=len(cache[m])
                 for f in cache[m]:
-                    if f['symbol'] not in risk:continue
+                    if f['symbol'] not in risk:poll['risk_rejected']+=1;continue
                     f=dict(f)
                     if f['source']=='INTRADAY':
                         ref=refs[f['symbol']];v=model_vector(f,ref,model['atr'])
@@ -208,12 +212,17 @@ def main():
                         primary=score is not None and score>=(.001 if model['atr'] else .003)
                         if model['atr']:primary=primary and .02<=v[9]<=1 and f['market_breadth']['ratio']>=.4 and v[12]>=-1 if v is not None else False
                         # V4QQ retains V4PT's entire schedule, not just opening bars.
-                        if not primary and not (model['atr'] and baseline>=.003):continue
+                        if not primary and not (model['atr'] and baseline>=.003):poll['model_rejected']+=1;continue
                         f['score']=score if primary else baseline
                     candidates.append(f)
                 candidates.sort(key=lambda f:('INTRADAY'!=f['source'] if m%1440!=602 else f['source']!='OPENING_MAIN',-f['score'],-f['turnover'],f['symbol']))
+                poll['entry_candidates']+=len(candidates)
                 s['candidates']+=len(candidates);reduce_minute(s,data,m,candidates,received)
             s['last_source_time']=stamp(latest)
+            for k,v in poll.items():diagnostics[k]=diagnostics.get(k,0)+v
+            s['daily_diagnostics']=diagnostics;s['last_poll_diagnostics']=poll
+            s['no_entry_reason']='MODEL_SCORE_BELOW_ENTRY_THRESHOLD' if poll['model_rejected'] else 'NO_TECHNICAL_CANDIDATE' if not poll['entry_candidates'] else 'CANDIDATES_EVALUATED'
+            s['entry_score_threshold']=.001 if model['atr'] else .003
         reconcile(s)
         result=worker_call('/bist/feed/trials',{'id':row['id'],'expected_revision':row['revision'],'state':s})
         print(json.dumps({'id':row['id'],'status':s['status'],'scanned':coverage,'fetch_failed':failures,'source':s.get('last_source_time'),'cash':s['cash'],'open':len(s['open_trades']),'closed':len(s['closed_trades']),'saved':result.get('ok')},allow_nan=False))

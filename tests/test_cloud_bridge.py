@@ -161,3 +161,15 @@ class ExternalReview(unittest.TestCase):
             self.assertEqual(worker.call_args.args[1]['status'],'MISSING_KEY')
 
 if __name__=='__main__':unittest.main()
+
+class PreviousSessionTests(unittest.TestCase):
+ def test_prior_trading_day_close_not_intraday_range_reference(self):
+  from unittest.mock import patch
+  import bist_sync as feed
+  now=1791795600
+  previous=1791527400
+  packet={'chart':{'result':[{'meta':{'currency':'TRY','instrumentType':'EQUITY','chartPreviousClose':80},'timestamp':[previous,now-3600],'indicators':{'quote':[{'close':[100,107]}]}}]}}
+  with patch.object(feed,'request_json',return_value=packet):
+   context=feed.previous_session_close('TUPRS',now)
+  self.assertEqual(context['close'],100)
+  self.assertLess(context['bar_time'][:10],'2026-10-12')

@@ -1,3 +1,4 @@
+import {scalpPremiumGuard,capturePremium,captureOpportunity,highMomentumRadar} from './opportunities.mjs';
 import {json,validSymbol,trtParts,trtDate,sessionOpen,entryPlan,restrictionClear,symbolBars,technicalSignal,feedStatus,GEMINI_MODEL} from './cloud_bridge.mjs';
 const iso=n=>new Date(n).toISOString();
 const QUEUES={SCALP:'scalp_sniper_queue',SWING:'trend_radar_queue'};
@@ -105,6 +106,8 @@ export async function fillStrategy(db,strategy,now){const table=QUEUES[strategy]
   const quote=await db.prepare('SELECT * FROM strategy_quotes WHERE symbol=?').bind(q.symbol).first();if(!usableQuote(quote,now)||!await restrictionClear(db,q.symbol,now))continue;
   let stop=null;
   if(strategy==='SCALP'){
+   const metrics=JSON.parse(q.metrics_json),guard=await scalpPremiumGuard(db,q.symbol,Math.max(quote.price,metrics.last_candle?.close||0),now);
+   if(guard.blocked){await capturePremium(db,q.symbol,q.signal_key,q.bar_time,metrics,guard,now);continue;}
    const g=await db.prepare("SELECT status FROM bist_gemini_decisions WHERE signal_key=? AND model=?").bind(q.signal_key,GEMINI_MODEL).first(),a=await db.prepare("SELECT status FROM bist_ai_decisions WHERE signal_key=? AND model='gpt-4o-mini'").bind(q.signal_key).first();if(g?.status!=='APPROVED'||a?.status!=='APPROVED')continue;
    // For an already approved scalp, do not require another breakout candle.
    const m=JSON.parse(q.metrics_json);if(quote.price<=m.resistance||quote.price<=m.vwap){await db.prepare(`UPDATE ${table} SET status='INVALID',reason='BREAKOUT_OR_VWAP_LOST' WHERE signal_key=? AND status='READY'`).bind(q.signal_key).run();continue;}
@@ -132,6 +135,7 @@ export async function trendIngest(request,env,now=Date.now()){
  const rows=[...hour,...daily];await env.DB.prepare(`INSERT INTO trend_bars SELECT json_extract(value,'$.symbol'),json_extract(value,'$.interval'),json_extract(value,'$.time'),json_extract(value,'$.open'),json_extract(value,'$.high'),json_extract(value,'$.low'),json_extract(value,'$.close'),json_extract(value,'$.volume'),'YAHOO_INDICATIVE',? FROM json_each(?) WHERE true ON CONFLICT(symbol,interval,bar_time) DO UPDATE SET open=excluded.open,high=excluded.high,low=excluded.low,close=excluded.close,volume=excluded.volume,received_at=excluded.received_at`).bind(iso(now),JSON.stringify(rows)).run();
  await saveQuote(env.DB,b.symbol,b.quote,now);
  const m=trendSignal(hour.map(x=>({...x,bar_time:x.time})),daily.map(x=>({...x,bar_time:x.time})),await symbolBars(env.DB,b.symbol,now),now);let queued=0;
+ if(m){await captureOpportunity(env.DB,'SWING',b.symbol,b.symbol+':'+m.bar_time,'HOT',m.bar_time,{...m,last_candle:hour.at(-1)},now);await captureOpportunity(env.DB,'SWING',b.symbol,b.symbol+':'+m.bar_time,'APPROVED',m.bar_time,{...m,last_candle:hour.at(-1)},now);}
  if(m&&strategyEntryWindow('SWING',now)&&await restrictionClear(env.DB,b.symbol,now)){
   const key=b.symbol+':'+m.bar_time,priority=await env.DB.prepare('SELECT priority FROM berker3_symbols WHERE symbol=? AND active=1').bind(b.symbol).first(),expiry=trtDate(now)+'T15:05:00.000Z';
   await env.DB.prepare("UPDATE trend_radar_queue SET status='EXPIRED',reason='SUPERSEDED' WHERE symbol=? AND signal_key<>? AND status='READY'").bind(b.symbol,key).run();
@@ -140,7 +144,7 @@ export async function trendIngest(request,env,now=Date.now()){
  return json({ok:true,queued,criteria_passed:!!m,engines:await tickStrategies(env.DB,now),paper_only:true});
 }
 export async function strategyMonitor(db,now=Date.now()){
- const r=await db.prepare(`SELECT symbol,strategy FROM virtual_trades WHERE status='OPEN' UNION SELECT symbol,'SCALP' FROM scalp_sniper_queue WHERE status='READY' AND expires_at>? UNION SELECT symbol,'SWING' FROM trend_radar_queue WHERE status='READY' AND expires_at>?`).bind(iso(now),iso(now)).all();const targets=r.results||[];return {symbols:[...new Set(targets.map(x=>x.symbol))],targets};
+ const r=await db.prepare(`SELECT symbol,strategy FROM virtual_trades WHERE status='OPEN' UNION SELECT symbol,'SCALP' FROM scalp_sniper_queue WHERE status='READY' AND expires_at>? UNION SELECT symbol,'SWING' FROM trend_radar_queue WHERE status='READY' AND expires_at>? UNION SELECT symbol,strategy FROM opportunity_events WHERE captured_at>=strftime('%Y-%m-%dT00:00:00.000Z','now','-3 hours')`).bind(iso(now),iso(now)).all();const targets=r.results||[];return {symbols:[...new Set(targets.map(x=>x.symbol))],targets};
 }
 export async function manualStrategyClose(request,env,now=Date.now()){
  const b=await boundedBody(request);if(!Number.isInteger(b.trade_id)||!['SCALP','SWING'].includes(b.strategy))return json({error:'INVALID_TRADE'},422);
@@ -158,7 +162,7 @@ export async function isolatedOverview(db,now=Date.now()){
  const accounts=Object.fromEntries((cash.results||[]).map(x=>[x.strategy,x.available_cash])),trades=(open.results||[]).map(t=>{const qty=t.remaining_lots??t.lot_count,unit=t.executed_price+t.commission/t.lot_count,price=t.current_price||t.executed_price;const q={price,quote_time:t.quote_time,source:'YAHOO_INDICATIVE'};return {...t,remaining_lots:qty,current_price:price,quote_fresh:usableQuote(q,now),quote_age_minutes:t.quote_time?Math.max(0,(now-Date.parse(t.quote_time))/60000):null,unrealised_net:price*qty*.998*.998-unit*qty,unrealised_pct:100*(price*.998*.998/unit-1),elapsed_minutes:Math.max(0,(now-Date.parse(t.entry_time))/60000),runner_active: t.strategy==='SCALP'&&!!t.tp1_done,remaining_minutes:Math.max(0,((t.strategy==='SCALP'&&t.tp1_done?Date.parse(trtDate(Date.parse(t.entry_time))+'T14:40:00.000Z'):Date.parse(t.entry_time)+3600000)-now)/60000),thresholds:strategyThresholds(t)};});
  const histories=[...(legs.results||[]),...(old.results||[]).map(t=>({...t,event_key:'legacy:'+t.id,observed_at:t.exit_time}))].sort((a,b)=>String(b.observed_at).localeCompare(String(a.observed_at)));
  const realised=await db.prepare("SELECT (SELECT COALESCE(SUM(pnl_net),0) FROM strategy_exit_legs)+(SELECT COALESCE(SUM(pnl_net),0) FROM virtual_trades WHERE status='CLOSED' AND engine_version=1) pnl").first();
- return {...status,ai_signals:ai.results||[],watchlist:watch.results||[],approved:counts?.approved||0,candidates:status.stage1_hot||0,pending_entries:(scalp.results||[]).length+(trend.results||[]).length,total_capital:(cash.results||[]).reduce((n,a)=>n+Number(a.initial_cash),0),equity:(accounts.SCALP||0)+(accounts.SWING||0)+trades.reduce((n,t)=>n+t.current_price*t.remaining_lots*.998*.998,0),equity_basis:'LAST_AVAILABLE_QUOTE_NET_LIQUIDATION_ESTIMATE',realised_pnl:realised?.pnl||0,scalp_cash:accounts.SCALP||0,swing_cash:accounts.SWING||0,open_trades:trades,exit_history:histories,closed_trades:histories,scalp_sniper_queue:scalp.results||[],trend_radar_queue:trend.results||[],scalp_slots:trades.filter(t=>t.strategy==='SCALP').length,trend_slots:trades.filter(t=>t.strategy==='SWING').length,engine_version:2};
+ return {...status,high_momentum_radar:await highMomentumRadar(db,now),ai_signals:ai.results||[],watchlist:watch.results||[],approved:counts?.approved||0,candidates:status.stage1_hot||0,pending_entries:(scalp.results||[]).length+(trend.results||[]).length,total_capital:(cash.results||[]).reduce((n,a)=>n+Number(a.initial_cash),0),equity:(accounts.SCALP||0)+(accounts.SWING||0)+trades.reduce((n,t)=>n+t.current_price*t.remaining_lots*.998*.998,0),equity_basis:'LAST_AVAILABLE_QUOTE_NET_LIQUIDATION_ESTIMATE',realised_pnl:realised?.pnl||0,scalp_cash:accounts.SCALP||0,swing_cash:accounts.SWING||0,open_trades:trades,exit_history:histories,closed_trades:histories,scalp_sniper_queue:scalp.results||[],trend_radar_queue:trend.results||[],scalp_slots:trades.filter(t=>t.strategy==='SCALP').length,trend_slots:trades.filter(t=>t.strategy==='SWING').length,engine_version:2};
 }
 export async function quoteIngest(request,env,now=Date.now()){
  let b;try{b=await boundedBody(request);}catch(e){return json({error:e.message},422);}

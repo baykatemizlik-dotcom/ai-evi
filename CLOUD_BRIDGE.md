@@ -264,3 +264,52 @@ Native RFC 8291 aes128gcm encryption and RFC 8292 VAPID signing run in the Worke
 Authenticated endpoints: GET /push/key, GET /push/status, POST /push/subscribe and POST /push/test. A subscribed phone can send itself a test from Settings. iPhone requires adding the panel to Home Screen, opening that installed web app, and granting notification permission from the user's button click. Subscription saves are authenticated and check same-origin requests. Old placeholder text has been replaced with actionable status and a test button. No device was enrolled at setup; end-to-end delivery awaits that permission and real phone test.
 
 Gemini, please audit cryptographic interoperability, outbox retry/lease behavior and subscription authorization. Browser notification permission remains the user's action.
+
+## Gün İçi Fırsatlar ve sabah prim koruması (12 Ekim 2026)
+
+`GET /bist/opportunities?date=YYYY-MM-DD` kimlik doğrulamalı gün arşividir.
+Scalp ve Trend ayrı; HOT, APPROVED (Scalp: Mini, Trend: teknik), RESERVE ve
+HIGH_PREMIUM aşamaları korunur. Aynı sembolün farklı kaynak mumları farklı
+sinyal kayıtlarıdır. Süresi dolan kayıtlar silinmez.
+
+Scalp girişlerinde **13:00 TRT öncesinde günlük prim >= %6,50** işlem için
+REJECT edilir. Önceki işlem günü kapanışı Yahoo **1d / 10d** grafiğindeki son
+kapanmış günlük mumdan alınır; 5 günlük intraday `chartPreviousClose` önceki
+gün kapanışı sanılmaz. Referans yoksa sabah yeni giriş bekler. Teknik koşullar
+geçiyorsa engellenen kayıt yüksek prim radarında saklanır. Guard ingest,
+Gemini aday erişimi, finalize, slot doldurma ve D1 insert seviyesinde uygulanır.
+13:00'da yalnız bu yeni guard kalkar; diğer filtreler aynen sürer. Trend ve
+Deneme 1/2 stratejilerine bu Scalp koruması uygulanmaz. Açık pozisyonlar
+iptal edilmez, mevcut çıkış kuralları çalışır.
+
+Overview ve günlük rapor JSON'unda ek alan:
+
+```json
+{"high_momentum_radar":[{"symbol":"ORNEK","daily_change_pct":7.4,"rvol":2.4,
+"reason":"Teknik kriterler tam uyumlu, ancak sabah %6.50 tavan riski koruması nedeniyle otomatik işlem reddedildi. Radar izlemede.",
+"captured_at":"2026-10-12T09:20:00.000Z","decision":"REJECTED"}]}
+```
+
+“Alsaydı?” gerçek sanal kasadan bağımsız, her kayda motorun başlangıç
+kasasının yarısı kadar slot bütçesi verir. O aşamada gerçekten gözlenen,
+geçerli Yahoo quote'u girişte kullanılır; kaynak ve alınma zamanları ayrıdır.
+TP/stop, komisyon/kayma, Scalp %70 TP1 + %30 runner, Trend yarım TP1 / iki-bar
+trailing ve beş-seans süre kuralları uygulanır. Tespit öncesi mumların high/low
+verisiyle geriye dönük kazanç üretilmez. Eski kayıtlar kurtarılır fakat geçmiş
+giriş quote'u saklanmadıysa `ENTRY_DATA_NOT_RECORDED` gösterilir. Senaryo
+sonuçları gerçek veya sanal motor kasasına eklenmez; gözlenmeyen fiyat
+aralıkları nedeniyle bu bir gerçek yürütme ispatı değildir.
+
+Yeni kalıcı tablolar `opportunity_events`, `opportunity_quotes`,
+`strategy_market_context`, `high_momentum_radar`; kurulum additive
+`0022_opportunities.sql`. Kasa veya mevcut işlem kaydı sıfırlanmaz.
+
+Deneme 1/2 veri akışı ile alım sayısı farklı konulardır. 12 Ekim sabahı yapılan
+bağımsız Yahoo kontrolünde 625 hisse, sıfır veri hatası görüldü; 10:30–11:45
+teknik filtrelerini geçen SAHOL, KLRHO, KPEKS, KORDS, TMPOL, PAHOL ve VAKBN
+her iki kurulum modelinde negatif puan aldı (V4PT >=0,003; V4QQ >=0,001
+başlangıç eşikleri ve mevcut V4PT fallback aynen korunur). Eksik kesintisiz
+30 dakikalık mum geçmişi bulunan hisseler için mum uydurulmaz. Yeni taramalar
+`daily_diagnostics` ve `last_poll_diagnostics` içinde teknik/risk/model
+retlerini sayar; bu kayıt eklenmeden önceki döngüler bu sayaçlara eklenmiş
+sayılmaz. Geçmiş kazanç/işlem/kasa veya cursor değiştirilmez.
