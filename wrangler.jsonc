@@ -6,7 +6,8 @@
   "vars": {
     "OPENAI_MODEL": "gpt-4o-mini",
     "GEMINI_MODEL": "gemini-3.1-flash-lite",
-    "ALLOWED_ORIGIN": "https://baykatemizlik-dotcom.github.io"
+    "ALLOWED_ORIGIN": "https://baykatemizlik-dotcom.github.io",
+    "NEWS_AI_ENABLED": "false"
   },
   "d1_databases": [
     {
@@ -23,7 +24,10 @@
   ],
   "triggers": {
     "crons": [
-      "* 6-16 * * 1-5"
+      "* 6-16 * * 1-5",
+      "30 16 * * *",
+      "30 20 * * *",
+      "15 6 * * *"
     ]
   },
   "observability": {
