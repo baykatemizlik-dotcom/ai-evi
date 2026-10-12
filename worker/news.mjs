@@ -68,7 +68,7 @@ async function analyze(env,rows,runId,network){
 }
 export async function runNews(env,wave='MANUAL',now=Date.now(),network=fetch){
  const runId=wave==='MANUAL'?(env.NEWS_TEST==='true'?'test:':'manual:')+Math.floor(now/300000):iso(now).slice(0,10)+':'+wave;
- const claim=await env.DB.prepare("INSERT OR IGNORE INTO news_runs(run_id,wave,started_at,status) VALUES(?,?,?,'RUNNING')").bind(runId,wave,iso(now)).run();if(!claim.meta.changes)return {duplicate:true,run_id:runId};
+ const claim=await env.DB.prepare("INSERT OR IGNORE INTO news_runs(run_id,wave,started_at,status) VALUES(?,?,?,'RUNNING')").bind(runId,wave,iso(now)).run();if(!claim.meta.changes){const prior=await env.DB.prepare('SELECT status,metrics_json FROM news_runs WHERE run_id=?').bind(runId).first();return {...JSON.parse(prior?.metrics_json||'{}'),duplicate:true,run_id:runId,status:prior?.status,retry_at:wave==='MANUAL'?iso((Math.floor(now/300000)+1)*300000):null};}
  const metrics={source_attempts:0,new_records:0,analysis_calls:0,analysis:[],errors:[],coverage:'PARTIAL',kap_status:'NOT_CONFIGURED',deep_search_status:'NOT_ENABLED',cost_status:'UNMEASURED'};
  const progress=async(percent,phase,extra={})=>{metrics.progress={...metrics.progress,...extra,percent,phase,updated_at:iso(Date.now())};await env.DB.prepare('UPDATE news_runs SET metrics_json=? WHERE run_id=?').bind(JSON.stringify(metrics),runId).run();};
  try{
@@ -86,6 +86,15 @@ export async function runNews(env,wave='MANUAL',now=Date.now(),network=fetch){
 export async function newsScheduled(env,time){const wave=waveAt(time);return wave?runNews(env,wave,time):null;}
 export async function newsRoute(request,env){
  const u=new URL(request.url),path=u.pathname;
+ if(path==='/bist/news/list'&&request.method==='GET'){
+  const date=u.searchParams.get('date')||new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Istanbul'}).format(new Date());
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return response({error:'INVALID_DATE'},422);
+  const start=Date.parse(date+'T00:00:00+03:00');if(!Number.isFinite(start)||iso(start+3*3600000).slice(0,10)!==date)return response({error:'INVALID_DATE'},422);
+  const offset=Math.max(0,Math.min(100000,Math.floor(Number(u.searchParams.get('offset'))||0))),limit=50;
+  const rows=await env.DB.prepare('SELECT r.record_id,r.source_id,r.headline,r.published_at,r.source_url,r.record_version,r.state,b.payload_json FROM news_records r LEFT JOIN news_bodies b ON b.record_id=r.record_id WHERE r.published_at>=? AND r.published_at<? ORDER BY r.published_at DESC,r.record_id LIMIT ? OFFSET ?').bind(iso(start),iso(start+86400000),limit+1,offset).all();
+  const count=await env.DB.prepare('SELECT count(*) total FROM news_records WHERE published_at>=? AND published_at<?').bind(iso(start),iso(start+86400000)).first();
+  return response({date,time_zone:'Europe/Istanbul',total:count.total,offset,limit,has_more:rows.results.length>limit,coverage:'PARTIAL_RSS_WINDOW',records:rows.results.slice(0,limit).map(({payload_json,...r})=>({...r,analysis:payload_json?JSON.parse(payload_json).analysis:null,analysis_location:r.state==='ACKED'?'PC_ARCHIVE':r.state==='READY'?'CLOUD':'PENDING'}))});
+ }
  if(path==='/bist/news/status'&&request.method==='GET'){
   const [sources,runs,count]=await Promise.all([env.DB.prepare('SELECT * FROM news_sources ORDER BY source_id').all(),env.DB.prepare('SELECT * FROM news_runs ORDER BY started_at DESC LIMIT 10').all(),env.DB.prepare('SELECT state,count(*) count FROM news_records GROUP BY state').all()]);return response({module:'NEWS_V1',schedules_trt:['19:30','23:30','09:15'],sources:sources.results,runs:runs.results.map(x=>({...x,metrics:JSON.parse(x.metrics_json)})),counts:count.results,ai_enabled:env.NEWS_AI_ENABLED==='true',kap_status:'NOT_CONFIGURED',deep_search_enabled:false,paper_only:true});
  }

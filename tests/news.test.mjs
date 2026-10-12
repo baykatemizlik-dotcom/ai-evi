@@ -28,3 +28,11 @@ test('incomplete Gemini coverage keeps raw records, captures usage and stops pro
  const result=await runNews({DB:db,GEMINI_API_KEY:'test-not-a-real-key',NEWS_AI_ENABLED:'true',NEWS_TEST:'true'},'MANUAL',now,net);
  assert.equal(result.errors[0].error,'ANALYSIS_COVERAGE_MISMATCH');assert.equal(result.errors[0].expected_records,2);assert.equal(result.errors[0].returned_records,0);assert.equal(result.analysis[0].total_tokens,12);assert.equal(result.progress.percent,50);assert.equal(sqlite.prepare("SELECT count(*) n FROM news_records WHERE state='RAW'").get().n,2);sqlite.close();
 });
+
+test('daily list uses Istanbul midnight and retains headline after ACK without exposing raw bodies',async()=>{
+ const {db,sqlite}=database();
+ for(const [id,published,state] of [['before','2026-10-12T20:59:59Z','RAW'],['after','2026-10-12T21:00:00Z','ACKED']])sqlite.prepare('INSERT INTO news_records(record_id,source_id,source_record_id,record_version,content_hash,published_at,fetched_at,source_url,headline,state) VALUES(?,?,?,?,?,?,?,?,?,?)').run(id,'TRT_WORLD',id,1,'hash',published,published,'https://www.trthaber.com/x','Haber '+id,state);
+ const list=async d=>newsRoute(new Request('https://panel.test/bist/news/list?date='+d),{DB:db});
+ const day12=await(await list('2026-10-12')).json(),day13=await(await list('2026-10-13')).json();
+ assert.equal(day12.records.length,1);assert.equal(day12.records[0].record_id,'before');assert.equal(day13.records[0].record_id,'after');assert.equal(day13.records[0].analysis_location,'PC_ARCHIVE');assert.equal(day13.records[0].headline,'Haber after');assert.equal('payload_json' in day13.records[0],false);assert.equal((await list('2026-02-30')).status,422);sqlite.close();
+});
