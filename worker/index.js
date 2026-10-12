@@ -583,6 +583,31 @@ async function berker3Route(request,env){
  await env.DB.batch([env.DB.prepare('UPDATE berker3_symbols SET active=0'),...b.symbols.map(symbol=>env.DB.prepare('INSERT INTO berker3_symbols(symbol,priority,active) VALUES(?,1,1) ON CONFLICT(symbol) DO UPDATE SET active=1,priority=1').bind(symbol)),env.DB.prepare('UPDATE trend_radar_queue SET priority=COALESCE((SELECT priority FROM berker3_symbols b WHERE b.symbol=trend_radar_queue.symbol AND b.active=1),0)')]);return json({ok:true,symbols:b.symbols});
 }
 
+// Separate namespaces: never write any existing engine/cash/queue table.
+async function trialBody(request){
+ if(!request.headers.get('Content-Type')?.startsWith('application/json'))throw Error('JSON_REQUIRED');
+ const reader=request.body?.getReader();if(!reader)throw Error('EMPTY_BODY');
+ let n=0,s='';const d=new TextDecoder();while(true){const x=await reader.read();if(x.done)break;n+=x.value.length;if(n>200000){await reader.cancel();throw Error('PAYLOAD_TOO_LARGE');}s+=d.decode(x.value,{stream:true});}return JSON.parse(s+d.decode());
+}
+const TRIAL_IDS=['DENEME_1','DENEME_2'];
+async function trialOverview(db,privateState=false){
+ const rows=await db.prepare('SELECT id,revision,state_json,updated_at FROM research_paper_trials ORDER BY id').all();
+ return {paper_only:true,real_orders_enabled:false,mode:'YAHOO_DELAYED_PAPER_ADAPTATION',bots:(rows.results||[]).map(r=>{const s=JSON.parse(r.state_json);return {...s,id:r.id,revision:r.revision,updated_at:r.updated_at,...(!privateState?{ledger:undefined}:{}),panel_stale:!s.last_received_at||Date.now()-Date.parse(s.last_received_at)>15*60000};})};
+}
+async function trialFeed(request,env){
+ if(request.method==='GET')return json({...await trialOverview(env.DB,true),risk:(await env.DB.prepare("SELECT symbol,eligible,valid_until FROM bist_funnel_risk WHERE valid_until>strftime('%Y-%m-%dT%H:%M:%fZ','now')").all()).results||[]});
+ const b=await trialBody(request);
+ if(!TRIAL_IDS.includes(b.id)||!Number.isSafeInteger(b.expected_revision)||b.expected_revision<0||!b.state||b.state.initial_cash!=='25000'||b.state.paper_only!==true||b.state.mode!=='YAHOO_DELAYED_PAPER_ADAPTATION')return json({error:'INVALID_TRIAL_STATE'},422);
+ const s=b.state;
+ if(!/^\d+(?:\.\d+)?$/.test(s.cash)||!Array.isArray(s.ledger)||s.ledger.length>2000||!Array.isArray(s.open_trades)||s.open_trades.length>1||!['WAITING_TODAY_DATA','RUNNING_DELAYED_PAPER','BLOCKED_INCOMPLETE_UNIVERSE','BLOCKED_STALE_DATA','BLOCKED_RISK_DATA','ERROR'].includes(s.status))return json({error:'INVALID_TRIAL_LEDGER'},422);
+ const current=await env.DB.prepare('SELECT state_json FROM research_paper_trials WHERE id=?').bind(b.id).first();
+ if(!current)return json({error:'TRIAL_NOT_INSTALLED'},409);
+ const old=JSON.parse(current.state_json);
+ if(s.activation_epoch!==old.activation_epoch||s.source_start_minute!==old.source_start_minute||s.arm!==old.arm||(old.cursor!==null&&(s.cursor===null||s.cursor<old.cursor))||s.ledger.length<old.ledger.length||JSON.stringify(s.ledger.slice(0,old.ledger.length))!==JSON.stringify(old.ledger))return json({error:'IMMUTABLE_TRIAL_HISTORY'},422);
+ const r=await env.DB.prepare("UPDATE research_paper_trials SET state_json=?,revision=revision+1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND revision=?").bind(JSON.stringify(s),b.id,b.expected_revision).run();
+ return r.meta.changes===1?json({ok:true,revision:b.expected_revision+1,paper_only:true}):json({error:'REVISION_CONFLICT'},409);
+}
+
 const reply=json;
 const hash=async value=>new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)));
 const secureEqual=async(a,b)=>{const[x,y]=await Promise.all([hash(a),hash(b)]);let d=0;for(let i=0;i<x.length;i++)d|=x[i]^y[i];return d===0;};
@@ -593,7 +618,10 @@ export default {async fetch(request,env){
 .room{margin:16px 0}.row{display:flex;align-items:center;justify-content:space-between;gap:8px}.card{background:#151d2b;border:1px solid #2d3849;border-radius:17px;padding:16px;margin:10px 0}.price{font-size:24px;font-weight:750}.gain{color:#65dfab}.loss{color:#ff9191}.kv{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}.kv b{display:block}.queue{padding:12px 0;border-bottom:1px solid #2d3849}.queue button{margin:4px;font-size:12px;padding:9px}.close{width:100%;background:#5c3543}.history{padding:14px 0;border-bottom:1px solid #2d3849}.rule{font-size:12px;color:#99a5b5}.room h3{font-size:16px}section.settings{padding:12px 0}.reserve-grid{margin-top:11px}.reserve-grid button.tile{width:100%;text-align:left;color:#f2f5fa;font:inherit;min-height:110px}.reserve-grid button.tile:focus-visible{outline:2px solid #65dfab;outline-offset:3px}.reserve-grid .money{font-size:21px}.reserve-grid small{display:block;margin-top:6px}#scalpQueueTitle,#trendQueueTitle{scroll-margin-top:18px}</style></head><body><main>
 <header><div><h1>📈 BIST AVCI</h1><p>Bulut radar & sanal portföy · teknik demo</p></div><span class="badge" id="mainState">Veri bekleniyor</span></header>
 <div class="api"><span class="pill"><i id="geminiDot" class="dot"></i>Gemini · <span id="geminiText">Kontrol bekliyor</span></span><span class="pill"><i id="gptDot" class="dot"></i>GPT · <span id="gptText">Kontrol bekliyor</span></span></div>
+<div id="trial1" class="page"><h2>Deneme 1 · V4QQ</h2><p>Yahoo 1m · gecikmeli sanal motor · ayrı 25.000 TL kasa</p><div id="trial1Body" class="panel">Motor durumu yükleniyor…</div><button data-jump="home">Ana menü</button></div>
+<div id="trial2" class="page"><h2>Deneme 2 · V4PT</h2><p>Yahoo 1m · gecikmeli sanal motor · ayrı 25.000 TL kasa</p><div id="trial2Body" class="panel">Motor durumu yükleniyor…</div><button data-jump="home">Ana menü</button></div>
 <div id="home" class="page active">
+<div class="grid" style="margin-top:14px"><button class="tile" data-jump="trial1"><b>🧪 Deneme 1 · V4QQ</b><div class="money" id="trial1Cash">Yükleniyor…</div><small id="trial1State">Bağlantı bekleniyor</small></button><button class="tile" data-jump="trial2"><b>🧪 Deneme 2 · V4PT</b><div class="money" id="trial2Cash">Yükleniyor…</div><small id="trial2State">Bağlantı bekleniyor</small></button></div>
 <div class="hero" role="button" tabindex="0" data-jump="demo"><small>💼 Sanal portföy · nakit + giriş değeri</small><div><strong id="total">5.000,00 TL</strong></div><p>Gerçekleşen kâr/zarar: <span id="pnl">Henüz işlem yok</span></p></div>
 <div class="grid" style="margin-top:11px"><div class="tile" role="button" tabindex="0" data-jump="demo"><b>⚡ SCALP</b><div class="money" id="scalpCash">2.500 TL</div><small>Kullanılabilir nakit · işlemler için dokun</small></div><div class="tile" role="button" tabindex="0" data-jump="candidates"><b>🎯 TREND</b><div class="money" id="swingCash">2.500 TL</div><small>Kullanılabilir nakit · iki slot için dokun</small></div></div>
 <div class="grid reserve-grid"><button type="button" class="tile" id="homeScalpReserve" data-queue-target="SCALP"><b>⚡ Scalp Yedekleri</b><div class="money"><span id="homeScalpReserveCount">0</span> yedek</div><small>Scalp kuyruğunu aç →</small></button><button type="button" class="tile" id="homeTrendReserve" data-queue-target="SWING"><b>🎯 Trend Yedekleri</b><div class="money"><span id="homeTrendReserveCount">0</span> yedek</div><small>Trend radarını aç →</small></button></div>
@@ -701,6 +729,20 @@ el('filters').querySelectorAll('button').forEach(b=>b.onclick=()=>{historyFilter
 el('saveBerker3').onclick=async()=>{try{const symbols=[...new Set(el('berker3').value.toUpperCase().split(/[\s,;]+/).filter(Boolean))];const r=await fetch('/bist/strategy/berker3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbols})});el('berker3Status').textContent=r.ok?'Liste kaydedildi.':'Liste kaydedilemedi.';}catch{el('berker3Status').textContent='Bağlantı hatası.';}};
 fetch('/bist/strategy/berker3').then(r=>r.ok?r.json():null).then(d=>{if(d)el('berker3').value=d.symbols.join(', ')}).catch(()=>{});
 setInterval(()=>{if(!document.hidden)timers();},1000);
+let trialPending=false;
+async function refreshTrials(){if(trialPending)return;trialPending=true;try{
+ const r=await fetch('/bist/trials',{headers:headers()});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();
+ const labels={WAITING_TODAY_DATA:'Bugünün 1m verisi bekleniyor',RUNNING_DELAYED_PAPER:'Yahoo gecikmeli sanal akış',BLOCKED_INCOMPLETE_UNIVERSE:'Eksik evren · yeni alım yok',BLOCKED_STALE_DATA:'Veri eski · yeni alım yok',BLOCKED_RISK_DATA:'Risk verisi eksik · yeni alım yok',ERROR:'Motor hatası'};
+ for(const [i,s] of (d.bots||[]).entries()){
+  const p='trial'+(i+1);document.getElementById(p+'Cash').textContent=money(s.equity??s.cash);
+  document.getElementById(p+'State').textContent=(s.panel_stale?'Durum güncel değil · ':'')+(labels[s.status]||s.status);
+  const root=document.getElementById(p+'Body');root.replaceChildren();
+  const fields=[['Durum',labels[s.status]||s.status],['Başlangıç',money(s.initial_cash)],['Nakit',money(s.cash)],['Varlık',money(s.equity??s.cash)],['Gerçekleşen net',money(s.realised_pnl)],['Taranan',String(s.scanned_symbols||0)],['Aday',String(s.candidates||0)],['Kaynak zamanı',s.last_source_time?new Date(s.last_source_time).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'}):'—'],['Alınma zamanı',s.last_received_at?new Date(s.last_received_at).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'}):'—'],['Model',s.model_kind||'Hazırlanıyor'],['Not','Yahoo uyarlaması; eski test kazancı bu kasaya eklenmez. Model kurulumda eğitildi; gerçek emir yok.']];
+  for(const [k,v] of fields){const row=document.createElement('p');row.textContent=k+': '+v;root.append(row);}
+  for(const [title,rows] of [['Açık işlemler',s.open_trades||[]],['Kapanan işlemler',s.closed_trades||[]]]){const h=document.createElement('h3');h.textContent=title;root.append(h);if(!rows.length){const p=document.createElement('p');p.textContent='Henüz işlem yok';root.append(p);}for(const t of rows.slice(-30).reverse()){const p=document.createElement('p');p.textContent=t.symbol+' · '+t.lot_count+' lot · '+(t.exit_reason||'AÇIK')+' · '+money(t.pnl_net||0);root.append(p);}}
+ }
+ }catch(e){for(const i of [1,2])document.getElementById('trial'+i+'State').textContent='Motor durumu alınamadı · '+e.message;}finally{trialPending=false;}}
+void refreshTrials();setInterval(()=>{if(!document.hidden)void refreshTrials();},30000);
 </script></body></html>
 `;
  if((u.pathname==="/"||u.pathname==="/bist")&&request.method==="GET")return new Response(dashboard,{headers:{"Content-Type":"text/html; charset=utf-8","Cache-Control":"no-store","Content-Security-Policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'","X-Content-Type-Options":"nosniff","Referrer-Policy":"no-referrer"}});
@@ -709,6 +751,12 @@ setInterval(()=>{if(!document.hidden)timers();},1000);
  if(u.pathname==="/sw.js")return new Response("self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));self.addEventListener('push',e=>{let x={title:'BIST AVCI',body:'Yeni doğrulanmış sinyal var. Paneli açıp kontrol et.'};try{if(e.data)x={...x,...e.data.json()}}catch{}e.waitUntil(self.registration.showNotification(x.title,{body:x.body,icon:'/icon.svg',tag:x.tag||'bist-signal',data:{url:'/'}}))});self.addEventListener('notificationclick',e=>{e.notification.close();e.waitUntil(self.clients.openWindow('/'))})",{headers:{"Content-Type":"application/javascript","Service-Worker-Allowed":"/","Cache-Control":"no-cache"}});
  const bearer=request.headers.get("Authorization")||"";
  const provided=bearer.startsWith("Bearer ")?bearer.slice(7):"";
+ if(u.pathname==='/bist/feed/trials'){
+  if(!['GET','POST'].includes(request.method))return reply({error:'METHOD_NOT_ALLOWED'},405);
+  const key=env.BIST_INGEST_TOKEN||env.ACCESS_TOKEN;
+  if(!key||!provided||!await secureEqual(provided,key))return reply({error:'Unauthorized'},401);
+  try{return await trialFeed(request,env);}catch{return reply({error:'TRIAL_FEED_FAILED'},503);}
+ }
  const constantEqual=(x,y)=>{if(x.length!==y.length)return false;let d=0;for(let i=0;i<x.length;i++)d|=x.charCodeAt(i)^y.charCodeAt(i);return d===0};
  const key=env.ACCESS_TOKEN?await crypto.subtle.importKey("raw",new TextEncoder().encode(env.ACCESS_TOKEN),{name:"HMAC",hash:"SHA-256"},false,["sign"]):null;
  const sign=async msg=>{const bytes=new Uint8Array(await crypto.subtle.sign("HMAC",key,new TextEncoder().encode(msg)));return [...bytes].map(x=>x.toString(16).padStart(2,"0")).join("")};
@@ -742,6 +790,10 @@ setInterval(()=>{if(!document.hidden)timers();},1000);
    return await ingest(request,env);}catch{return reply({error:'INGEST_OR_ENGINE_FAILED',retry_safe:true},503);}
  }
  if(!authenticated)return reply({error:"Unauthorized"},401);
+ if(u.pathname==='/bist/trials'){
+  if(request.method!=='GET')return reply({error:'METHOD_NOT_ALLOWED'},405);
+  try{return reply(await trialOverview(env.DB));}catch{return reply({error:'TRIAL_STATUS_UNAVAILABLE'},503);}
+ }
  if(u.pathname.startsWith('/push/')){if(request.method==='POST'&&request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);return await pushRoute(request,env);}
 
  if(u.pathname==='/bist/status'||u.pathname==='/bist/bridge/status')return reply(await feedStatus(env.DB));

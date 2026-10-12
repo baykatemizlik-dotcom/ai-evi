@@ -1,0 +1,36 @@
+name: BIST Deneme 1 and Deneme 2 Yahoo Paper
+on:
+  schedule:
+    - cron: '1-56/5 7-15 * * 1-5'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/bist_trials.yml
+      - bridge/trial_paper.py
+      - bridge/trial_models.json
+      - tests/test_trial_paper.py
+permissions:
+  contents: read
+concurrency:
+  group: bist-isolated-deneme-paper
+  cancel-in-progress: false
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install existing feed dependencies
+        run: python3 -m pip install --disable-pip-version-check -r bridge/requirements.txt
+      - name: Verify isolated paper reducer
+        run: python3 -m unittest discover -s tests -p 'test_trial_paper.py'
+      - name: Fetch closed Yahoo 1m data and update isolated paper accounts
+        env:
+          BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
+          BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
+          OPENBLAS_NUM_THREADS: '1'
+          OMP_NUM_THREADS: '1'
+        run: python3 bridge/trial_paper.py

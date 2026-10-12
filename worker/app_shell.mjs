@@ -10,6 +10,12 @@ export default {async fetch(request,env){
  if(u.pathname==="/sw.js")return new Response("self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));self.addEventListener('push',e=>{let x={title:'BIST AVCI',body:'Yeni doğrulanmış sinyal var. Paneli açıp kontrol et.'};try{if(e.data)x={...x,...e.data.json()}}catch{}e.waitUntil(self.registration.showNotification(x.title,{body:x.body,icon:'/icon.svg',tag:x.tag||'bist-signal',data:{url:'/'}}))});self.addEventListener('notificationclick',e=>{e.notification.close();e.waitUntil(self.clients.openWindow('/'))})",{headers:{"Content-Type":"application/javascript","Service-Worker-Allowed":"/","Cache-Control":"no-cache"}});
  const bearer=request.headers.get("Authorization")||"";
  const provided=bearer.startsWith("Bearer ")?bearer.slice(7):"";
+ if(u.pathname==='/bist/feed/trials'){
+  if(!['GET','POST'].includes(request.method))return reply({error:'METHOD_NOT_ALLOWED'},405);
+  const key=env.BIST_INGEST_TOKEN||env.ACCESS_TOKEN;
+  if(!key||!provided||!await secureEqual(provided,key))return reply({error:'Unauthorized'},401);
+  try{return await trialFeed(request,env);}catch{return reply({error:'TRIAL_FEED_FAILED'},503);}
+ }
  const constantEqual=(x,y)=>{if(x.length!==y.length)return false;let d=0;for(let i=0;i<x.length;i++)d|=x.charCodeAt(i)^y.charCodeAt(i);return d===0};
  const key=env.ACCESS_TOKEN?await crypto.subtle.importKey("raw",new TextEncoder().encode(env.ACCESS_TOKEN),{name:"HMAC",hash:"SHA-256"},false,["sign"]):null;
  const sign=async msg=>{const bytes=new Uint8Array(await crypto.subtle.sign("HMAC",key,new TextEncoder().encode(msg)));return [...bytes].map(x=>x.toString(16).padStart(2,"0")).join("")};
@@ -43,6 +49,10 @@ export default {async fetch(request,env){
    return await ingest(request,env);}catch{return reply({error:'INGEST_OR_ENGINE_FAILED',retry_safe:true},503);}
  }
  if(!authenticated)return reply({error:"Unauthorized"},401);
+ if(u.pathname==='/bist/trials'){
+  if(request.method!=='GET')return reply({error:'METHOD_NOT_ALLOWED'},405);
+  try{return reply(await trialOverview(env.DB));}catch{return reply({error:'TRIAL_STATUS_UNAVAILABLE'},503);}
+ }
  if(u.pathname.startsWith('/push/')){if(request.method==='POST'&&request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);return await pushRoute(request,env);}
 
  if(u.pathname==='/bist/status'||u.pathname==='/bist/bridge/status')return reply(await feedStatus(env.DB));
