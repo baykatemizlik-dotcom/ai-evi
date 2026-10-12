@@ -1,11 +1,22 @@
-"""Deterministically bundle the tested engine modules and PWA. No external files."""
+"""Refresh the dashboard in the canonical deployed Worker.
+
+The Worker includes edge bridge and sector code absent from older standalone
+modules. Preserve that code while updating only the panel literal.
+"""
 from pathlib import Path
-import re
-root=Path(__file__).resolve().parent
-parts=[]
-for name in ['cloud_bridge.mjs','strategy_engines.mjs','trial_engines.mjs','opportunities.mjs','panel_archive.mjs']:
- text=(root/'worker'/name).read_text()
- text=re.sub(r'^import .*?;\n','',text,flags=re.M)
- parts.append(re.sub(r'^export ','',text,flags=re.M))
-shell=(root/'worker/app_shell.mjs').read_text().replace('@@DASHBOARD@@',(root/'worker/dashboard.html').read_text())
-(root/'worker/index.js').write_text('\n'.join(parts)+'\n'+shell)
+import json
+
+root = Path(__file__).resolve().parent
+worker = root / 'worker/index.js'
+source = worker.read_text()
+marker = 'const dashboard=String.raw`'
+start = source.index(marker) + len(marker)
+end = source.index('`;\n', start)
+report = json.loads((root / 'data/replay_2026-10-12.json').read_text())
+dashboard = (root / 'worker/dashboard.html').read_text().replace(
+    '@@REPLAY_REPORT@@',
+    json.dumps(report, ensure_ascii=False, separators=(',', ':')).replace('</', '<\\/'),
+)
+if '`' in dashboard or '${' in dashboard.replace('${JSON.stringify(BIST_SECTORS)}', ''):
+    raise ValueError('Unsafe dashboard template literal')
+worker.write_text(source[:start] + dashboard + source[end:])
