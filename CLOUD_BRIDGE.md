@@ -26,7 +26,10 @@ The existing mobile dashboard and ACCESS_TOKEN sessions remain available.
 
 ## Operation and limits
 
-Cron: `4,19,34,49 7-15 * * 1-5` (UTC); the sender accepts scheduled data runs only
+Fallback cron: `4-59/5 7-15 * * 1-5` (UTC). The active runner uses a bounded
+25-minute session with a 300-second target cadence, unchanged eight shards and
+AI finalization, then dispatches this same workflow. Slow cycles finish before
+another starts: five minutes is a target, not a hard deadline. The sender accepts scheduled data runs only
 between 10:00 and 18:05 Europe/Istanbul. Thus scans after 18:05 are skipped.
 Epoch/UTC ISO timestamps remain unchanged; only session calendars and panel display
 use Europe/Istanbul. Freshness is measured from bar END, with 35 minutes tolerance.
@@ -37,7 +40,24 @@ Yahoo is an indicative, best-effort source; HTTP 429 can still occur on Actions.
 No cookie/rate-limit bypass is attempted. Twelve Data XIST is documented EOD:
 its fallback imports history but never enables intraday paper entries or ACTIVE.
 The first 10:00 run cannot import a fully closed 10:00 candle; normally the first
-current-session candle becomes usable after 10:15, depending on provider delay.
+current-session 10:00–10:15 candle becomes usable around 10:30 with Yahoo's
+indicative delay; provider updates and transport may delay it further.
+
+### Status troubleshooting
+
+`freshness_minutes=35` is measured from the 15-minute candle END, not its start
+or the fetch completion time. A 09:45 TRT candle ends at 10:00 and expires after
+10:35. A 10:19 successful fetch of that candle does not extend its validity.
+`scanned_symbols=0` means no fresh report remains; `last_scan_fetched` retains
+the historical fetched count. A session-open calendar does not prove data is
+available. Never change timestamps or widen freshness to disguise stale data.
+
+The actual workflow filename is `bist_sync.yml`, not `cloud-bridge.yml`:
+`gh run list --workflow=bist_sync.yml --limit 5`,
+`gh run view RUN_ID --log-failed`, `gh workflow run bist_sync.yml --ref main`.
+This Markdown is technical documentation, not a live JSON status file. Current
+authenticated status comes from `/bist/status`, and the panel report from
+`/bist/overview`. Manual runs update D1/panel, not this file's contents.
 
 A validated recent closed candle enables ACTIVE for that symbol. After 35 minutes
 without a newly closed candle, status becomes BLOCKED again. No authenticated
