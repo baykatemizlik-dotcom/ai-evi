@@ -1,0 +1,13 @@
+# BIST sector presentation — 12 October 2026
+
+The existing deployed Worker is the baseline, including EdgeLiveHub and the PC/cloud source selector. Matriks receiver and C# files are not modified.
+
+Official sources: https://www.kap.org.tr/tr/Sektorler and https://www.kap.org.tr/tr/Endeksler. Of the existing 631-symbol universe, 557 have a verified BIST sector/industry index membership and 74 have KAP sector classification only. Both are preserved separately. Index membership is not inferred from company names. For example ASTOR belongs to XMESY, THYAO to XULAS. Where overlapping broad and narrow sector indices exist, the narrower index is chosen for the panel label; all memberships remain in sector_indices. This is a dated snapshot, not a promise of automatic updates.
+
+Outgoing panel objects gain sector, sector_code, sector_key, sector_label, sector_mapping_status, kap_sector, kap_sector_code, sector_indices, sector_source and sector_updated_at. KAP-only rows have sector_code=null. Unrecognized future symbols remain UNMAPPED. No D1 schema migration or ledger write is needed; metadata is versioned with source in data/bist-sectors.json and embedded in the deployment script. Refresh the official snapshot and regenerate the embedded BIST_SECTORS constant together.
+
+Badges are shown in open positions, candidates, reserves, radar and opportunity cards. Sector filters are shared across the candidate/radar/opportunity views. Exposure is grouped across the selected main portfolio's open positions using remaining lots and last available price, with entry-price fallback explicitly marked. Percentages show both invested positions and gross assets including cash. Trial accounts are separate and excluded. A quoted value is not a fresh-price assertion; original quote times remain intact. Archived panel replies also retain archive flags and their original times.
+
+sector_risk_status=MONITOR_ONLY; risk_enforcement_enabled=false; max_positions_per_sector=null. This change does not alter entries, exits, risk guards, cash, positions or source clocks. GET /bist/sectors uses the existing authentication and does not query D1. WebSocket replies are decorated at the outgoing boundary; ingestion and stored PC payloads remain unchanged.
+
+Validation: node --check worker/index.js and node test-sectors.cjs. Tests cover all 631 mappings, official sample codes, unknown symbols, no input mutation, remaining lots, closed-trade exclusion, TL/percent/fallback exposure, dashboard JavaScript syntax, local badges and sector filtering, and authentication. Browser visual verification is not included in these checks.

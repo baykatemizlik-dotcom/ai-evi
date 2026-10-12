@@ -1,0 +1,21 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+let code=fs.readFileSync(__dirname+'/worker/index.js','utf8').replace("import {DurableObject} from 'cloudflare:workers';",'').replace('export class EdgeLiveHub','class EdgeLiveHub').replace('export default {','globalThis.worker = {');
+const ctx=vm.createContext({DurableObject:class{},Response,Request,Headers,URL,TextEncoder,TextDecoder,crypto:require('node:crypto').webcrypto,console,Date,Intl});
+vm.runInContext(code,ctx);
+assert.equal(vm.runInContext("sectorInfo('THYAO').sector_code",ctx),'XULAS');assert.equal(vm.runInContext("sectorInfo('ASTOR').sector_code",ctx),'XMESY');assert.equal(vm.runInContext("sectorInfo('ZZZZZ').sector_mapping_status",ctx),'UNMAPPED');
+const universe=JSON.parse(fs.readFileSync(__dirname+'/data/bist-sectors.json','utf8')).metadata.universe_symbols;ctx.universe=universe;assert.equal(universe.length,631);assert.equal(vm.runInContext("universe.filter(s=>sectorInfo(s).sector_mapping_status==='UNMAPPED').length",ctx),0);
+ctx.fixture={accounts:[{available_cash:6000}],trades:[{symbol:'AKBNK',status:'OPEN',executed_price:10,remaining_lots:100,lot_count:200},{symbol:'THYAO',status:'OPEN',executed_price:30,remaining_lots:100},{symbol:'TUPRS',status:'CLOSED',executed_price:100,lot_count:20}],watched_quotes:[{symbol:'THYAO',price:40,quote_time:'2026-10-12T12:00:00Z'}],candidates:[{symbol:'THYAO'}]};
+const before=JSON.stringify(ctx.fixture);const d=vm.runInContext('withSectorData(fixture)',ctx);assert.equal(JSON.stringify(ctx.fixture),before);assert.equal(d.sector_exposure.total_positions,2);assert.equal(d.sector_exposure.total_value_tl,5000);assert.equal(d.sector_exposure.groups[0].position_pct,80);assert.equal(d.sector_exposure.groups[1].entry_price_fallbacks,1);assert.equal(d.sector_exposure.risk_enforcement_enabled,false);assert.equal(d.candidates[0].sector_code,'XULAS');
+ctx.fixture.trades[0].remaining_lots=0;assert.equal(vm.runInContext('withSectorData(fixture).sector_exposure.total_value_tl',ctx),4000);
+(async()=>{const res=await ctx.worker.fetch(new Request('https://example.test/'),{});assert.equal(res.status,200);const html=await res.text();const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];new vm.Script(script);
+ class E {constructor(tag='div'){this.tag=tag;this.children=[];this.style={};this.dataset={};this.classList={add(){},remove(){},toggle(){},contains(){return false}};this.value='';this.textContent='';}append(...xs){this.children.push(...xs)}appendChild(x){this.append(x)}replaceChildren(...xs){this.children=xs}setAttribute(){}addEventListener(){}querySelectorAll(){return []}querySelector(){return new E()}remove(){}focus(){}select(){}}
+ const els=new Map();const get=id=>{if(!els.has(id))els.set(id,new E());return els.get(id)};const dom={getElementById:get,createElement:t=>new E(t),querySelectorAll:()=>[],querySelector:()=>new E(),addEventListener(){},hidden:false};
+ const ui=vm.createContext({document:dom,window:{},navigator:{},location:{href:'https://example.test/'},localStorage:{getItem:()=>null,setItem(){}},fetch:async()=>({ok:false,status:401,json:async()=>({})}),setTimeout:()=>0,clearTimeout(){},setInterval:()=>0,console,URL,Date,Intl,alert(){},crypto:require('node:crypto').webcrypto});
+ vm.runInContext(script,ui);ui.fixture=d;
+ vm.runInContext("edgeData=fixture;panelSource='LOCAL';renderLocalDashboard();",ui);
+ assert.equal(get('sectorExposure').children.length,2);assert.equal(get('candidateList').children.length,1);assert.ok(get('candidateList').children[0].children.some(x=>x.className==='sector-badge'));
+ vm.runInContext("selectedSector='XBANK';renderLocalDashboard();",ui);assert.equal(get('sectorRadarList').children[0].textContent,'Seçili sektörde radar kaydı yok.');
+ assert.ok(get('candidateList').children[0].textContent.includes('aday yok'));
+ const r=await ctx.worker.fetch(new Request('https://example.test/bist/sectors'),{});assert.equal(r.status,401);
+ console.log('PASS: 631 mappings, official examples, immutable enrichment, partial lots, closed exclusions, TL/percent/fallback exposure, panel JS syntax, local badges and filters, authentication.');
+})().catch(e=>{console.error(e);process.exitCode=1});
