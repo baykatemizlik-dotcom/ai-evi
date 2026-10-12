@@ -15,6 +15,7 @@
       "database_id": "08339ed0-2dfc-49d1-a4a4-52552ae25966"
     }
   ],
+  "kv_namespaces": [{"binding":"PANEL_ARCHIVE","id":"28b97d6f1fca4122a0c617d4829631a7"}],
   "triggers": {
     "crons": [
       "* 6-16 * * 1-5"

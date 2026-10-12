@@ -679,7 +679,19 @@ function simulateOpportunity(event,bars,quotes,hour=[],daily=[],now=Date.now(),b
  const unrealised=t.remaining_lots?last.price*.998*.998*t.remaining_lots-(t.executed_price+t.commission/t.lot_count)*t.remaining_lots:0;
  return {status:exit?'CLOSED':'OPEN',entry_time:event.captured_at,entry_quote_time:q.quote_time,executed_price:t.executed_price,lot_count:t.lot_count,remaining_lots:t.remaining_lots,thresholds,initial_stop:metrics.initial_stop||thresholds.sl,budget,realised_pnl:realised,unrealised_pnl:unrealised,pnl_net:realised+unrealised,pnl_pct:100*(realised+unrealised)/budget,last_price:last.price,last_quote_time:last.quote_time,quote_stale:!usableQuote(last,now),exit,legs};
 }
-async function opportunitiesOverview(db,date=trtDate(Date.now()),now=Date.now()){
+function reconstructOpportunity(event,reconstruction,now=Date.now(),budget=6250){
+ const entry=reconstruction?.entries?.[event.event_key],at=Date.parse(event.captured_at),time=Date.parse(entry?.bar_time);
+ if(!entry||entry.source!=='YAHOO_HISTORICAL_NEXT_MINUTE_OPEN'||entry.interval!=='1m'||!(entry.price>0)||!Number.isFinite(time)||time<at||time>at+120000||time+60000>now)return {status:'ENTRY_DATA_NOT_RECORDED',reason:'Bulunma anından sonraki iki dakika içinde doğrulanmış Yahoo 1m açılışı bulunamadı.'};
+ const cached=reconstruction.scenarios?.[event.event_key];if(cached?.retrospective&&cached.entry_time===entry.bar_time&&Date.parse(cached.scenario_as_of)<=now)return {...cached,quote_stale:cached.status==='OPEN'?true:cached.quote_stale};
+ const history=reconstruction.history?.[event.symbol]||{},observed=(interval,seconds)=>(history[interval]||[]).map(b=>({...b,received_at:new Date(Date.parse(b.bar_time)+seconds*1000).toISOString(),first_received_at:new Date(Date.parse(b.bar_time)+seconds*1000).toISOString()}));
+ // These availability times belong only to a labelled retrospective scenario.
+ // Original event, source candle and stored entry quote are never overwritten.
+ const q={price:entry.price,quote_time:entry.bar_time,received_at:entry.bar_time,source:'YAHOO_INDICATIVE'};
+ const quotes=(history['1m']||[]).filter(b=>Date.parse(b.bar_time)>=time).map(b=>({price:b.close,quote_time:new Date(Date.parse(b.bar_time)+60000).toISOString(),received_at:new Date(Date.parse(b.bar_time)+60000).toISOString(),source:'YAHOO_INDICATIVE'}));
+ const scenario=simulateOpportunity({...event,captured_at:entry.bar_time,entry_quote_json:JSON.stringify(q)},observed('15m',900),quotes,observed('60m',3600),[],now,budget);
+ return {...scenario,retrospective:true,entry_basis:entry.source,reconstructed_at:entry.retrieved_at,scenario_as_of:new Date(now).toISOString(),original_found_at:event.captured_at,reconstruction_note:'Geçmiş Yahoo 1m mumundan varsayımsal giriş: bulunma anından sonraki ilk açılış + %0,2 kayma + %0,2 komisyon. O anki veri gecikmesi/spread bilinmiyor; gerçek sanal alım değildir. Çıkışlar mevcut motor kurallarıyla geçmiş veriden değerlendirilir.'};
+}
+async function opportunitiesOverview(db,date=trtDate(Date.now()),now=Date.now(),reconstruction=null){
  if(!/^\d{4}-\d\d-\d\d$/.test(date))throw Error('INVALID_DATE');
  const start=new Date(date+'T00:00:00+03:00').toISOString(),end=new Date(Date.parse(start)+86400000).toISOString();
  const rows=await db.prepare('SELECT * FROM opportunity_events WHERE captured_at>=? AND captured_at<? ORDER BY captured_at DESC LIMIT 500').bind(start,end).all();
@@ -694,10 +706,36 @@ async function opportunitiesOverview(db,date=trtDate(Date.now()),now=Date.now())
   const data=cache.get(symbol),metrics=JSON.parse(first.metrics_json),key=first.signal_key;
   const queue=await db.prepare('SELECT status,reason,expires_at FROM '+(first.strategy==='SCALP'?'scalp_sniper_queue':'trend_radar_queue')+' WHERE signal_key=?').bind(key).first();
   const [ai,gemini]=first.strategy==='SCALP'?await Promise.all([db.prepare('SELECT status,reason,completed_at FROM bist_ai_decisions WHERE signal_key=?').bind(key).first(),db.prepare('SELECT status,reason,completed_at FROM bist_gemini_decisions WHERE signal_key=?').bind(key).first()]):[null,null];
-  result.push({symbol,strategy:first.strategy,signal_key:key,bar_time:first.bar_time,found_at:first.captured_at,signal_price:metrics.last_candle?.close||(first.strategy==='SWING'?data.hour:data.bars).find(b=>b.bar_time===first.bar_time)?.close||null,metrics,stages:events.map(e=>({stage:e.stage,captured_at:e.captured_at,origin:e.origin,scenario:simulateOpportunity(e,data.bars,data.quotes,data.hour,data.daily,now,budgets[e.strategy]||6250)})),queue:queue?{...queue,status:queue.status==='READY'&&Date.parse(queue.expires_at)<=now?'EXPIRED':queue.status}:null,mini:ai,gemini,actual_trade:data.trades.find(t=>t.strategy===first.strategy&&t.feed_entry_key===(first.strategy==='SCALP'?'SCALP:':'TREND:')+key)||null});
+  result.push({symbol,strategy:first.strategy,signal_key:key,bar_time:first.bar_time,found_at:first.captured_at,signal_price:metrics.last_candle?.close||(first.strategy==='SWING'?data.hour:data.bars).find(b=>b.bar_time===first.bar_time)?.close||null,metrics,stages:events.map(e=>{const s=simulateOpportunity(e,data.bars,data.quotes,data.hour,data.daily,now,budgets[e.strategy]||6250);return {stage:e.stage,captured_at:e.captured_at,origin:e.origin,scenario:s.status==='ENTRY_DATA_NOT_RECORDED'&&reconstruction?reconstructOpportunity(e,reconstruction,now,budgets[e.strategy]||6250):s};}),queue:queue?{...queue,status:queue.status==='READY'&&Date.parse(queue.expires_at)<=now?'EXPIRED':queue.status}:null,mini:ai,gemini,actual_trade:data.trades.find(t=>t.strategy===first.strategy&&t.feed_entry_key===(first.strategy==='SCALP'?'SCALP:':'TREND:')+key)||null});
  }
  const radar=await db.prepare('SELECT * FROM high_momentum_radar WHERE captured_at>=? AND captured_at<? ORDER BY captured_at DESC').bind(start,end).all();
  return {trt_date:date,server_time:new Date(now).toISOString(),paper_only:true,scenario_basis:'OBSERVED_YAHOO_QUOTE_AND_EXISTING_EXIT_RULES',opportunities:result,high_momentum_radar:radar.results||[],recording_started_at:(await db.prepare('SELECT MIN(received_at) started FROM opportunity_quotes').first())?.started||null,truncated:(rows.results||[]).length===500};
+}
+
+const quotaFailure=e=>/daily row (read|write) limit|free tier.*daily.*limit/i.test(String(e?.message||e));
+function archivedPanelValue(saved,now=Date.now()){
+ if(!saved?.data||!saved.captured_at)return null;
+ const d=JSON.parse(JSON.stringify(saved.data));
+ Object.assign(d,{panel_archived:true,snapshot_at:saved.captured_at,archive_reason:'D1_DAILY_QUOTA_EXCEEDED',archive_notice:'D1 kotası doldu · son kayıtların arşivi gösteriliyor · güncel akış ve fiyat değildir.',scanner_live:false});
+ if(d.status==='ACTIVE')d.status='ARCHIVED_DATA';
+ for(const t of d.open_trades||[])t.quote_fresh=false;
+ for(const q of [...(d.scalp_sniper_queue||[]),...(d.trend_radar_queue||[])])if(q.status==='READY'&&Date.parse(q.expires_at)<=now)q.status='EXPIRED';
+ for(const row of d.opportunities||[]){if(row.queue?.status==='READY'&&Date.parse(row.queue.expires_at)<=now)row.queue.status='EXPIRED';for(const stage of row.stages||[])if(stage.scenario?.status==='OPEN')stage.scenario.quote_stale=true;}
+ for(const bot of d.bots||[])bot.panel_stale=true;
+ for(const field of ['gemini','openai'])if(d[field])d[field]={...d[field],archived_connection:d[field].connection,connection:'ARCHIVED_STATUS'};
+ return d;
+}
+async function panelArchiveRead(env,name,produce,now=Date.now()){
+ const kv=env.PANEL_ARCHIVE;let saved=null,blockedUntil=0;
+ if(kv){try{[saved,blockedUntil]=await Promise.all([kv.get('snapshot:'+name,'json'),kv.get('quota_until')]);}catch{}}
+ const archived=()=>{const d=archivedPanelValue(saved,now);return d?json(d):json({error:'D1_DAILY_QUOTA_EXCEEDED',message:'D1 günlük kotası doldu. Kota 03:00 TRT’de yenilenir; bu bölüm için arşiv bulunamadı.'},503);};
+ if(Number(blockedUntil)>now)return archived();
+ try{const data=await produce();if(kv&&(!saved||now-Date.parse(saved.captured_at)>60000))try{await kv.put('snapshot:'+name,JSON.stringify({captured_at:new Date(now).toISOString(),data}));}catch{}return json(data);}
+ catch(e){if(!quotaFailure(e))throw e;if(kv)try{await kv.put('quota_until',String((Math.floor(now/86400000)+1)*86400000));}catch{}return archived();}
+}
+async function reconstructionFor(env,date=trtDate(Date.now())){
+ if(!/^\d{4}-\d\d-\d\d$/.test(date)||!env.PANEL_ARCHIVE)return null;
+ try{return await env.PANEL_ARCHIVE.get('reconstructed:'+date,'json');}catch{return null;}
 }
 
 const reply=json;
@@ -756,7 +794,7 @@ async function checkConnections(){try{
  if(!a.ok){const error=await a.json().catch(()=>({}));throw Error(error.message||'Bağlantı durumu alınamadı: HTTP '+a.status);}
  const x=await a.json();document.getElementById('checkResult').textContent=JSON.stringify(x,null,2);
  for(const [label,field] of [['gemini','gemini'],['gpt','openai']]){
-  const connection=x[field]?.connection,ok=connection==='CONNECTED';
+  const connection=x[field]?.connection,ok=connection==='CONNECTED';if(x.panel_archived){setDot(label,'wait','Son karar arşivi · '+(x[field]?.last_decision?.status||'Bilinmiyor'));continue;}
   setDot(label,ok?'ok':connection==='ERROR'||connection==='MISSING_KEY'?'bad':'wait',ok?'Bağlı':(field==='openai'?(connection==='CONFIGURED'?'Mini hazır · ilk karar bekleniyor':connection==='ERROR'?'Mini API hatası':connection==='MISSING_KEY'?'Mini anahtarı eksik':'Mini testi bekleniyor'):connection==='ERROR'?'Gemini API hatası':'Bulut Gemini testi bekleniyor'));
   const last=x[field]?.last_decision;document.getElementById(label+'Text').title=last?'Son karar: '+last.status+' · '+new Date(last.completed_at).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'})+' · '+(last.reason||''):'';
  }
@@ -766,7 +804,7 @@ async function checkApis(silent=false){if(pending)return;pending=true;try{
   try{const [b,c]=await Promise.all([fetch('/bist/overview',{headers:headers()}),fetch('/bist/status',{headers:headers()})]);
    if(!b.ok){const error=await b.json().catch(()=>({}));throw Error(error.message||'Panel verisi güncellenemedi: HTTP '+b.status);}
    if(!c.ok)throw Error('Radar durumu alınamadı: HTTP '+c.status);
-   const [o,status]=await Promise.all([b.json(),c.json()]);lastData=o;renderOverview(o);document.getElementById('mainState').textContent=status.scanner_live?'Bulut radar aktif':'Veri bekleniyor';
+   const [o,status]=await Promise.all([b.json(),c.json()]);lastData=o;renderOverview(o);document.getElementById('mainState').textContent=o.panel_archived?'Kota doldu · arşiv':status.scanner_live?'Bulut radar aktif':'Veri bekleniyor';
   }catch(e){document.getElementById('mainState').textContent='Panel verisi alınamadı';document.getElementById('panelFreshness').textContent='Panel yenilenemedi · '+(lastData?'son alınan kayıtlar gösteriliyor · ':'güncel kasa ve işlemler bilinmiyor · ')+e.message;}
  })()]);
 }finally{pending=false}}
@@ -790,7 +828,7 @@ function renderOverview(d){
  document.getElementById('radarState').textContent='Son tarama: '+(d.last_scan_fetched||0)+' / '+(d.eligible_total||0)+' hisse · '+(d.stage1_hot||0)+' sıcak aday · '+(d.watchlist||[]).length+' teknik filtreyi geçen · '+(d.scanner_live?'Veri taze':'Veri bayat');
  
  const trt=value=>value?new Date(value).toLocaleTimeString('tr-TR',{timeZone:'Europe/Istanbul',hour:'2-digit',minute:'2-digit'}):'bekleniyor';
- document.getElementById('panelFreshness').textContent='Panel güncellendi '+new Date().toLocaleTimeString('tr-TR',{timeZone:'Europe/Istanbul'})+' · 5 sn';document.getElementById('scanTime').textContent='Son tarama '+trt(d.last_scan_at)+' TRT';
+ document.getElementById('panelFreshness').textContent=d.panel_archived?d.archive_notice+' · Arşiv hazırlandı '+new Date(d.snapshot_at).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'}):'Panel güncellendi '+new Date().toLocaleTimeString('tr-TR',{timeZone:'Europe/Istanbul'})+' · 5 sn';document.getElementById('scanTime').textContent='Son tarama '+trt(d.last_scan_at)+' TRT';
  document.getElementById('feedDetail').textContent='Son mum başlangıcı '+trt(d.last_scan_bar)+' TRT · '+(d.shards_completed||0)+'/8 parça · '+(d.pending_entries||0)+' bekleyen giriş · '+[...(d.scalp_sniper_queue||[]),...(d.trend_radar_queue||[])].length+' taze yedek · '+(d.scanner_live?'Veri taze':'Veri bayat; giriş kapalı');
  
  const standby=document.getElementById('sniperStandby');standby.replaceChildren();
@@ -849,7 +887,7 @@ async function refreshTrials(){if(trialPending)return;trialPending=true;try{
  const labels={WAITING_TODAY_DATA:'Bugünün 1m verisi bekleniyor',RUNNING_DELAYED_PAPER:'Yahoo gecikmeli sanal akış',BLOCKED_INCOMPLETE_UNIVERSE:'Eksik evren · yeni alım yok',BLOCKED_STALE_DATA:'Veri eski · yeni alım yok',BLOCKED_RISK_DATA:'Risk verisi eksik · yeni alım yok',ERROR:'Motor hatası'};
  for(const [i,s] of (d.bots||[]).entries()){
   const p='trial'+(i+1);document.getElementById(p+'Cash').textContent=money(s.equity??s.cash);
-  document.getElementById(p+'State').textContent=(s.panel_stale?'Durum güncel değil · ':'')+(labels[s.status]||s.status);
+  document.getElementById(p+'State').textContent=(d.panel_archived?'Kota doldu · arşiv · ':s.panel_stale?'Durum güncel değil · ':'')+(labels[s.status]||s.status);
   const root=document.getElementById(p+'Body');root.replaceChildren();
   const fields=[['Durum',labels[s.status]||s.status],['Başlangıç',money(s.initial_cash)],['Nakit',money(s.cash)],['Varlık',money(s.equity??s.cash)],['Gerçekleşen net',money(s.realised_pnl)],['Taranan',String(s.scanned_symbols||0)],['Aday · son döngü',String(s.candidates||0)],['Bugün teknik uygun',String(s.daily_diagnostics?.technical_pass??'Henüz aşama kaydı yok')],['Modelin reddettiği',String(s.daily_diagnostics?.model_rejected??'Henüz aşama kaydı yok')],['Risk filtresi reddi',String(s.daily_diagnostics?.risk_rejected??'Henüz aşama kaydı yok')],['Bugün giriş adayı',String(s.daily_diagnostics?.entry_candidates??'Henüz aşama kaydı yok')],['Giriş eşiği',s.entry_score_threshold==null?'—':String(s.entry_score_threshold)],['Giriş açıklaması',s.no_entry_reason==='MODEL_SCORE_BELOW_ENTRY_THRESHOLD'?'Model puanı giriş eşiğinin altında':s.no_entry_reason==='NO_TECHNICAL_CANDIDATE'?'Bu döngüde teknik aday yok':s.no_entry_reason||'Aşama tanısı sonraki taramada gelir'],['Kaynak zamanı',s.last_source_time?new Date(s.last_source_time).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'}):'—'],['Alınma zamanı',s.last_received_at?new Date(s.last_received_at).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'}):'—'],['Model',s.model_kind||'Hazırlanıyor'],['Not','Yahoo uyarlaması; eski test kazancı bu kasaya eklenmez. Model kurulumda eğitildi; gerçek emir yok.']];
   for(const [k,v] of fields){const row=document.createElement('p');row.textContent=k+': '+v;root.append(row);}
@@ -870,16 +908,16 @@ function renderOpportunities(){if(!opportunityData)return;
  document.getElementById('opportunityEngineNote').textContent=opportunityEngine==='SCALP'?'15 dk mum · Mini + Gemini · 13:00 öncesi %6,50+ alım engeli':'60 dk + günlük · Teknik uygunluk · AI onayı aranmaz';
  document.querySelectorAll('[data-opp-stage]').forEach(b=>{const stage=b.dataset.oppStage,count=all.filter(x=>stage==='ALL'||x.stages.some(s=>s.stage===stage)).length;b.textContent=(stage==='ALL'?'Günün tümü':stage==='APPROVED'&&opportunityEngine==='SWING'?'Teknik uygun':oppLabels[stage])+' · '+count;b.hidden=stage==='HIGH_PREMIUM'&&opportunityEngine!=='SCALP';b.classList.toggle('active',opportunityStage===stage);});
  document.querySelectorAll('[data-opp-engine]').forEach(b=>b.classList.toggle('active',b.dataset.oppEngine===opportunityEngine));
- document.getElementById('opportunitySummary').textContent=items.length+' sinyal kaydı · '+new Set(items.map(x=>x.symbol)).size+' hisse · '+oppTime(opportunityData.server_time)+' TRT'+(opportunityData.truncated?' · İlk 500 aşama gösteriliyor':'');
+ document.getElementById('opportunitySummary').textContent=items.length+' sinyal kaydı · '+new Set(items.map(x=>x.symbol)).size+' hisse · '+oppTime(opportunityData.server_time)+' TRT'+(opportunityData.truncated?' · İlk 500 aşama gösteriliyor':'')+(opportunityData.panel_archived?' · Kota doldu: arşiv, güncel değil':'');
  for(const row of items){
   const stages=[...row.stages].sort((a,b)=>a.captured_at.localeCompare(b.captured_at)),chosen=document.getElementById('opportunityBasis').value==='STAGE'&&opportunityStage!=='ALL'?stages.find(s=>s.stage===opportunityStage):stages[0],scenario=chosen?.scenario||{},high=row.stages.some(s=>s.stage==='HIGH_PREMIUM'),card=node('article','','card');
   const metrics=row.metrics||{},radar=(opportunityData.high_momentum_radar||[]).find(r=>r.signal_key===row.signal_key),head=node('div','','row');head.append(node('strong',row.symbol),node('span',high?'Otomatik Alım Engellendi (Tavan Riski)':row.actual_trade?'Motor aldı':row.queue?.status==='READY'?'Slot bekliyor':row.queue?.status==='EXPIRED'?'Yedek süresi doldu':row.mini?.status==='REJECTED'?'Mini reddetti':row.gemini?.status==='ERROR'?'Gemini hatası':'Aday','chip'));card.append(head);
   if(high){card.style.borderColor='#a5823e';card.append(node('p','⚡ Prim +%'+Number(radar?.daily_change_pct??metrics.daily_change_pct??0).toLocaleString('tr-TR',{maximumFractionDigits:2})+' · RVOL '+Number(radar?.rvol??metrics.rvol??0).toLocaleString('tr-TR',{maximumFractionDigits:2}),'warn'));}
   card.append(node('p',stages.map(s=>(s.stage==='APPROVED'&&opportunityEngine==='SWING'?'Teknik uygun':oppLabels[s.stage]||s.stage)+' '+oppTime(s.captured_at)).join(' → '),'muted'));
   const grid=node('div','','kv');for(const [k,v] of [['Bulunduğu an',oppTime(row.found_at)],['Sinyal fiyatı',row.signal_price?money(row.signal_price):'Kaydedilmemiş'],['Varsayımsal giriş',scenario.executed_price?money(scenario.executed_price):'Kaydedilmemiş'],['Giriş lotu',scenario.lot_count?String(scenario.lot_count):'—']]){const f=node('div');f.append(node('small',k),node('b',v));grid.append(f);}card.append(grid);
-  const result=node('div','','panel');result.append(node('b','Alsaydı ne olurdu?'));if(scenario.pnl_net!=null){result.append(node('div',(scenario.pnl_net>=0?'+':'')+money(scenario.pnl_net)+' · %'+Number(scenario.pnl_pct).toLocaleString('tr-TR',{maximumFractionDigits:2}),scenario.pnl_net>=0?'money gain':'money loss'));result.append(node('p',scenario.status==='CLOSED'?'Senaryo kapandı · '+scenario.exit.reason:'Senaryo sürüyor · '+scenario.remaining_lots+' lot'));if(scenario.quote_stale&&scenario.status!=='CLOSED')result.append(node('small','Son fiyat bayat · son gözlenen fiyatla değerleme'));}else result.append(node('p',scenario.reason||'Giriş fiyatı bekleniyor.'));card.append(result);
+  if(scenario.retrospective)card.append(node('p','Geçmiş Yahoo mumundan hesaplanan varsayımsal giriş · gerçek alım değil','warn'));const result=node('div','','panel');result.append(node('b',scenario.retrospective?'Geçmiş veriden “Alsaydı?”':'Alsaydı ne olurdu?'));if(scenario.pnl_net!=null){result.append(node('div',(scenario.pnl_net>=0?'+':'')+money(scenario.pnl_net)+' · %'+Number(scenario.pnl_pct).toLocaleString('tr-TR',{maximumFractionDigits:2}),scenario.pnl_net>=0?'money gain':'money loss'));result.append(node('p',scenario.status==='CLOSED'?'Senaryo kapandı · '+scenario.exit.reason:'Senaryo sürüyor · '+scenario.remaining_lots+' lot'));if(scenario.quote_stale&&scenario.status!=='CLOSED')result.append(node('small','Son fiyat bayat · son gözlenen fiyatla değerleme'));}else result.append(node('p',scenario.reason||'Giriş fiyatı bekleniyor.'));card.append(result);
   const detail=document.createElement('details'),summary=document.createElement('summary');summary.textContent='Giriş verileri ve neden';detail.append(summary);
-  for(const [k,v] of [['Senaryo başlangıcı',oppTime(chosen?.captured_at)],['TP1',scenario.thresholds?money(scenario.thresholds.tp):'—'],['İlk stop',scenario.initial_stop?money(scenario.initial_stop):'—'],['Son fiyat',scenario.last_price?money(scenario.last_price):'—'],['Kaynak mum başlangıcı',oppTime(row.bar_time)],['Giriş fiyatının kaynak zamanı',oppTime(scenario.entry_quote_time)],['Son fiyatın kaynak zamanı',oppTime(scenario.last_quote_time)],['Mini kararı',row.mini?row.mini.status+' · '+row.mini.reason:opportunityEngine==='SWING'?'Aranmaz':'Henüz yok'],['Gemini kararı',row.gemini?row.gemini.status+' · '+row.gemini.reason:opportunityEngine==='SWING'?'Aranmaz':'Henüz yok'],['Alım durumu',radar?.reason||row.queue?.reason||'Teknik aday izleniyor'],['Gerçek sanal giriş',row.actual_trade?money(row.actual_trade.executed_price)+' · '+oppTime(row.actual_trade.entry_time):'Yok'],['Senaryo bütçesi',scenario.budget?money(scenario.budget):'—']])detail.append(node('p',k+': '+v));card.append(detail);container.append(card);
+  for(const [k,v] of [['Senaryo başlangıcı',oppTime(scenario.entry_time||chosen?.captured_at)],['Fiyatın türü',scenario.retrospective?scenario.reconstruction_note:'O anda kaydedilmiş Yahoo fiyatı'],['Geçmiş fiyatın alınma zamanı',oppTime(scenario.reconstructed_at)],['TP1',scenario.thresholds?money(scenario.thresholds.tp):'—'],['İlk stop',scenario.initial_stop?money(scenario.initial_stop):'—'],['Son fiyat',scenario.last_price?money(scenario.last_price):'—'],['Kaynak mum başlangıcı',oppTime(row.bar_time)],['Giriş fiyatının kaynak zamanı',oppTime(scenario.entry_quote_time)],['Son fiyatın kaynak zamanı',oppTime(scenario.last_quote_time)],['Mini kararı',row.mini?row.mini.status+' · '+row.mini.reason:opportunityEngine==='SWING'?'Aranmaz':'Henüz yok'],['Gemini kararı',row.gemini?row.gemini.status+' · '+row.gemini.reason:opportunityEngine==='SWING'?'Aranmaz':'Henüz yok'],['Alım durumu',radar?.reason||row.queue?.reason||'Teknik aday izleniyor'],['Gerçek sanal giriş',row.actual_trade?money(row.actual_trade.executed_price)+' · '+oppTime(row.actual_trade.entry_time):'Yok'],['Senaryo bütçesi',scenario.budget?money(scenario.budget):'—']])detail.append(node('p',k+': '+v));card.append(detail);container.append(card);
  }
  if(!items.length)container.append(node('div','Bu gün ve kategoride kayıt yok.','empty'));
 }
@@ -939,19 +977,19 @@ setInterval(()=>{if(!document.hidden&&document.getElementById('opportunities').c
  try {
  if(u.pathname==='/bist/opportunities'){
   if(request.method!=='GET')return reply({error:'METHOD_NOT_ALLOWED'},405);
-  try{return reply(await opportunitiesOverview(env.DB,u.searchParams.get('date')||trtDate(Date.now())));}catch(e){return d1QuotaReply(e)||reply({error:'OPPORTUNITIES_UNAVAILABLE'},503);}
+  try{const date=u.searchParams.get('date')||trtDate(Date.now());if(!/^\d{4}-\d\d-\d\d$/.test(date))return reply({error:'INVALID_DATE'},422);return await panelArchiveRead(env,'opportunities:'+date,async()=>opportunitiesOverview(env.DB,date,Date.now(),await reconstructionFor(env,date)));}catch(e){return d1QuotaReply(e)||reply({error:'OPPORTUNITIES_UNAVAILABLE'},503);}
  }
  if(u.pathname==='/bist/trials'){
   if(request.method!=='GET')return reply({error:'METHOD_NOT_ALLOWED'},405);
-  try{return reply(await trialOverview(env.DB));}catch(e){return d1QuotaReply(e)||reply({error:'TRIAL_STATUS_UNAVAILABLE'},503);}
+  try{return await panelArchiveRead(env,'trials',()=>trialOverview(env.DB));}catch(e){return d1QuotaReply(e)||reply({error:'TRIAL_STATUS_UNAVAILABLE'},503);}
  }
  if(u.pathname.startsWith('/push/')){if(request.method==='POST'&&request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);return await pushRoute(request,env);}
 
- if(u.pathname==='/bist/status'||u.pathname==='/bist/bridge/status')return reply(await feedStatus(env.DB));
- if(u.pathname==='/bist/connections')return reply({mode:'CLOUD_BRIDGE_AI_REFEREE',external_fetch_enabled:true,market_data_fetch_enabled:false,gemini:await geminiStatus(env),openai:await aiStatus(env)});
+ if(u.pathname==='/bist/status'||u.pathname==='/bist/bridge/status')return await panelArchiveRead(env,'status',()=>feedStatus(env.DB));
+ if(u.pathname==='/bist/connections')return await panelArchiveRead(env,'connections',async()=>({mode:'CLOUD_BRIDGE_AI_REFEREE',external_fetch_enabled:true,market_data_fetch_enabled:false,gemini:await geminiStatus(env),openai:await aiStatus(env)}));
  if(u.pathname==='/bist/ai/decisions')return reply({decisions:(await env.DB.prepare('SELECT symbol,bar_time,model,status,reason,completed_at,confidence,input_tokens,output_tokens FROM bist_ai_decisions ORDER BY created_at DESC LIMIT 100').all()).results});
  if(u.pathname==='/bist/report'){const report=await dailyReport(env.DB);const audit=await env.DB.prepare('SELECT * FROM bist_external_audits ORDER BY trt_date DESC LIMIT 1').first();return reply({...report,external_audit:audit?{...audit,report:JSON.parse(audit.report_json)}:null});}
- if(u.pathname==='/bist/overview')return reply({...await isolatedOverview(env.DB),gemini:await geminiStatus(env)});
+ if(u.pathname==='/bist/overview')return await panelArchiveRead(env,'overview',async()=>({...await isolatedOverview(env.DB),gemini:await geminiStatus(env)}));
  if(u.pathname==='/bist/demo/start-20261012'){
   if(request.method!=='POST')return reply({error:'METHOD_NOT_ALLOWED'},405);
   if(request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);

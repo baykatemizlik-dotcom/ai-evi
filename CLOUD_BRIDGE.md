@@ -342,3 +342,11 @@ Panel, D1 kota hatasını `D1_DAILY_QUOTA_EXCEEDED` / HTTP 503 ve gerçek UTC
 sıfırlanma zamanı ile gösterir; bu hata Gemini anahtarı/API kopukluğu diye
 etiketlenmez. Kota engeli varken yeni canlı arşiv/diagnostic kaydı doğrulanmış
 sayılmaz.
+
+### Kota sırasında panel arşivi ve geçmiş giriş fiyatları
+
+`PANEL_ARCHIVE` özel KV bağlantısı yalnız panel görüntüleme içindir. D1 günlük kota hatasında son snapshot, `panel_archived=true`, `snapshot_at` ve kaynakların orijinal zamanlarıyla sunulur. API durumu son karar arşivi olarak işaretlenir; fiyatlar taze, motor canlı veya giriş uygun sayılmaz. Feed, emir ve kasa işlemleri arşivden yürütülmez. `quota_until` UTC gün sonuna kadar tekrarlanan başarısız panel okumalarını durdurur. Abonelik sonradan değiştirilirse bu anahtar temizlenerek yeni canlı okuma denenebilir; sistem kendisi ücretli plana geçmez.
+
+`bridge/reconstruct_opportunity_prices.py` yerel salt okunur SQL yedeğinden günün adaylarını alır. Yahoo 1m geçmişinde bulunma zamanından sonraki ilk mum açılışı (en fazla iki dakika boşluk) varsayımsal giriştir. Orijinal `captured_at`, `bar_time`, `entry_quote_json`, işlemler ve kasalar değiştirilmez. Senaryo `retrospective=true`, `entry_basis=YAHOO_HISTORICAL_NEXT_MINUTE_OPEN`, `reconstructed_at`, `scenario_as_of` alanlarıyla gösterilir. Tarihsel veri erişim gecikmesi ve spread bilinmediği için gerçekleşmiş işlem veya aynı canlı yürütme sayılmaz. Masraflar ve mevcut çıkış kurallarıyla ayrı 6.250 TL slot varsayımı kullanılır; son fiyat zamanı ayrıca görünür.
+
+`bridge/build_panel_archive.mjs` özel yerel backup SQLite kopyasından salt okunur panel snapshotları ve küçük hesaplanmış senaryo katmanı oluşturur. Çıktıları GitHub'a koymayın; özel KV ve Drive'a yükleyin. Snapshot anahtarları `snapshot:overview`, `snapshot:status`, `snapshot:connections`, `snapshot:trials`, `snapshot:opportunities:YYYY-MM-DD`; fiyat katmanı `reconstructed:YYYY-MM-DD`. Tam SQL backup Drive'da kalır, KV yalnız görüntüleme için küçük özet taşır. Canlı başarılı panel yanıtı en fazla dakikada bir snapshot günceller.

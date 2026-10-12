@@ -53,19 +53,19 @@ export default {async fetch(request,env){
  try {
  if(u.pathname==='/bist/opportunities'){
   if(request.method!=='GET')return reply({error:'METHOD_NOT_ALLOWED'},405);
-  try{return reply(await opportunitiesOverview(env.DB,u.searchParams.get('date')||trtDate(Date.now())));}catch(e){return d1QuotaReply(e)||reply({error:'OPPORTUNITIES_UNAVAILABLE'},503);}
+  try{const date=u.searchParams.get('date')||trtDate(Date.now());if(!/^\d{4}-\d\d-\d\d$/.test(date))return reply({error:'INVALID_DATE'},422);return await panelArchiveRead(env,'opportunities:'+date,async()=>opportunitiesOverview(env.DB,date,Date.now(),await reconstructionFor(env,date)));}catch(e){return d1QuotaReply(e)||reply({error:'OPPORTUNITIES_UNAVAILABLE'},503);}
  }
  if(u.pathname==='/bist/trials'){
   if(request.method!=='GET')return reply({error:'METHOD_NOT_ALLOWED'},405);
-  try{return reply(await trialOverview(env.DB));}catch(e){return d1QuotaReply(e)||reply({error:'TRIAL_STATUS_UNAVAILABLE'},503);}
+  try{return await panelArchiveRead(env,'trials',()=>trialOverview(env.DB));}catch(e){return d1QuotaReply(e)||reply({error:'TRIAL_STATUS_UNAVAILABLE'},503);}
  }
  if(u.pathname.startsWith('/push/')){if(request.method==='POST'&&request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);return await pushRoute(request,env);}
 
- if(u.pathname==='/bist/status'||u.pathname==='/bist/bridge/status')return reply(await feedStatus(env.DB));
- if(u.pathname==='/bist/connections')return reply({mode:'CLOUD_BRIDGE_AI_REFEREE',external_fetch_enabled:true,market_data_fetch_enabled:false,gemini:await geminiStatus(env),openai:await aiStatus(env)});
+ if(u.pathname==='/bist/status'||u.pathname==='/bist/bridge/status')return await panelArchiveRead(env,'status',()=>feedStatus(env.DB));
+ if(u.pathname==='/bist/connections')return await panelArchiveRead(env,'connections',async()=>({mode:'CLOUD_BRIDGE_AI_REFEREE',external_fetch_enabled:true,market_data_fetch_enabled:false,gemini:await geminiStatus(env),openai:await aiStatus(env)}));
  if(u.pathname==='/bist/ai/decisions')return reply({decisions:(await env.DB.prepare('SELECT symbol,bar_time,model,status,reason,completed_at,confidence,input_tokens,output_tokens FROM bist_ai_decisions ORDER BY created_at DESC LIMIT 100').all()).results});
  if(u.pathname==='/bist/report'){const report=await dailyReport(env.DB);const audit=await env.DB.prepare('SELECT * FROM bist_external_audits ORDER BY trt_date DESC LIMIT 1').first();return reply({...report,external_audit:audit?{...audit,report:JSON.parse(audit.report_json)}:null});}
- if(u.pathname==='/bist/overview')return reply({...await isolatedOverview(env.DB),gemini:await geminiStatus(env)});
+ if(u.pathname==='/bist/overview')return await panelArchiveRead(env,'overview',async()=>({...await isolatedOverview(env.DB),gemini:await geminiStatus(env)}));
  if(u.pathname==='/bist/demo/start-20261012'){
   if(request.method!=='POST')return reply({error:'METHOD_NOT_ALLOWED'},405);
   if(request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);
