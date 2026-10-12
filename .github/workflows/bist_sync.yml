@@ -21,7 +21,7 @@ permissions:
   actions: write
 concurrency:
   group: bist-cloud-feed
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 jobs:
   continuous:
     if: ${{ vars.BIST_MAIN_FEED_PAUSED != 'true' }}

@@ -16,7 +16,7 @@ permissions:
   actions: write
 concurrency:
   group: bist-isolated-deneme-paper
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 jobs:
   paper:
     if: ${{ vars.BIST_TRIALS_PAUSED != 'true' }}

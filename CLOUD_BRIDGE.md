@@ -313,3 +313,8 @@ başlangıç eşikleri ve mevcut V4PT fallback aynen korunur). Eksik kesintisiz
 `daily_diagnostics` ve `last_poll_diagnostics` içinde teknik/risk/model
 retlerini sayar; bu kayıt eklenmeden önceki döngüler bu sayaçlara eklenmiş
 sayılmaz. Geçmiş kazanç/işlem/kasa veya cursor değiştirilmez.
+
+Üretim kod güncellemesinde eski checkout'un yeni sürümü kuyrukta bekletmesini
+önlemek için ana/Deneme workflow concurrency yalnız `push` olayında eski koşuyu
+devreder (`cancel-in-progress: github.event_name == 'push'`). Normal cron ve
+oturum devamları birbirini kesmez. Mevcut D1 kasaları/işlemleri korunur.
