@@ -48,7 +48,7 @@ def run_session(clock=time.time,sleep=time.sleep,run=subprocess.run):
 
 
 def handoff(workflow='bist_trials.yml'):
-    if workflow not in ('bist_trials.yml','bist_sync.yml'):raise RuntimeError('UNAPPROVED_WORKFLOW')
+    if workflow not in ('bist_trials.yml','bist_sync.yml','bist_trend.yml'):raise RuntimeError('UNAPPROVED_WORKFLOW')
     if not market_window(time.time()):
         print(json.dumps({'event':'TRIAL_HANDOFF_SKIPPED','reason':'OUTSIDE_SESSION'}));return
     repo=os.environ.get('GITHUB_REPOSITORY','');token=os.environ.get('GH_TOKEN','')
