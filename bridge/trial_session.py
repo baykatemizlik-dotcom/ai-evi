@@ -47,12 +47,13 @@ def run_session(clock=time.time,sleep=time.sleep,run=subprocess.run):
     print(json.dumps({'event':'TRIAL_SESSION_END','cycles':n}),flush=True)
 
 
-def handoff():
+def handoff(workflow='bist_trials.yml'):
+    if workflow not in ('bist_trials.yml','bist_sync.yml'):raise RuntimeError('UNAPPROVED_WORKFLOW')
     if not market_window(time.time()):
         print(json.dumps({'event':'TRIAL_HANDOFF_SKIPPED','reason':'OUTSIDE_SESSION'}));return
     repo=os.environ.get('GITHUB_REPOSITORY','');token=os.environ.get('GH_TOKEN','')
     if repo!='baykatemizlik-dotcom/ai-evi' or not token:raise RuntimeError('HANDOFF_CONFIGURATION_MISSING')
-    url='https://api.github.com/repos/'+repo+'/actions/workflows/bist_trials.yml/dispatches'
+    url='https://api.github.com/repos/'+repo+'/actions/workflows/'+workflow+'/dispatches'
     req=urllib.request.Request(url,data=b'{"ref":"main"}',headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','Content-Type':'application/json'},method='POST')
     # Do not expose credentials or API response bodies; no credential redirects.
     class NoRedirect(urllib.request.HTTPRedirectHandler):
