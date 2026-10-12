@@ -40,7 +40,8 @@ def run_session(clock=time.time,sleep=time.sleep,run=subprocess.run):
             print(json.dumps({'event':'TRIAL_POLL_TIMEOUT','cycle':n}),flush=True)
         # Keep cadence inside the active runner; no cron between these polls.
         end=clock();delay=next_delay(start,end)
-        if end-began+delay>=DURATION:break
+        if end-began>=DURATION:break
+        delay=min(delay,DURATION-(end-began))
         print(json.dumps({'event':'TRIAL_NEXT_POLL','after_seconds':delay}),flush=True)
         sleep(delay)
     print(json.dumps({'event':'TRIAL_SESSION_END','cycles':n}),flush=True)
