@@ -9,16 +9,19 @@ on:
       - .github/workflows/bist_trials.yml
       - bridge/trial_paper.py
       - bridge/trial_models.json
+      - bridge/trial_session.py
       - tests/test_trial_paper.py
 permissions:
   contents: read
+  actions: write
 concurrency:
   group: bist-isolated-deneme-paper
   cancel-in-progress: false
 jobs:
   paper:
+    if: ${{ vars.BIST_TRIALS_PAUSED != 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -26,11 +29,17 @@ jobs:
       - name: Install existing feed dependencies
         run: python3 -m pip install --disable-pip-version-check -r bridge/requirements.txt
       - name: Verify isolated paper reducer
-        run: python3 -m unittest discover -s tests -p 'test_trial_paper.py'
-      - name: Fetch closed Yahoo 1m data and update isolated paper accounts
+        run: python3 -m unittest discover -s tests -p 'test_trial*.py'
+      - name: Continuous bounded session - poll Yahoo every five minutes
+        id: session
         env:
           BIST_WORKER_URL: ${{ vars.BIST_WORKER_URL || 'https://ai-evi.baykatemizlik.workers.dev' }}
           BIST_INGEST_TOKEN: ${{ secrets.BIST_INGEST_TOKEN }}
           OPENBLAS_NUM_THREADS: '1'
           OMP_NUM_THREADS: '1'
-        run: python3 bridge/trial_paper.py
+        run: python3 -u bridge/trial_session.py
+      - name: Hand off to the next isolated feed session
+        if: ${{ success() && steps.session.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 bridge/trial_session.py --handoff

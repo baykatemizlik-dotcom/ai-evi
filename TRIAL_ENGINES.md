@@ -1,5 +1,7 @@
 # Deneme 1 / Deneme 2 — isolated Yahoo paper adaptation
 
+Feed scheduling fix: each active Actions runner polls internally every 300 seconds for a bounded 25-minute session, then dispatches only this same workflow during weekday market hours using its standard ephemeral GITHUB_TOKEN (actions:write). Existing single-concurrency group prevents overlap; the cron remains a fallback. This removes cron dependence between polls, not all runner/network handoff latency. No guaranteed hard-real-time service claim.
+
 This installation starts the delayed source-time paper simulation at 12 October 2026 10:00 TRT. Source bars may precede installation wall time, but every event records the actual later observation time. This is explicitly delayed simulation, not a claim that orders were placed at that historical instant.
 
 Deneme 1 descends from V4QQ (ExtraTrees + prior-session ATR); Deneme 2 from V4PT (standardized Ridge alpha20). Each has its own 25,000 TRY account in research_paper_trials. Existing SCALP/SWING tables, trigger logic, balances, cron and histories are untouched.
