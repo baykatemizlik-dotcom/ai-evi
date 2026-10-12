@@ -40,9 +40,27 @@ document.getElementById('selectReport').onclick=()=>{const out=document.getEleme
 document.getElementById('copyReport').onclick=()=>{const out=document.getElementById('reportResult'),status=document.getElementById('reportStatus');if(!lastData){status.textContent='Panel verisi henüz gelmedi; Ayarlar bölümünden bağlantıyı kontrol et.';return}const text='BIST anlık sanal işlem karnesi\nhttps://github.com/baykatemizlik-dotcom/ai-evi/blob/main/CLOUD_BRIDGE.md\n'+JSON.stringify({...lastData,panel_report_at:new Date().toISOString()},null,2);out.value=text;
  const fallback=()=>{out.focus();out.select();out.setSelectionRange(0,text.length);try{if(document.execCommand('copy')){status.textContent='Karne kopyalandı ✅';return}}catch{}status.textContent='Karne hazır ve seçili. Metne uzun basıp Kopyala seçebilirsin.'};
  if(navigator.clipboard?.writeText){try{navigator.clipboard.writeText(text).then(()=>{status.textContent='Karne kopyalandı ✅'},fallback)}catch{fallback()}}else fallback();};
-async function checkApis(silent=false){if(pending)return;pending=true;if(!silent){setDot('gemini','wait','Kontrol');setDot('gpt','wait','Kontrol');}try{
-const [a,b,c]=await Promise.all([fetch('/bist/connections',{headers:headers()}),fetch('/bist/overview',{headers:headers()}),fetch('/bist/status',{headers:headers()})]);const x=await a.json(),o=await b.json(),status=await c.json();if(a.status===401){setDot('gemini','','Oturum gerekli');setDot('gpt','','Oturum gerekli');document.getElementById('checkResult').textContent='Bir defa erişim tokenı girerek oturum aç.';return}document.getElementById('checkResult').textContent=JSON.stringify(x,null,2);for(const [label,field] of [['gemini','gemini'],['gpt','openai']]){const ok=a.ok&&x[field]&&x[field].connection==='CONNECTED';setDot(label,ok?'ok':'bad',ok?'Bağlı':(field==='openai'?(x.openai?.connection==='CONFIGURED'?'Mini hazır · ilk karar bekleniyor':x.openai?.connection==='ERROR'?'Mini API hatası':'Mini anahtarı eksik'):x.gemini?.connection==='ERROR'?'Gemini API hatası':'Bulut Gemini testi bekleniyor'))}if(!b.ok)throw Error('Panel verisi güncellenemedi: HTTP '+b.status);lastData=o;renderOverview(o);document.getElementById('mainState').textContent=status.scanner_live?'Bulut radar aktif':'Veri bekleniyor';
-}catch(e){setDot('gemini','bad','Hata');setDot('gpt','bad','Hata');document.getElementById('panelFreshness').textContent='Panel yenilenemedi · son kayıtlar gösteriliyor';document.getElementById('checkResult').textContent=String(e.message)}finally{pending=false}}
+async function checkConnections(){try{
+ const a=await fetch('/bist/connections',{headers:headers()});
+ if(a.status===401){setDot('gemini','','Oturum gerekli');setDot('gpt','','Oturum gerekli');document.getElementById('checkResult').textContent='Bir defa erişim tokenı girerek oturum aç.';return}
+ if(!a.ok)throw Error('Bağlantı durumu alınamadı: HTTP '+a.status);
+ const x=await a.json();document.getElementById('checkResult').textContent=JSON.stringify(x,null,2);
+ for(const [label,field] of [['gemini','gemini'],['gpt','openai']]){
+  const connection=x[field]?.connection,ok=connection==='CONNECTED';
+  setDot(label,ok?'ok':connection==='ERROR'||connection==='MISSING_KEY'?'bad':'wait',ok?'Bağlı':(field==='openai'?(connection==='CONFIGURED'?'Mini hazır · ilk karar bekleniyor':connection==='ERROR'?'Mini API hatası':connection==='MISSING_KEY'?'Mini anahtarı eksik':'Mini testi bekleniyor'):connection==='ERROR'?'Gemini API hatası':'Bulut Gemini testi bekleniyor'));
+  const last=x[field]?.last_decision;document.getElementById(label+'Text').title=last?'Son karar: '+last.status+' · '+new Date(last.completed_at).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'})+' · '+(last.reason||''):'';
+ }
+}catch(e){setDot('gemini','wait','Durum alınamadı');setDot('gpt','wait','Durum alınamadı');document.getElementById('checkResult').textContent=e.message;}}
+async function checkApis(silent=false){if(pending)return;pending=true;try{
+ await Promise.all([checkConnections(),(async()=>{
+  try{const [b,c]=await Promise.all([fetch('/bist/overview',{headers:headers()}),fetch('/bist/status',{headers:headers()})]);
+   if(!b.ok)throw Error('Panel verisi güncellenemedi: HTTP '+b.status);
+   if(!c.ok)throw Error('Radar durumu alınamadı: HTTP '+c.status);
+   const [o,status]=await Promise.all([b.json(),c.json()]);lastData=o;renderOverview(o);document.getElementById('mainState').textContent=status.scanner_live?'Bulut radar aktif':'Veri bekleniyor';
+  }catch(e){document.getElementById('panelFreshness').textContent='Panel yenilenemedi · son kayıtlar gösteriliyor · '+e.message;}
+ })()]);
+}finally{pending=false}}
+
 function renderOverview(d){
  const stamp=value=>value?new Date(value).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'}):'—';
  const states={READY:'Slot bekliyor',INVALID:'Koşul geçersiz',PENDING:'Giriş bekliyor',ENTERED:'Sanal alım yapıldı',EXPIRED:'Giriş süresi doldu',OPEN:'Açık sanal işlem',CLOSED:'Sanal işlem kapandı'};
