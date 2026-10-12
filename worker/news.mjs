@@ -1,5 +1,6 @@
 // Isolated news collection and transfer. No trading/cash/price tables are used.
 import {NEWS_COMPANIES} from './news-catalog.mjs';
+import {matriksRoute} from './matriks-news.mjs';
 const SOURCES=[
  {id:'TRT_ECONOMY',url:'https://www.trthaber.com/ekonomi_articles.rss',kind:'RSS'},
  {id:'TRT_WORLD',url:'https://www.trthaber.com/dunya_articles.rss',kind:'RSS'}
@@ -43,7 +44,7 @@ export function validateAnalysis(result,inputs){
 }
 export function waveAt(now){const d=new Date(now),h=d.getUTCHours(),m=d.getUTCMinutes();return h===16&&m===30?'EVENING':h===20&&m===30?'NIGHT':h===6&&m===15?'MORNING':null;}
 async function sourceStatus(db,s,status,now,error=null){await db.prepare('INSERT INTO news_sources(source_id,source_url,status,last_attempt_at,last_success_at,error) VALUES(?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET status=excluded.status,last_attempt_at=excluded.last_attempt_at,last_success_at=COALESCE(excluded.last_success_at,news_sources.last_success_at),error=excluded.error').bind(s.id,s.url,status,iso(now),status==='PARTIAL_RSS_WINDOW'?iso(now):null,error).run();}
-async function saveRaw(db,raw,now){
+export async function saveRaw(db,raw,now){
  const hash=await sha256(JSON.stringify({headline:raw.headline,body:raw.body,published_at:raw.published_at})),id=await sha256(raw.source_id+'\n'+raw.source_record_id+'\n'+hash);
  const existing=await db.prepare('SELECT record_id FROM news_records WHERE record_id=?').bind(id).first();if(existing)return false;
  const payload={...raw,record_id:id,content_hash:hash,fetched_at:iso(now)};
@@ -65,14 +66,30 @@ async function analyze(env,rows,runId,network){
  const data=JSON.parse(await boundedText(r,1_000_000)),usage={model,calls:1,elapsed_ms:Date.now()-start,prompt_tokens:data.usageMetadata?.promptTokenCount??null,output_tokens:data.usageMetadata?.candidatesTokenCount??null,total_tokens:data.usageMetadata?.totalTokenCount??null,search_queries:0,grounding_enabled:false,expected_records:rows.length};let result;
  try{if(data.candidates?.[0]?.finishReason!=='STOP')throw Error('GEMINI_INCOMPLETE');result=validateAnalysis(JSON.parse(data.candidates[0].content.parts.filter(p=>!p.thought).map(p=>p.text||'').join('')),rows);}catch(e){e.analysis_metadata={...usage,validation_status:'REJECTED',returned_records:e.returned_records??null};throw e;}
  const at=iso(Date.now());
+ await persistAnalysis(env,rows,result,runId,model);
+ return {...usage,elapsed_ms:Date.now()-start,validation_status:'VALIDATED',returned_records:result.length};
+}
+
+async function persistAnalysis(env,rows,result,runId,model){
+ const at=iso(Date.now());
  for(const a of result){const raw=rows.find(x=>x.record_id===a.record_id),payload=JSON.stringify({...raw,analysis:a,analyzed_at:at,model_version:model,prompt_version:'news-v3',run_id:runId,research_status:a.needs_followup||a.importance>=4?'WAITING_RESEARCH':'NOT_REQUESTED'}),hash=await sha256(payload);
   const stmts=[env.DB.prepare('UPDATE news_bodies SET payload_json=?,payload_hash=?,analyzed_at=? WHERE record_id=? AND payload_json IS NULL').bind(payload,hash,at,a.record_id),env.DB.prepare("UPDATE news_records SET state='READY' WHERE record_id=? AND state='RAW'").bind(a.record_id)];
   if(a.needs_followup||a.importance>=4)stmts.push(env.DB.prepare('INSERT OR IGNORE INTO news_followups(record_id,importance,created_at) VALUES(?,?,?)').bind(a.record_id,a.importance,at));await env.DB.batch(stmts);
  }
- return {...usage,elapsed_ms:Date.now()-start,validation_status:'VALIDATED',returned_records:result.length};
 }
+function openaiSchema(s){const out={...s,type:s.type.toLowerCase()};delete out.minimum;delete out.maximum;if(s.properties){out.properties=Object.fromEntries(Object.entries(s.properties).map(([k,v])=>[k,openaiSchema(v)]));out.additionalProperties=false;}if(s.items)out.items=openaiSchema(s.items);return out;}
+async function analyzeMini(env,rows,runId,network){
+ const model='gpt-4o-mini';if(!env.OPENAI_API_KEY)throw Error('OPENAI_KEY_MISSING');
+ const companies=Object.entries(NEWS_COMPANIES).map(([symbol,c])=>[symbol,c.name,c.sector_key].join('\t')).join('\n');
+ const start=Date.now(),r=await network('https://api.openai.com/v1/chat/completions',{method:'POST',redirect:'manual',signal:AbortSignal.timeout(45000),headers:{'Content-Type':'application/json','Authorization':'Bearer '+env.OPENAI_API_KEY},body:JSON.stringify({model,temperature:0,max_tokens:10000,store:false,messages:[{role:'system',content:NEWS_PROMPT+' Sözlük satırları: sembol, şirket unvanı, sektör kodu. body boşsa yalnız başlık var; needs_followup=true ve uncertainty_level=HIGH olmalı.'},{role:'user',content:JSON.stringify({expected_records:rows.length,required_record_ids:rows.map(x=>x.record_id),companies,items:rows})}],response_format:{type:'json_schema',json_schema:{name:'bist_news_analysis',strict:true,schema:openaiSchema(ANALYSIS_SCHEMA)}}})});
+ if(!r.ok){let p={};try{p=JSON.parse(await boundedText(new Response(r.body),100000)).error||{};}catch{}const e=Error('OPENAI_HTTP_'+r.status);e.provider_error={http_status:r.status,status:String(p.code||p.type||'').slice(0,80),message:String(p.message||'').split(env.OPENAI_API_KEY).join('[REDACTED]').replace(/sk-[A-Za-z0-9_-]+/g,'[REDACTED]').slice(0,600)};throw e;}
+ const data=JSON.parse(await boundedText(r,1000000)),u=data.usage||{},cached=Math.min(u.prompt_tokens||0,u.prompt_tokens_details?.cached_tokens||0),usage={model,calls:1,elapsed_ms:Date.now()-start,prompt_tokens:u.prompt_tokens??null,output_tokens:u.completion_tokens??null,total_tokens:u.total_tokens??null,cached_tokens:cached,expected_records:rows.length,search_queries:0,grounding_enabled:false,estimated_usd:Number.isInteger(u.prompt_tokens)&&Number.isInteger(u.completion_tokens)?((u.prompt_tokens-cached)*0.15+cached*0.075+u.completion_tokens*0.60)/1000000:null,pricing_basis:'gpt-4o-mini standard text USD; checked 2026-10-13'};let result;
+ try{const choice=data.choices?.[0];if(choice?.finish_reason!=='stop'||choice.message?.refusal)throw Error('OPENAI_INCOMPLETE_OR_REFUSAL');result=validateAnalysis(JSON.parse(choice.message.content),rows);for(const a of result){if(!rows.find(x=>x.record_id===a.record_id).body){a.needs_followup=true;a.uncertainty_level='HIGH';}}}catch(e){e.analysis_metadata={...usage,validation_status:'REJECTED',returned_records:e.returned_records??null};throw e;}
+ await persistAnalysis(env,rows,result,runId,model);return {...usage,elapsed_ms:Date.now()-start,validation_status:'VALIDATED',returned_records:result.length};
+}
+
 export async function runNews(env,wave='MANUAL',now=Date.now(),network=fetch){
- const runId=wave==='MANUAL'?(env.NEWS_TEST==='true'?'test:':'manual:')+Math.floor(now/300000):iso(now).slice(0,10)+':'+wave;
+ const runId=wave==='MANUAL'?(env.NEWS_TEST==='true'?(env.NEWS_PROVIDER==='OPENAI'?'mini:':'test:'):'manual:')+Math.floor(now/300000):iso(now).slice(0,10)+':'+wave;
  const claim=await env.DB.prepare("INSERT OR IGNORE INTO news_runs(run_id,wave,started_at,status) VALUES(?,?,?,'RUNNING')").bind(runId,wave,iso(now)).run();if(!claim.meta.changes){const prior=await env.DB.prepare('SELECT status,metrics_json FROM news_runs WHERE run_id=?').bind(runId).first();return {...JSON.parse(prior?.metrics_json||'{}'),duplicate:true,run_id:runId,status:prior?.status,retry_at:wave==='MANUAL'?iso((Math.floor(now/300000)+1)*300000):null};}
  const metrics={source_attempts:0,new_records:0,analysis_calls:0,analysis:[],errors:[],coverage:'PARTIAL',kap_status:'NOT_CONFIGURED',deep_search_status:'NOT_ENABLED',cost_status:'UNMEASURED'};
  const progress=async(percent,phase,extra={})=>{metrics.progress={...metrics.progress,...extra,percent,phase,updated_at:iso(Date.now())};await env.DB.prepare('UPDATE news_runs SET metrics_json=? WHERE run_id=?').bind(JSON.stringify(metrics),runId).run();};
@@ -83,7 +100,7 @@ export async function runNews(env,wave='MANUAL',now=Date.now(),network=fetch){
   await sourceStatus(env.DB,{id:'KAP',url:'https://www.kap.org.tr'},'NOT_CONFIGURED',now,'OFFICIAL_DISCLOSURE_ADAPTER_REQUIRED');
   const pending=await env.DB.prepare("SELECT b.raw_json FROM news_bodies b JOIN news_records r ON r.record_id=b.record_id WHERE r.state='RAW' ORDER BY r.published_at,r.record_id LIMIT ?").bind(env.NEWS_TEST==='true'?20:50).all();
   const batches=chunks((pending.results||[]).map(x=>JSON.parse(x.raw_json))).slice(0,2),target=batches.reduce((n,b)=>n+b.length,0);let analyzed=0;
-  if(env.NEWS_AI_ENABLED==='true'){await progress(50,target?'Gemini analizi hazırlanıyor':'Analiz edilecek haber yok',{target_records:target});for(const batch of batches){try{await progress(50+Math.floor(45*analyzed/target),'Gemini yanıtı bekleniyor');metrics.analysis_calls++;metrics.analysis.push(await analyze(env,batch,runId,network));analyzed+=batch.length;await progress(50+Math.floor(45*analyzed/target),'Analiz sonuçları kaydedildi',{analyzed_records:analyzed});}catch(e){if(e.analysis_metadata)metrics.analysis.push(e.analysis_metadata);metrics.errors.push({stage:'ANALYSIS',error:String(e.message).slice(0,120),expected_records:e.expected_records??batch.length,returned_records:e.returned_records??null,...(e.provider_error?{provider_error:e.provider_error}:{})});break;}}}else metrics.analysis_status='DISABLED_UNTIL_SMALL_TEST';
+  if(env.NEWS_AI_ENABLED==='true'){await progress(50,target?'Haber analizi hazırlanıyor':'Analiz edilecek haber yok',{target_records:target});for(const batch of batches){try{await progress(50+Math.floor(45*analyzed/target),env.NEWS_PROVIDER==='OPENAI'?'GPT mini yanıtı bekleniyor':'Gemini yanıtı bekleniyor');metrics.analysis_calls++;metrics.analysis.push(await (env.NEWS_PROVIDER==='OPENAI'?analyzeMini:analyze)(env,batch,runId,network));analyzed+=batch.length;await progress(50+Math.floor(45*analyzed/target),'Analiz sonuçları kaydedildi',{analyzed_records:analyzed});}catch(e){if(e.analysis_metadata)metrics.analysis.push(e.analysis_metadata);metrics.errors.push({stage:'ANALYSIS',error:String(e.message).slice(0,120),expected_records:e.expected_records??batch.length,returned_records:e.returned_records??null,...(e.provider_error?{provider_error:e.provider_error}:{})});break;}}}else metrics.analysis_status='DISABLED_UNTIL_SMALL_TEST';
   await progress(metrics.errors.length?metrics.progress.percent:100,metrics.errors.length?'İşlem hatayla tamamlandı':env.NEWS_AI_ENABLED==='true'&&!metrics.analysis_calls?'Gemini testi yapılmadı: haber yok':'İşlem tamamlandı');
   metrics.elapsed_ms=Date.now()-now;await env.DB.prepare('UPDATE news_runs SET finished_at=?,status=?,metrics_json=? WHERE run_id=?').bind(iso(Date.now()),metrics.errors.length?'PARTIAL_ERROR':'PARTIAL',JSON.stringify(metrics),runId).run();return {run_id:runId,...metrics};
  }catch(e){await env.DB.prepare("UPDATE news_runs SET finished_at=?,status='ERROR',metrics_json=? WHERE run_id=?").bind(iso(Date.now()),JSON.stringify({...metrics,fatal_error:String(e.message).slice(0,120)}),runId).run();throw e;}
@@ -91,6 +108,7 @@ export async function runNews(env,wave='MANUAL',now=Date.now(),network=fetch){
 export async function newsScheduled(env,time){const wave=waveAt(time);return wave?runNews(env,wave,time):null;}
 export async function newsRoute(request,env){
  const u=new URL(request.url),path=u.pathname;
+ if(path.startsWith('/bist/news/matriks/'))return await matriksRoute(request,env);
  if(path==='/bist/news/list'&&request.method==='GET'){
   const date=u.searchParams.get('date')||new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Istanbul'}).format(new Date());
   if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return response({error:'INVALID_DATE'},422);
@@ -115,8 +133,8 @@ export async function newsRoute(request,env){
  }
  if(path==='/bist/news/run'&&request.method==='POST'){
   const body=JSON.parse(await boundedText(new Response(request.body),2000));
-  if(!['COLLECT','TEST'].includes(body.mode))return response({error:'INVALID_MODE'},422);
-  return response(await runNews(body.mode==='TEST'?{...env,NEWS_AI_ENABLED:'true',NEWS_TEST:'true'}:env));
+  if(!['COLLECT','TEST','MINI'].includes(body.mode))return response({error:'INVALID_MODE'},422);
+  return response(await runNews(['TEST','MINI'].includes(body.mode)?{...env,NEWS_AI_ENABLED:'true',NEWS_TEST:'true',NEWS_PROVIDER:body.mode==='MINI'?'OPENAI':'GEMINI'}:env));
  }
  return response({error:'METHOD_NOT_ALLOWED'},405);
 }
