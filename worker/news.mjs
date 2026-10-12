@@ -1,9 +1,14 @@
 // Isolated news collection and transfer. No trading/cash/price tables are used.
 import {NEWS_COMPANIES} from './news-catalog.mjs';
 import {matriksRoute} from './matriks-news.mjs';
+import {KAP_SOURCE,kapRequest,parseKap} from './kap-source.mjs';
+import {intelligenceRoute} from './news-intelligence.mjs';
 const SOURCES=[
  {id:'TRT_ECONOMY',url:'https://www.trthaber.com/ekonomi_articles.rss',kind:'RSS'},
- {id:'TRT_WORLD',url:'https://www.trthaber.com/dunya_articles.rss',kind:'RSS'}
+ {id:'TRT_WORLD',url:'https://www.trthaber.com/dunya_articles.rss',kind:'RSS'},
+ {id:'BLOOMBERGHT',url:'https://www.bloomberght.com/rss',kind:'RSS',host:'www.bloomberght.com'},
+ KAP_SOURCE,
+ {id:'TCMB_PRESS',url:'https://www.tcmb.gov.tr/wps/wcm/connect/TR/TCMB%2BTR/Bottom%2BMenu/Diger/RSS/Basin%2BDuyurulari',kind:'ATOM',max_age_days:31}
 ];
 const iso=n=>new Date(n).toISOString().replace(/\.\d{3}Z$/,'Z');
 const response=(x,status=200)=>new Response(JSON.stringify(x),{status,headers:{'Content-Type':'application/json','Cache-Control':'no-store'}});
@@ -20,12 +25,19 @@ export function parseRSS(xml,source,now=Date.now()){
  for(const m of xml.matchAll(/<item(?:\s[^>]*)?>([\s\S]*?)<\/item>/gi)){
   const b=m[1],url=decode(tag(b,'link')).trim(),ts=Date.parse(text(tag(b,'pubDate'))),headline=text(tag(b,'title'));
   if(!headline||!Number.isFinite(ts)||ts>now+60000){invalid++;continue;}
-  let u;try{u=new URL(url);}catch{invalid++;continue;}if(u.protocol!=='https:'||u.hostname!=='www.trthaber.com'){invalid++;continue;}
+  let u;try{u=new URL(url);}catch{invalid++;continue;}if(u.protocol!=='https:'||u.hostname!==(source.host||'www.trthaber.com')){invalid++;continue;}
   const full=text(tag(b,'content:encoded')||tag(b,'description'));
   out.push({source_id:source.id,source_record_id:text(tag(b,'guid'))||url,source_url:url,headline,published_at:iso(ts),body:full.slice(0,14000),body_truncated:full.length>14000,coverage:'PARTIAL_RSS_WINDOW'});
  }
  if(!out.length)throw Error('RSS_EMPTY_OR_INVALID');return {items:out,invalid,coverage:'PARTIAL_RSS_WINDOW'};
 }
+
+export function parseTCMB(xml,source,now=Date.now()){
+ if(!/<feed\b/i.test(xml))throw Error('INVALID_ATOM');const out=[],months={Oca:0,Şub:1,Mar:2,Nis:3,May:4,Haz:5,Tem:6,Ağu:7,Eyl:8,Eki:9,Kas:10,Ara:11};
+ for(const match of xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)){const body=match[1],tag=name=>{const m=body.match(new RegExp('<'+name+'(?:\\s[^>]*)?>([\\s\\S]*?)</'+name+'>','i'));return m?text(m[1]):'';},headline=tag('title'),date=tag('published'),m=date.match(/^(\d{1,2}) (\S+) (\d{4}) (\d\d):(\d\d):(\d\d)$/);if(!m||months[m[2]]===undefined)continue;const ts=Date.UTC(+m[3],months[m[2]],+m[1],+m[4]-3,+m[5],+m[6]);if(!headline||!Number.isFinite(ts)||ts>now+60000)continue;const link=body.match(/<link[^>]*rel="alternate"[^>]*href="([^"]+)"/i);if(!link)continue;const u=new URL(decode(link[1]),'https://www.tcmb.gov.tr');if(u.hostname!=='www.tcmb.gov.tr'||!['http:','https:'].includes(u.protocol))continue;u.protocol='https:';out.push({source_id:source.id,source_record_id:tag('id')||u.href,source_url:u.href,headline,published_at:iso(ts),body:tag('summary').slice(0,14000),body_truncated:false,coverage:'PARTIAL_OFFICIAL_FEED',headline_only:!tag('summary')});}
+ if(!out.length)throw Error('ATOM_EMPTY_OR_INVALID');return {items:out,coverage:'PARTIAL_OFFICIAL_FEED'};
+}
+
 export async function boundedText(res,max=2_000_000){
  if(!res.ok){await res.body?.cancel();throw Error('SOURCE_HTTP_'+res.status);}
  const reader=res.body.getReader(),parts=[];let n=0;try{for(;;){const {done,value}=await reader.read();if(done)break;n+=value.length;if(n>max)throw Error('RESPONSE_TOO_LARGE');parts.push(value);}}catch(e){await reader.cancel();throw e;}
@@ -43,7 +55,7 @@ export function validateAnalysis(result,inputs){
  }return result.items;
 }
 export function waveAt(now){const d=new Date(now),h=d.getUTCHours(),m=d.getUTCMinutes();return h===16&&m===30?'EVENING':h===20&&m===30?'NIGHT':h===6&&m===15?'MORNING':null;}
-async function sourceStatus(db,s,status,now,error=null){await db.prepare('INSERT INTO news_sources(source_id,source_url,status,last_attempt_at,last_success_at,error) VALUES(?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET status=excluded.status,last_attempt_at=excluded.last_attempt_at,last_success_at=COALESCE(excluded.last_success_at,news_sources.last_success_at),error=excluded.error').bind(s.id,s.url,status,iso(now),status==='PARTIAL_RSS_WINDOW'?iso(now):null,error).run();}
+async function sourceStatus(db,s,status,now,error=null){await db.prepare('INSERT INTO news_sources(source_id,source_url,status,last_attempt_at,last_success_at,error) VALUES(?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET status=excluded.status,last_attempt_at=excluded.last_attempt_at,last_success_at=COALESCE(excluded.last_success_at,news_sources.last_success_at),error=excluded.error').bind(s.id,s.url,status,iso(now),status.startsWith('PARTIAL_')?iso(now):null,error).run();}
 export async function saveRaw(db,raw,now){
  const hash=await sha256(JSON.stringify({headline:raw.headline,body:raw.body,published_at:raw.published_at})),id=await sha256(raw.source_id+'\n'+raw.source_record_id+'\n'+hash);
  const existing=await db.prepare('SELECT record_id FROM news_records WHERE record_id=?').bind(id).first();if(existing)return false;
@@ -72,7 +84,7 @@ async function analyze(env,rows,runId,network){
 
 async function persistAnalysis(env,rows,result,runId,model){
  const at=iso(Date.now());
- for(const a of result){const raw=rows.find(x=>x.record_id===a.record_id),payload=JSON.stringify({...raw,analysis:a,analyzed_at:at,model_version:model,prompt_version:'news-v3',run_id:runId,research_status:a.needs_followup||a.importance>=4?'WAITING_RESEARCH':'NOT_REQUESTED'}),hash=await sha256(payload);
+ for(const a of result){const raw=rows.find(x=>x.record_id===a.record_id);if(raw.summary_only||!raw.body?.trim()){a.needs_followup=true;a.uncertainty_level='HIGH';}const payload=JSON.stringify({...raw,analysis:a,analyzed_at:at,model_version:model,prompt_version:'news-v3',run_id:runId,research_status:a.needs_followup||a.importance>=4?'WAITING_RESEARCH':'NOT_REQUESTED'}),hash=await sha256(payload);
   const stmts=[env.DB.prepare('UPDATE news_bodies SET payload_json=?,payload_hash=?,analyzed_at=? WHERE record_id=? AND payload_json IS NULL').bind(payload,hash,at,a.record_id),env.DB.prepare("UPDATE news_records SET state='READY' WHERE record_id=? AND state='RAW'").bind(a.record_id)];
   if(a.needs_followup||a.importance>=4)stmts.push(env.DB.prepare('INSERT OR IGNORE INTO news_followups(record_id,importance,created_at) VALUES(?,?,?)').bind(a.record_id,a.importance,at));await env.DB.batch(stmts);
  }
@@ -89,15 +101,17 @@ async function analyzeMini(env,rows,runId,network){
 }
 
 export async function runNews(env,wave='MANUAL',now=Date.now(),network=fetch){
- const runId=wave==='MANUAL'?(env.NEWS_TEST==='true'?(env.NEWS_PROVIDER==='OPENAI'?'mini:':'test:'):'manual:')+Math.floor(now/300000):iso(now).slice(0,10)+':'+wave;
+ const runId=wave==='AUTO_COLLECT'?'auto:'+Math.floor(now/900000):wave==='MANUAL'?(env.NEWS_TEST==='true'?(env.NEWS_PROVIDER==='OPENAI'?'mini:':'test:'):'manual:')+Math.floor(now/300000):iso(now).slice(0,10)+':'+wave;
  const claim=await env.DB.prepare("INSERT OR IGNORE INTO news_runs(run_id,wave,started_at,status) VALUES(?,?,?,'RUNNING')").bind(runId,wave,iso(now)).run();if(!claim.meta.changes){const prior=await env.DB.prepare('SELECT status,metrics_json FROM news_runs WHERE run_id=?').bind(runId).first();return {...JSON.parse(prior?.metrics_json||'{}'),duplicate:true,run_id:runId,status:prior?.status,retry_at:wave==='MANUAL'?iso((Math.floor(now/300000)+1)*300000):null};}
+ const kapLast=wave==='AUTO_COLLECT'?await env.DB.prepare("SELECT last_attempt_at FROM news_sources WHERE source_id='KAP_PUBLIC'").first():null;
+ const sources=SOURCES.filter(x=>x.kind!=='KAP_PUBLIC'||wave!=='AUTO_COLLECT'||new Date(now).getUTCMinutes()===0||!kapLast);
  const metrics={source_attempts:0,new_records:0,analysis_calls:0,analysis:[],errors:[],coverage:'PARTIAL',kap_status:'NOT_CONFIGURED',deep_search_status:'NOT_ENABLED',cost_status:'UNMEASURED'};
  const progress=async(percent,phase,extra={})=>{metrics.progress={...metrics.progress,...extra,percent,phase,updated_at:iso(Date.now())};await env.DB.prepare('UPDATE news_runs SET metrics_json=? WHERE run_id=?').bind(JSON.stringify(metrics),runId).run();};
  try{
-  await progress(0,'Haber kaynaklarına bağlanılıyor',{completed_sources:0,total_sources:SOURCES.length,analyzed_records:0,target_records:0});
+  await progress(0,'Haber kaynaklarına bağlanılıyor',{completed_sources:0,total_sources:sources.length,analyzed_records:0,target_records:0});
   // Public RSS is a finite window. Never advance a full-coverage checkpoint for it.
-  for(const s of SOURCES){await progress(25*metrics.source_attempts,s.id+' haberleri toplanıyor');metrics.source_attempts++;try{const parsed=parseRSS(await boundedText(await network(s.url,{redirect:'manual',signal:AbortSignal.timeout(20000)})),s,now);const recent=parsed.items.filter(x=>Date.parse(x.published_at)>=now-3*86400000);for(const raw of recent.slice(0,80))if(await saveRaw(env.DB,raw,now))metrics.new_records++;await sourceStatus(env.DB,s,'PARTIAL_RSS_WINDOW',now);}catch(e){metrics.errors.push({source:s.id,error:String(e.message).slice(0,120)});await sourceStatus(env.DB,s,'ERROR',now,String(e.message).slice(0,120));}await progress(25*metrics.source_attempts,'Kaynak taraması ilerliyor',{completed_sources:metrics.source_attempts});}
-  await sourceStatus(env.DB,{id:'KAP',url:'https://www.kap.org.tr'},'NOT_CONFIGURED',now,'OFFICIAL_DISCLOSURE_ADAPTER_REQUIRED');
+  for(const s of sources){await progress(Math.floor(50*metrics.source_attempts/sources.length),s.id+' haberleri toplanıyor');metrics.source_attempts++;try{const parsed=(s.kind==='KAP_PUBLIC'?parseKap:s.kind==='ATOM'?parseTCMB:parseRSS)(await boundedText(await network(s.url,{...(s.kind==='KAP_PUBLIC'?kapRequest(now):{redirect:'manual'}),signal:AbortSignal.timeout(20000)})),s,now);const recent=parsed.items.filter(x=>Date.parse(x.published_at)>=now-(s.max_age_days||3)*86400000);for(const raw of recent.slice(0,s.kind==='KAP_PUBLIC'?1500:80))if(await saveRaw(env.DB,raw,now))metrics.new_records++;await sourceStatus(env.DB,s,parsed.coverage,now);if(s.kind==='KAP_PUBLIC')metrics.kap_status='PUBLIC_SUMMARY_ONLY';}catch(e){metrics.errors.push({source:s.id,error:String(e.message).slice(0,120)});await sourceStatus(env.DB,s,'ERROR',now,String(e.message).slice(0,120));}await progress(Math.floor(50*metrics.source_attempts/sources.length),'Kaynak taraması ilerliyor',{completed_sources:metrics.source_attempts});}
+  await sourceStatus(env.DB,{id:'KAP',url:'https://www.kap.org.tr'},'LICENSED_API_NOT_CONFIGURED',now,'PUBLIC_SUMMARY_ADAPTER_SEPARATE;LICENSED_API_REQUIRES_AUTHORIZATION');
   const pending=await env.DB.prepare("SELECT b.raw_json FROM news_bodies b JOIN news_records r ON r.record_id=b.record_id WHERE r.state='RAW' ORDER BY r.published_at,r.record_id LIMIT ?").bind(env.NEWS_TEST==='true'?20:50).all();
   const batches=chunks((pending.results||[]).map(x=>JSON.parse(x.raw_json))).slice(0,2),target=batches.reduce((n,b)=>n+b.length,0);let analyzed=0;
   if(env.NEWS_AI_ENABLED==='true'){await progress(50,target?'Haber analizi hazırlanıyor':'Analiz edilecek haber yok',{target_records:target});for(const batch of batches){try{await progress(50+Math.floor(45*analyzed/target),env.NEWS_PROVIDER==='OPENAI'?'GPT mini yanıtı bekleniyor':'Gemini yanıtı bekleniyor');metrics.analysis_calls++;metrics.analysis.push(await (env.NEWS_PROVIDER==='OPENAI'?analyzeMini:analyze)(env,batch,runId,network));analyzed+=batch.length;await progress(50+Math.floor(45*analyzed/target),'Analiz sonuçları kaydedildi',{analyzed_records:analyzed});}catch(e){if(e.analysis_metadata)metrics.analysis.push(e.analysis_metadata);metrics.errors.push({stage:'ANALYSIS',error:String(e.message).slice(0,120),expected_records:e.expected_records??batch.length,returned_records:e.returned_records??null,...(e.provider_error?{provider_error:e.provider_error}:{})});break;}}}else metrics.analysis_status='DISABLED_UNTIL_SMALL_TEST';
@@ -105,21 +119,13 @@ export async function runNews(env,wave='MANUAL',now=Date.now(),network=fetch){
   metrics.elapsed_ms=Date.now()-now;await env.DB.prepare('UPDATE news_runs SET finished_at=?,status=?,metrics_json=? WHERE run_id=?').bind(iso(Date.now()),metrics.errors.length?'PARTIAL_ERROR':'PARTIAL',JSON.stringify(metrics),runId).run();return {run_id:runId,...metrics};
  }catch(e){await env.DB.prepare("UPDATE news_runs SET finished_at=?,status='ERROR',metrics_json=? WHERE run_id=?").bind(iso(Date.now()),JSON.stringify({...metrics,fatal_error:String(e.message).slice(0,120)}),runId).run();throw e;}
 }
-export async function newsScheduled(env,time){const wave=waveAt(time);return wave?runNews(env,wave,time):null;}
+export async function newsScheduled(env,time,network=fetch){const wave=waveAt(time);return wave?runNews({...env,NEWS_AI_ENABLED:'false'},wave,time,network):new Date(time).getUTCMinutes()%15===0?runNews({...env,NEWS_AI_ENABLED:'false'},'AUTO_COLLECT',time,network):null;}
 export async function newsRoute(request,env){
  const u=new URL(request.url),path=u.pathname;
  if(path.startsWith('/bist/news/matriks/'))return await matriksRoute(request,env);
- if(path==='/bist/news/list'&&request.method==='GET'){
-  const date=u.searchParams.get('date')||new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Istanbul'}).format(new Date());
-  if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return response({error:'INVALID_DATE'},422);
-  const start=Date.parse(date+'T00:00:00+03:00');if(!Number.isFinite(start)||iso(start+3*3600000).slice(0,10)!==date)return response({error:'INVALID_DATE'},422);
-  const offset=Math.max(0,Math.min(100000,Math.floor(Number(u.searchParams.get('offset'))||0))),limit=50;
-  const rows=await env.DB.prepare('SELECT r.record_id,r.source_id,r.headline,r.published_at,r.source_url,r.record_version,r.state,b.payload_json FROM news_records r LEFT JOIN news_bodies b ON b.record_id=r.record_id WHERE r.published_at>=? AND r.published_at<? ORDER BY r.published_at DESC,r.record_id LIMIT ? OFFSET ?').bind(iso(start),iso(start+86400000),limit+1,offset).all();
-  const count=await env.DB.prepare('SELECT count(*) total FROM news_records WHERE published_at>=? AND published_at<?').bind(iso(start),iso(start+86400000)).first();
-  return response({date,time_zone:'Europe/Istanbul',total:count.total,offset,limit,has_more:rows.results.length>limit,coverage:'PARTIAL_RSS_WINDOW',records:rows.results.slice(0,limit).map(({payload_json,...r})=>({...r,analysis:payload_json?JSON.parse(payload_json).analysis:null,analysis_location:r.state==='ACKED'?'PC_ARCHIVE':r.state==='READY'?'CLOUD':'PENDING'}))});
- }
+ if(['/bist/news/list','/bist/news/digest','/bist/news/context'].includes(path))return await intelligenceRoute(request,env);
  if(path==='/bist/news/status'&&request.method==='GET'){
-  const [sources,runs,count]=await Promise.all([env.DB.prepare('SELECT * FROM news_sources ORDER BY source_id').all(),env.DB.prepare('SELECT * FROM news_runs ORDER BY started_at DESC LIMIT 10').all(),env.DB.prepare('SELECT state,count(*) count FROM news_records GROUP BY state').all()]);return response({module:'NEWS_V1',schedules_trt:['19:30','23:30','09:15'],sources:sources.results,runs:runs.results.map(x=>({...x,metrics:JSON.parse(x.metrics_json)})),counts:count.results,ai_enabled:env.NEWS_AI_ENABLED==='true',kap_status:'NOT_CONFIGURED',deep_search_enabled:false,paper_only:true});
+  const [sources,runs,count]=await Promise.all([env.DB.prepare('SELECT * FROM news_sources ORDER BY source_id').all(),env.DB.prepare('SELECT * FROM news_runs ORDER BY started_at DESC LIMIT 10').all(),env.DB.prepare('SELECT state,count(*) count FROM news_records GROUP BY state').all()]);return response({module:'NEWS_V1',schedules_trt:['19:30','23:30','09:15'],automatic_collection:{enabled:true,interval_minutes:15,ordering:'PUBLISHED_AT_DESC',next_run_at:iso((Math.floor(Date.now()/900000)+1)*900000)},automatic_analysis:{enabled:false,status:'WAITING_MINI_LIVE_TEST'},sources:sources.results,runs:runs.results.map(x=>({...x,metrics:JSON.parse(x.metrics_json)})),counts:count.results,ai_enabled:env.NEWS_AI_ENABLED==='true',kap_status:'PUBLIC_SUMMARY_ADAPTER',kap_licensed_api_status:'NOT_CONFIGURED',kap_public_interval_minutes:60,deep_search_enabled:false,paper_only:true});
  }
  if(path==='/bist/news/pending'&&request.method==='GET'){
   const limit=Math.min(30,Math.max(1,Number(u.searchParams.get('limit'))||20));const rows=await env.DB.prepare("SELECT r.record_id,r.content_hash,b.payload_hash,b.payload_json FROM news_records r JOIN news_bodies b ON b.record_id=r.record_id WHERE r.state='READY' AND b.payload_json IS NOT NULL ORDER BY r.published_at,r.record_id LIMIT ?").bind(limit).all();return response({records:rows.results});
