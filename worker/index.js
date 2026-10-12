@@ -1228,6 +1228,7 @@ replayClock.oninput=renderReplay;replayClock.value=replayReport.accounts[0].time
 },async scheduled(controller,env){const time=controller.scheduledTime||Date.now();
  const news=await newsScheduled(env,time).catch(e=>({error:'NEWS_SCHEDULE_FAILED'}));
  // Added off-session news triggers must never tick the existing trading scheduler.
+ if(['30 16 * * *','30 20 * * *','15 6 * * *'].includes(controller.cron))return {news};
  const d=new Date(time),h=d.getUTCHours(),day=d.getUTCDay();
  if(day===0||day===6||h<6||h>16)return {news};
  const result=await enforceSessionClose(env.DB,Date.now());try{return {...result,news,push:await drainPush(env)};}catch{return {...result,news,push:{error:'DISPATCH_FAILED'}};}}};

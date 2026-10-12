@@ -46,9 +46,11 @@ async function sourceStatus(db,s,status,now,error=null){await db.prepare('INSERT
 async function saveRaw(db,raw,now){
  const hash=await sha256(JSON.stringify({headline:raw.headline,body:raw.body,published_at:raw.published_at})),id=await sha256(raw.source_id+'\n'+raw.source_record_id+'\n'+hash);
  const existing=await db.prepare('SELECT record_id FROM news_records WHERE record_id=?').bind(id).first();if(existing)return false;
- const prior=await db.prepare('SELECT record_id,record_version FROM news_records WHERE source_id=? AND source_record_id=? ORDER BY record_version DESC LIMIT 1').bind(raw.source_id,raw.source_record_id).first();
- const v=(prior?.record_version||0)+1,payload={...raw,record_id:id,record_version:v,supersedes_record_id:prior?.record_id||null,content_hash:hash,fetched_at:iso(now)};
- await db.batch([db.prepare('INSERT OR IGNORE INTO news_records(record_id,source_id,source_record_id,record_version,supersedes_record_id,content_hash,published_at,fetched_at,source_url,headline) VALUES(?,?,?,?,?,?,?,?,?,?)').bind(id,raw.source_id,raw.source_record_id,v,prior?.record_id||null,hash,raw.published_at,iso(now),raw.source_url,raw.headline),db.prepare("INSERT OR IGNORE INTO news_bodies(record_id,raw_json) SELECT ?,? WHERE NOT EXISTS(SELECT 1 FROM news_receipts WHERE record_id=?)").bind(id,JSON.stringify(payload),id)]);return true;
+ const payload={...raw,record_id:id,content_hash:hash,fetched_at:iso(now)};
+ const ops=await db.batch([
+  db.prepare('INSERT OR IGNORE INTO news_records(record_id,source_id,source_record_id,record_version,supersedes_record_id,content_hash,published_at,fetched_at,source_url,headline) SELECT ?,?,?,COALESCE((SELECT MAX(record_version) FROM news_records WHERE source_id=? AND source_record_id=?),0)+1,(SELECT record_id FROM news_records WHERE source_id=? AND source_record_id=? ORDER BY record_version DESC LIMIT 1),?,?,?,?,?').bind(id,raw.source_id,raw.source_record_id,raw.source_id,raw.source_record_id,raw.source_id,raw.source_record_id,hash,raw.published_at,iso(now),raw.source_url,raw.headline),
+  db.prepare("INSERT OR IGNORE INTO news_bodies(record_id,raw_json) SELECT ?,json_set(?,'$.record_version',r.record_version,'$.supersedes_record_id',r.supersedes_record_id) FROM news_records r WHERE r.record_id=? AND NOT EXISTS(SELECT 1 FROM news_receipts WHERE record_id=?)").bind(id,JSON.stringify(payload),id,id)
+ ]);return ops[0].meta.changes>0;
 }
 function chunks(rows){const out=[];let c=[],size=0;for(const r of rows){const n=JSON.stringify(r).length;if(c.length&&(c.length>=25||size+n>42000)){out.push(c);c=[];size=0;}c.push(r);size+=n;}if(c.length)out.push(c);return out;}
 async function analyze(env,rows,runId,network){
