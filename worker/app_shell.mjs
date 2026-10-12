@@ -1,4 +1,5 @@
 const reply=json;
+const d1QuotaReply=e=>/daily row (read|write) limit|free tier.*daily.*limit/i.test(String(e?.message||e))?reply({error:'D1_DAILY_QUOTA_EXCEEDED',message:'D1 günlük kotası doldu. Kota 03:00 TRT’de yenilenir; bugünkü akış için ücretli plan gerekir.',reset_at:new Date((Math.floor(Date.now()/86400000)+1)*86400000).toISOString()},503):null;
 const hash=async value=>new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)));
 const secureEqual=async(a,b)=>{const[x,y]=await Promise.all([hash(a),hash(b)]);let d=0;for(let i=0;i<x.length;i++)d|=x[i]^y[i];return d===0;};
 export default {async fetch(request,env){
@@ -14,7 +15,7 @@ export default {async fetch(request,env){
   if(!['GET','POST'].includes(request.method))return reply({error:'METHOD_NOT_ALLOWED'},405);
   const key=env.BIST_INGEST_TOKEN||env.ACCESS_TOKEN;
   if(!key||!provided||!await secureEqual(provided,key))return reply({error:'Unauthorized'},401);
-  try{return await trialFeed(request,env);}catch{return reply({error:'TRIAL_FEED_FAILED'},503);}
+  try{return await trialFeed(request,env);}catch(e){return d1QuotaReply(e)||reply({error:'TRIAL_FEED_FAILED'},503);}
  }
  const constantEqual=(x,y)=>{if(x.length!==y.length)return false;let d=0;for(let i=0;i<x.length;i++)d|=x.charCodeAt(i)^y.charCodeAt(i);return d===0};
  const key=env.ACCESS_TOKEN?await crypto.subtle.importKey("raw",new TextEncoder().encode(env.ACCESS_TOKEN),{name:"HMAC",hash:"SHA-256"},false,["sign"]):null;
@@ -46,16 +47,17 @@ export default {async fetch(request,env){
    if(u.pathname.endsWith('/risk'))return await riskIngest(request,env);
    if(u.pathname.endsWith('/report'))return await reportIngest(request,env);
    if(u.pathname.endsWith('/finalize'))return await finalize(request,env);
-   return await ingest(request,env);}catch{return reply({error:'INGEST_OR_ENGINE_FAILED',retry_safe:true},503);}
+   return await ingest(request,env);}catch(e){return d1QuotaReply(e)||reply({error:'INGEST_OR_ENGINE_FAILED',retry_safe:true},503);}
  }
  if(!authenticated)return reply({error:"Unauthorized"},401);
+ try {
  if(u.pathname==='/bist/opportunities'){
   if(request.method!=='GET')return reply({error:'METHOD_NOT_ALLOWED'},405);
-  try{return reply(await opportunitiesOverview(env.DB,u.searchParams.get('date')||trtDate(Date.now())));}catch{return reply({error:'OPPORTUNITIES_UNAVAILABLE'},503);}
+  try{return reply(await opportunitiesOverview(env.DB,u.searchParams.get('date')||trtDate(Date.now())));}catch(e){return d1QuotaReply(e)||reply({error:'OPPORTUNITIES_UNAVAILABLE'},503);}
  }
  if(u.pathname==='/bist/trials'){
   if(request.method!=='GET')return reply({error:'METHOD_NOT_ALLOWED'},405);
-  try{return reply(await trialOverview(env.DB));}catch{return reply({error:'TRIAL_STATUS_UNAVAILABLE'},503);}
+  try{return reply(await trialOverview(env.DB));}catch(e){return d1QuotaReply(e)||reply({error:'TRIAL_STATUS_UNAVAILABLE'},503);}
  }
  if(u.pathname.startsWith('/push/')){if(request.method==='POST'&&request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);return await pushRoute(request,env);}
 
@@ -67,13 +69,14 @@ export default {async fetch(request,env){
  if(u.pathname==='/bist/demo/start-20261012'){
   if(request.method!=='POST')return reply({error:'METHOD_NOT_ALLOWED'},405);
   if(request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);
-  try{return await startDemo20261012(request,env);}catch{return reply({error:'DEMO_START_FAILED',retry_safe:true},503);}
+  try{return await startDemo20261012(request,env);}catch(e){return d1QuotaReply(e)||reply({error:'DEMO_START_FAILED',retry_safe:true},503);}
  }
- if(u.pathname==='/bist/strategy/berker3'){if(request.method==='POST'&&request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);try{return await berker3Route(request,env);}catch{return reply({error:'LIST_UPDATE_FAILED'},503);}}
+ if(u.pathname==='/bist/strategy/berker3'){if(request.method==='POST'&&request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);try{return await berker3Route(request,env);}catch(e){return d1QuotaReply(e)||reply({error:'LIST_UPDATE_FAILED'},503);}}
  if(u.pathname==='/bist/strategy/close'){
   if(request.method!=='POST')return reply({error:'METHOD_NOT_ALLOWED'},405);
   if(request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);
-  try{return await manualStrategyClose(request,env);}catch{return reply({error:'CLOSE_FAILED',retry_safe:true},503);}
+  try{return await manualStrategyClose(request,env);}catch(e){return d1QuotaReply(e)||reply({error:'CLOSE_FAILED',retry_safe:true},503);}
  }
  return reply({error:'DISABLED_IN_INGRESS_ONLY_MODE',external_fetch_enabled:false},410);
+}catch(e){return d1QuotaReply(e)||reply({error:'PANEL_READ_FAILED'},503);}
 },async scheduled(controller,env){const result=await enforceSessionClose(env.DB,Date.now());try{return {...result,push:await drainPush(env)};}catch{return {...result,push:{error:'DISPATCH_FAILED'}};}}};

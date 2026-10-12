@@ -68,7 +68,7 @@ export function scalpExit(t,bars,q,now){
   if(last&&Date.parse(last.bar_time)+900000>=cutoff&&now-(Date.parse(last.bar_time)+900000)<=900000)return {raw:last.close,reason,time:last.bar_time};
  }return null;
 }
-export async function manageScalp(db,now){const rows=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN' AND engine_version=2").all();let closed=0,partial=0;
+export async function manageScalp(db,now,changedSymbol=null){const statement=db.prepare("SELECT * FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN' AND engine_version=2"+(changedSymbol?" AND symbol=?":""));const rows=await (changedSymbol?statement.bind(changedSymbol):statement).all();let closed=0,partial=0;
  for(let t of rows.results||[]){const q=await db.prepare('SELECT * FROM strategy_quotes WHERE symbol=?').bind(t.symbol).first(),bars=await symbolBars(db,t.symbol,now);
   // A historical TP1 and a later runner exit may be observed in one monitor tick.
   for(let step=0;step<2;step++){const exit=scalpExit(t,bars,q,now);if(!exit||!await sellLeg(db,t,exit.qty??t.remaining_lots,exit.raw,exit.reason,exit.time,now,exit.activation||null))break;
@@ -76,8 +76,11 @@ export async function manageScalp(db,now){const rows=await db.prepare("SELECT * 
   }
  }return {closed,partial};
 }
-export async function trendHistories(db,symbol,now){const r=await db.prepare('SELECT * FROM trend_bars WHERE symbol=? AND bar_time<=? ORDER BY bar_time').bind(symbol,iso(now)).all();return {hour:(r.results||[]).filter(b=>b.interval==='60m'&&Date.parse(b.bar_time)+3600000<=now).slice(-350),daily:(r.results||[]).filter(b=>b.interval==='1d'&&trtDate(Date.parse(b.bar_time))<trtDate(now)).slice(-350)};}
-export async function manageTrend(db,now){const rows=await db.prepare("SELECT * FROM virtual_trades WHERE strategy='SWING' AND status='OPEN' AND engine_version=2").all();let closed=0,partial=0;
+export async function trendHistories(db,symbol,now){
+ const [h,d]=await Promise.all([db.prepare("SELECT * FROM trend_bars WHERE symbol=? AND interval='60m' AND bar_time<=? ORDER BY bar_time DESC LIMIT 350").bind(symbol,iso(now-3600000)).all(),db.prepare("SELECT * FROM trend_bars WHERE symbol=? AND interval='1d' AND bar_time<? ORDER BY bar_time DESC LIMIT 350").bind(symbol,iso(Date.parse(trtDate(now)+'T00:00:00+03:00'))).all()]);
+ return {hour:(h.results||[]).reverse(),daily:(d.results||[]).reverse()};
+}
+export async function manageTrend(db,now,changedSymbol=null){const statement=db.prepare("SELECT * FROM virtual_trades WHERE strategy='SWING' AND status='OPEN' AND engine_version=2"+(changedSymbol?" AND symbol=?":""));const rows=await (changedSymbol?statement.bind(changedSymbol):statement).all();let closed=0,partial=0;
  for(let t of rows.results||[]){const {hour,daily}=await trendHistories(db,t.symbol,now),levels=strategyThresholds(t);
   for(const b of hour){if(Date.parse(b.bar_time)<Date.parse(t.entry_time)||t.last_processed_trend_bar&&b.bar_time<=t.last_processed_trend_bar)continue;
    // Stop established at OPEN takes priority; a stop raised by this candle applies later.
@@ -116,8 +119,8 @@ export async function fillStrategy(db,strategy,now){const table=QUEUES[strategy]
   try{const key=(strategy==='SCALP'?'SCALP:':'TREND:')+q.signal_key;const r=await db.prepare(`INSERT INTO virtual_trades(strategy,symbol,signal_price,executed_price,lot_count,commission,entry_time,status,slot_id,feed_entry_key,engine_version,remaining_lots,tp1_done,trailing_stop,entry_quote_time,entry_observed_at) VALUES(?,?,?,?,?,?,?,'OPEN',?,?,2,?,0,?,?,?) ON CONFLICT(feed_entry_key) DO NOTHING`).bind(strategy,q.symbol,quote.price,plan.executed,plan.qty,plan.commission,iso(now),slot,key,plan.qty,stop,quote.quote_time,iso(now)).run();opened+=r.meta.changes;}catch(e){if(!/PAPER_SLOT_BUSY|PAPER_INSUFFICIENT_CASH|PAPER_SIGNAL_NOT_ELIGIBLE|PAPER_QUOTE_OR_RISK_INVALID/.test(String(e)))throw e;}
  }return {opened};
 }
-export async function tickStrategies(db,now=Date.now()){
- const scalp=await manageScalp(db,now),trend=await manageTrend(db,now),scalpFill=await fillStrategy(db,'SCALP',now),trendFill=await fillStrategy(db,'SWING',now);
+export async function tickStrategies(db,now=Date.now(),changedSymbol=null){
+ const scalp=await manageScalp(db,now,changedSymbol),trend=await manageTrend(db,now,changedSymbol),scalpFill=await fillStrategy(db,'SCALP',now),trendFill=await fillStrategy(db,'SWING',now);
  return {scalp:{...scalp,...scalpFill},trend:{...trend,...trendFill},paper_only:true};
 }
 export async function enqueueScalp(db,c,decision,observed){
@@ -132,7 +135,7 @@ export function validateTrendBars(symbol,interval,rows,now){
 }
 export async function trendIngest(request,env,now=Date.now()){
  let b,hour,daily;try{b=await boundedBody(request);if(b.source!=='YAHOO_INDICATIVE')throw Error('INVALID_TREND_SOURCE');hour=validateTrendBars(b.symbol,'60m',b.hour,now);daily=validateTrendBars(b.symbol,'1d',b.daily,now);}catch(e){return json({error:e.message},422);}
- const rows=[...hour,...daily];await env.DB.prepare(`INSERT INTO trend_bars SELECT json_extract(value,'$.symbol'),json_extract(value,'$.interval'),json_extract(value,'$.time'),json_extract(value,'$.open'),json_extract(value,'$.high'),json_extract(value,'$.low'),json_extract(value,'$.close'),json_extract(value,'$.volume'),'YAHOO_INDICATIVE',? FROM json_each(?) WHERE true ON CONFLICT(symbol,interval,bar_time) DO UPDATE SET open=excluded.open,high=excluded.high,low=excluded.low,close=excluded.close,volume=excluded.volume,received_at=excluded.received_at`).bind(iso(now),JSON.stringify(rows)).run();
+ const rows=[...hour,...daily];await env.DB.prepare(`INSERT INTO trend_bars SELECT json_extract(value,'$.symbol'),json_extract(value,'$.interval'),json_extract(value,'$.time'),json_extract(value,'$.open'),json_extract(value,'$.high'),json_extract(value,'$.low'),json_extract(value,'$.close'),json_extract(value,'$.volume'),'YAHOO_INDICATIVE',? FROM json_each(?) WHERE true ON CONFLICT(symbol,interval,bar_time) DO UPDATE SET open=excluded.open,high=excluded.high,low=excluded.low,close=excluded.close,volume=excluded.volume,received_at=excluded.received_at WHERE trend_bars.open<>excluded.open OR trend_bars.high<>excluded.high OR trend_bars.low<>excluded.low OR trend_bars.close<>excluded.close OR trend_bars.volume<>excluded.volume OR excluded.bar_time IN (?,?)`).bind(iso(now),JSON.stringify(rows),hour.at(-1).time,daily.at(-1).time).run();
  await saveQuote(env.DB,b.symbol,b.quote,now);
  const m=trendSignal(hour.map(x=>({...x,bar_time:x.time})),daily.map(x=>({...x,bar_time:x.time})),await symbolBars(env.DB,b.symbol,now),now);let queued=0;
  if(m){await captureOpportunity(env.DB,'SWING',b.symbol,b.symbol+':'+m.bar_time,'HOT',m.bar_time,{...m,last_candle:hour.at(-1)},now);await captureOpportunity(env.DB,'SWING',b.symbol,b.symbol+':'+m.bar_time,'APPROVED',m.bar_time,{...m,last_candle:hour.at(-1)},now);}
@@ -141,7 +144,7 @@ export async function trendIngest(request,env,now=Date.now()){
   await env.DB.prepare("UPDATE trend_radar_queue SET status='EXPIRED',reason='SUPERSEDED' WHERE symbol=? AND signal_key<>? AND status='READY'").bind(b.symbol,key).run();
   const r=await env.DB.prepare(`INSERT OR IGNORE INTO trend_radar_queue VALUES(?,?,?,?,?,?,?,'READY','EMA200_SUPERTREND_VWAP',?)`).bind(key,b.symbol,m.bar_time,iso(now),expiry,m.score,priority?.priority||0,JSON.stringify(m)).run();queued=r.meta.changes;
  }
- return json({ok:true,queued,criteria_passed:!!m,engines:await tickStrategies(env.DB,now),paper_only:true});
+ return json({ok:true,queued,criteria_passed:!!m,engines:await tickStrategies(env.DB,now,b.symbol),paper_only:true});
 }
 export async function strategyMonitor(db,now=Date.now()){
  const r=await db.prepare(`SELECT symbol,strategy FROM virtual_trades WHERE status='OPEN' UNION SELECT symbol,'SCALP' FROM scalp_sniper_queue WHERE status='READY' AND expires_at>? UNION SELECT symbol,'SWING' FROM trend_radar_queue WHERE status='READY' AND expires_at>? UNION SELECT symbol,strategy FROM opportunity_events WHERE captured_at>=strftime('%Y-%m-%dT00:00:00.000Z','now','-3 hours')`).bind(iso(now),iso(now)).all();const targets=r.results||[];return {symbols:[...new Set(targets.map(x=>x.symbol))],targets};
@@ -167,7 +170,7 @@ export async function isolatedOverview(db,now=Date.now()){
 export async function quoteIngest(request,env,now=Date.now()){
  let b;try{b=await boundedBody(request);}catch(e){return json({error:e.message},422);}
  if(!await saveQuote(env.DB,b.symbol,b.quote,now))return json({error:'FRESH_PROVIDER_QUOTE_REQUIRED'},422);
- return json({ok:true,engines:await tickStrategies(env.DB,now)});
+ return json({ok:true,engines:await tickStrategies(env.DB,now,b.symbol)});
 }
 export async function trendUniverse(db,now=Date.now()){const r=await db.prepare(`SELECT symbol FROM bist_universe WHERE active=1 UNION SELECT symbol FROM bist_funnel_risk WHERE eligible=1 AND valid_until>? UNION SELECT symbol FROM berker3_symbols WHERE active=1`).bind(iso(now)).all();const p=await db.prepare('SELECT symbol FROM berker3_symbols WHERE active=1 ORDER BY priority DESC,symbol').all();return json({symbols:(r.results||[]).map(x=>x.symbol),priority:(p.results||[]).map(x=>x.symbol)});}
 export async function berker3Route(request,env){

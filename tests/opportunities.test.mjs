@@ -44,3 +44,7 @@ test('observed quote deduplication, day archive, and premium radar do not change
  await assert.rejects(db.prepare("INSERT INTO virtual_trades(strategy,symbol,status,engine_version,entry_time) VALUES('SCALP','TUPRS','OPEN',2,?)").bind(iso(at)).run());
  }finally{clean();}
 });
+test('production quota errors return a precise recoverable panel error, never an API-key claim',async()=>{
+ const code=(await import('node:fs')).readFileSync(new URL('../worker/index.js',import.meta.url),'utf8');const {default:worker}=await import('data:text/javascript;base64,'+Buffer.from(code).toString('base64'));
+ const response=await worker.fetch(new Request('https://panel.test/bist/connections',{headers:{Authorization:'Bearer test'}}),{ACCESS_TOKEN:'test',DB:{prepare(){throw Error("Your account has exceeded D1's free tier daily row read limit.");}}});assert.equal(response.status,503);const result=await response.json();assert.equal(result.error,'D1_DAILY_QUOTA_EXCEEDED');assert.match(result.message,/03:00 TRT/);
+});

@@ -166,7 +166,7 @@ export async function ingest(request, env, now=Date.now()) {
  // Save only the independently timestamped provider quote. A bar close is not a live quote.
  await saveQuote(env.DB,symbol,body.quote,now);
  await saveMarketContext(env.DB,symbol,body.previous_session_close,now);
- const engines=await tickStrategies(env.DB,now),engine=engines.scalp,sniper=engines.trend,session={scalp_close_at:'17:40',trend_overnight:true};
+ const engines=await tickStrategies(env.DB,now,symbol),engine=engines.scalp,sniper=engines.trend,session={scalp_close_at:'17:40',trend_overnight:true};
  let stage2='NOT_HOT';
  if(active && data.purpose==='HOT_CANDIDATE' && validRunId(data.run_id)) {
   const rows=await env.DB.prepare("SELECT * FROM bist_bridge_bars WHERE symbol=? AND source='YAHOO_INDICATIVE' AND interval='15m' AND bar_time<=? AND CAST(strftime('%s',bar_time) AS INTEGER)%900=0 ORDER BY bar_time DESC LIMIT 100").bind(symbol,latest.time).all();

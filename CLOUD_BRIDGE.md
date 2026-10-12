@@ -318,3 +318,27 @@ sayılmaz. Geçmiş kazanç/işlem/kasa veya cursor değiştirilmez.
 önlemek için ana/Deneme workflow concurrency yalnız `push` olayında eski koşuyu
 devreder (`cancel-in-progress: github.event_name == 'push'`). Normal cron ve
 oturum devamları birbirini kesmez. Mevcut D1 kasaları/işlemleri korunur.
+
+### D1 okuma yükü ve 12 Ekim kota engeli
+
+D1 ücretsiz günlük row-read sınırına ulaşıldı; bu durumda API ve Worker
+binding okumaları kota sıfırlanana veya ücretli plan uygulanana kadar başarısız
+olur. Eski verinin zamanı değiştirilmez ve veri aktifmiş gibi gösterilmez.
+Her gelen hisse paketi yalnız o hissenin açık pozisyon geçmişini yeniden
+değerlendirir. Slot doldurma sırası aynen global kalır; mevcut dakika cron'u
+bütün pozisyonları, çıkış sürelerini ve oturum sonunu yine kontrol eder.
+Trend geçmişleri artık interval/symbol indeksinden yalnız son 350 kapanmış
+60m + 350 önceki gün günlük mumunu okur. EMA/SuperTrend/TP/SL ve hesap
+kuralları değişmez. Bu optimizasyon dolmuş kotayı aynı gün sıfırlamaz.
+
+Ayrıca her Trend paketinde değişmeyen bütün eski 700 mum yeniden yazılmaz.
+OHLCV değişmiş mumlar ve alınma zamanını doğru göstermek için son saatlik/
+günlük mum güncellenir; yeni mumlar normal eklenir. Hem okuma hem yazma
+ücretsiz kotaları ayrı sınırlar olduğundan sık ve geniş evrenli çalışma için
+ücretli plan gerekebilir. Bu değişiklik geçmiş fiyatları/zamanları güncel
+fiyatmış gibi göstermez.
+
+Panel, D1 kota hatasını `D1_DAILY_QUOTA_EXCEEDED` / HTTP 503 ve gerçek UTC
+sıfırlanma zamanı ile gösterir; bu hata Gemini anahtarı/API kopukluğu diye
+etiketlenmez. Kota engeli varken yeni canlı arşiv/diagnostic kaydı doğrulanmış
+sayılmaz.
