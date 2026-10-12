@@ -1,5 +1,7 @@
 # Matriks haber/olay bağlantısı — emir göndermeyen ayrı strateji
 
+V2: `AddNewsKeyword("", false, false)` ile boş kelime denemesi eklendi. Terminal bu kaydı kabul etse bile bütün haberleri aldığı kanıtlanmış olmaz. Yeni genel haberler ile Debug'daki başlıklar karşılaştırılmalıdır. Boş kelime reddedilirse 631 sembol + KAP filtresi devam eder. Kaynak/kategori menülerine abonelik veya eksiksiz akış iddiası yoktur. Eski kayıtlar çekilmez. Debug artık callback ve dosyaya yazma aşamalarını ayrı gösterir.
+
 Bulut alıcısı ve GPT mini testi hazırdır. Windows/Matriks üzerinde kurulup gerçek kayıt alınmadan bağlantı tamamlandı sayılmaz.
 
 ## PC kurulumu
