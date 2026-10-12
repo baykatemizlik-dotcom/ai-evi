@@ -1,5 +1,7 @@
 # Haber motoru — çalışma durumu
 
+Son eklenenler: Foreks, Ekonomim, CNN Türk Ekonomi, Habertürk Ekonomi ve BIST resmî tedbir CSV adaptörleri. Yerel SQLite gardiyanı ve senkron bağlantısı için güncel ayrıntılar `NEWS_GUARDIAN.md` içindedir. Aşağıdaki ilk kurulum özeti bu eklerle birlikte okunmalıdır.
+
 ## Otomatik akış
 
 Bulut her 15 dakikada TRT ekonomi/dünya, Bloomberg HT RSS ve TCMB resmî duyuru Atom akışını toplar. KAP sitesi toplu başlık/özet sorgusu ilk taramada, saat başlarında ve üç ana dalgada çalışır; 631 tekil sorgu yapılmaz. PC kapalıyken de çalışır. 19:30, 23:30 ve 09:15 Türkiye saati taramaları korunur. Haber görevleri mevcut işlem zamanlayıcısını tetiklemez. Aynı zaman dilimi ve aynı kaynak/bildirim/içerik tekrarları yeni kayıt oluşturmaz; düzeltmeler ayrı sürüm olur. Sonraki tarama saati ve hata durumu panelde görünür.

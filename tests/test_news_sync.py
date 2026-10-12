@@ -1,5 +1,6 @@
-import hashlib,importlib.util,json,sqlite3,unittest
+import hashlib,importlib.util,json,sqlite3,unittest,sys
 from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'bridge'))
 spec=importlib.util.spec_from_file_location('news_sync',Path(__file__).resolve().parents[1]/'bridge'/'news_sync.py');sync=importlib.util.module_from_spec(spec);spec.loader.exec_module(sync)
 class SyncTests(unittest.TestCase):
     def setUp(self):

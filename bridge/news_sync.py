@@ -1,6 +1,7 @@
 """Standalone news archival client. Never opens the Matriks ledger or sends orders."""
 import argparse, getpass, hashlib, json, re, sqlite3, time, urllib.parse, urllib.request
 from pathlib import Path
+from news_guardian import schema as intelligence_schema, project_record
 
 def request_json(base, token, route, body=None):
     data=None if body is None else json.dumps(body).encode()
@@ -14,6 +15,7 @@ def request_json(base, token, route, body=None):
         return json.loads(raw)
 
 def store_records(db,records):
+    intelligence_schema(db)
     ack=[]
     with db:
         for r in records:
@@ -24,6 +26,7 @@ def store_records(db,records):
             db.execute('INSERT OR IGNORE INTO news_archive VALUES(?,?,?,?,?)',(r['record_id'],digest,r['content_hash'],payload,time.time()))
             saved=db.execute('SELECT payload_hash FROM news_archive WHERE record_id=?',(r['record_id'],)).fetchone()
             if saved[0]!=digest:raise ValueError('LOCAL_VERSION_COLLISION')
+            project_record(db,p)
             ack.append({'record_id':r['record_id'],'payload_hash':digest})
     # Only return ACKs after the transaction above has committed successfully.
     return ack
