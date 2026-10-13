@@ -1,3 +1,4 @@
+import {rankCandidates,rankedQueue,rankStatus} from './candidate-ranker.mjs';
 import {DurableObject} from 'cloudflare:workers';
 import {newsRoute,newsScheduled} from './news.mjs';
 import {NEWS_PANEL} from './news-panel.mjs';
@@ -333,10 +334,16 @@ async function finalize(request,env,now=Date.now(),network=(...args)=>globalThis
  // No candidate-count cap: five concurrent calls are transport throttling only.
  const candidates=[];
  for(const c of rows.results||[]){const m=JSON.parse(c.metrics_json),q=await env.DB.prepare('SELECT * FROM strategy_quotes WHERE symbol=?').bind(c.symbol).first(),guard=await scalpPremiumGuard(env.DB,c.symbol,Math.max(m.last_candle?.close||0,q?.price||0),now);if(guard.blocked){await capturePremium(env.DB,c.symbol,c.symbol+':'+c.bar_time,c.bar_time,m,guard,now);continue;}if(fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now)&&Number.isFinite(m.daily_turnover_tl_estimate)&&m.daily_turnover_tl_estimate>=MIN_DAILY_TURNOVER_TL&&await env.DB.prepare("SELECT signal_key FROM bist_gemini_decisions WHERE signal_key=? AND status='APPROVED' AND model=?").bind(c.symbol+':'+c.bar_time,GEMINI_MODEL).first())candidates.push(c);}
- const decisions=new Array(candidates.length);let cursor=0;
- await Promise.all(Array.from({length:Math.min(5,candidates.length)},async()=>{
-  while(cursor<candidates.length){const index=cursor++;decisions[index]=await judgeCandidate(env,candidates[index],now,network);}
- }));
+ let decisions;let ranking=null;
+ if(env.NEWS_CANDIDATE_RANKER_ENABLED==='true'){
+  ranking=await rankCandidates(env,candidates,b.run_id,now,network);
+  candidates.splice(0,candidates.length,...ranking.candidates);decisions=ranking.decisions;
+ }else{
+  decisions=new Array(candidates.length);let cursor=0;
+  await Promise.all(Array.from({length:Math.min(5,candidates.length)},async()=>{
+   while(cursor<candidates.length){const index=cursor++;decisions[index]=await judgeCandidate(env,candidates[index],now,network);}
+  }));
+ }
  let created=0;const selected=[];
  for(let i=0;i<candidates.length;i++){
   const c=candidates[i],decision=decisions[i];if(decision?.status!=='APPROVED')continue;
@@ -348,7 +355,7 @@ async function finalize(request,env,now=Date.now(),network=(...args)=>globalThis
   await enqueueScalp(env.DB,c,decision,observed);
  }
  return json({ok:true,run_id:b.run_id,model:AI_MODEL,candidates_reviewed:candidates.length,selected,signals_created:created,
-  rejected:decisions.filter(d=>d?.status==='REJECTED').length,errors:decisions.filter(d=>d?.status==='ERROR'||d?.status==='PENDING').length,orders_sent:0});
+  ranking_status:ranking?.status||'LEGACY_PER_CANDIDATE',ranking_usage:ranking?.usage||null,rejected:decisions.filter(d=>d?.status==='REJECTED').length,errors:decisions.filter(d=>d?.status==='ERROR'||d?.status==='PENDING').length,orders_sent:0});
 }
 async function aiStatus(env) {
  const last=await env.DB.prepare("SELECT symbol,status,reason,completed_at FROM bist_ai_decisions WHERE status!='PENDING' ORDER BY completed_at DESC LIMIT 1").first();
@@ -554,7 +561,8 @@ async function fillStrategy(db,strategy,now){const table=QUEUES[strategy];if(!ta
  await db.prepare(`UPDATE ${table} SET status='EXPIRED',reason='EXPIRED' WHERE status='READY' AND expires_at<=?`).bind(iso(now)).run();
  if(!strategyEntryWindow(strategy,now))return {opened,blocked:'ENTRY_WINDOW_CLOSED'};
  const qrows=await db.prepare(`SELECT * FROM ${table} WHERE status='READY' AND expires_at>? ORDER BY ${strategy==='SWING'?'priority DESC,':''}score DESC,observed_at ASC,symbol ASC LIMIT 100`).bind(iso(now)).all();
- for(const q of qrows.results||[]){
+ const queue=strategy==='SCALP'?await rankedQueue(db,qrows.results||[],now):qrows.results||[];
+ for(const q of queue){
   const slots=await db.prepare("SELECT slot_id,symbol FROM virtual_trades WHERE strategy=? AND status='OPEN'").bind(strategy).all(),open=slots.results||[],slot=[1,2].find(x=>!open.some(t=>t.slot_id===x));if(!slot)break;if(open.some(t=>t.symbol===q.symbol))continue;
   const quote=await db.prepare('SELECT * FROM strategy_quotes WHERE symbol=?').bind(q.symbol).first();if(!usableQuote(quote,now)||!await restrictionClear(db,q.symbol,now))continue;
   let stop=null;
@@ -615,7 +623,7 @@ async function isolatedOverview(db,now=Date.now()){
  const accounts=Object.fromEntries((cash.results||[]).map(x=>[x.strategy,x.available_cash])),trades=(open.results||[]).map(t=>{const qty=t.remaining_lots??t.lot_count,unit=t.executed_price+t.commission/t.lot_count,price=t.current_price||t.executed_price;const q={price,quote_time:t.quote_time,source:'YAHOO_INDICATIVE'};return {...t,remaining_lots:qty,current_price:price,quote_fresh:usableQuote(q,now),quote_age_minutes:t.quote_time?Math.max(0,(now-Date.parse(t.quote_time))/60000):null,unrealised_net:price*qty*.998*.998-unit*qty,unrealised_pct:100*(price*.998*.998/unit-1),elapsed_minutes:Math.max(0,(now-Date.parse(t.entry_time))/60000),runner_active: t.strategy==='SCALP'&&!!t.tp1_done,remaining_minutes:Math.max(0,((t.strategy==='SCALP'&&t.tp1_done?Date.parse(trtDate(Date.parse(t.entry_time))+'T14:40:00.000Z'):Date.parse(t.entry_time)+3600000)-now)/60000),thresholds:strategyThresholds(t)};});
  const histories=[...(legs.results||[]),...(old.results||[]).map(t=>({...t,event_key:'legacy:'+t.id,observed_at:t.exit_time}))].sort((a,b)=>String(b.observed_at).localeCompare(String(a.observed_at)));
  const realised=await db.prepare("SELECT (SELECT COALESCE(SUM(pnl_net),0) FROM strategy_exit_legs)+(SELECT COALESCE(SUM(pnl_net),0) FROM virtual_trades WHERE status='CLOSED' AND engine_version=1) pnl").first();
- return {...status,high_momentum_radar:await highMomentumRadar(db,now),ai_signals:ai.results||[],watchlist:watch.results||[],approved:counts?.approved||0,candidates:status.stage1_hot||0,pending_entries:(scalp.results||[]).length+(trend.results||[]).length,total_capital:(cash.results||[]).reduce((n,a)=>n+Number(a.initial_cash),0),equity:(accounts.SCALP||0)+(accounts.SWING||0)+trades.reduce((n,t)=>n+t.current_price*t.remaining_lots*.998*.998,0),equity_basis:'LAST_AVAILABLE_QUOTE_NET_LIQUIDATION_ESTIMATE',realised_pnl:realised?.pnl||0,scalp_cash:accounts.SCALP||0,swing_cash:accounts.SWING||0,open_trades:trades,exit_history:histories,closed_trades:histories,scalp_sniper_queue:scalp.results||[],trend_radar_queue:trend.results||[],scalp_slots:trades.filter(t=>t.strategy==='SCALP').length,trend_slots:trades.filter(t=>t.strategy==='SWING').length,engine_version:2};
+ return {...status,mini_candidate_ranking:await rankStatus(db,now),high_momentum_radar:await highMomentumRadar(db,now),ai_signals:ai.results||[],watchlist:watch.results||[],approved:counts?.approved||0,candidates:status.stage1_hot||0,pending_entries:(scalp.results||[]).length+(trend.results||[]).length,total_capital:(cash.results||[]).reduce((n,a)=>n+Number(a.initial_cash),0),equity:(accounts.SCALP||0)+(accounts.SWING||0)+trades.reduce((n,t)=>n+t.current_price*t.remaining_lots*.998*.998,0),equity_basis:'LAST_AVAILABLE_QUOTE_NET_LIQUIDATION_ESTIMATE',realised_pnl:realised?.pnl||0,scalp_cash:accounts.SCALP||0,swing_cash:accounts.SWING||0,open_trades:trades,exit_history:histories,closed_trades:histories,scalp_sniper_queue:await rankedQueue(db,scalp.results||[],now),trend_radar_queue:trend.results||[],scalp_slots:trades.filter(t=>t.strategy==='SCALP').length,trend_slots:trades.filter(t=>t.strategy==='SWING').length,engine_version:2};
 }
 async function quoteIngest(request,env,now=Date.now()){
  let b;try{b=await boundedBody(request);}catch(e){return json({error:e.message},422);}
