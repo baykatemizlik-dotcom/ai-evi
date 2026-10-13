@@ -1,5 +1,5 @@
 import {NEWS_COMPANIES} from './news-catalog.mjs';
-const ID='burkut-diagnostic-20261013';
+const ID='burkut-live-20261013';
 async function readJson(response){
  const reader=response.body?.getReader();if(!reader)throw Error('EMPTY_BODY');let size=0;const chunks=[];
  try{while(true){const r=await reader.read();if(r.done)break;size+=r.value.length;if(size>2000000)throw Error('BODY_TOO_LARGE');chunks.push(r.value);}}catch(e){await reader.cancel();throw e;}
@@ -20,7 +20,7 @@ export async function burkutProbe(env,network=fetch){
  const claim=await env.DB.prepare("INSERT OR IGNORE INTO external_feed_probe VALUES(?,'RUNNING',NULL)").bind(ID).run();if(!claim.meta.changes)return;
  const report={id:ID,started_at:new Date().toISOString(),key_configured:true,mode:'TEST_ONLY',trading_integration:false,requests:[]};
  try{for(const path of ['/stocks','/stocks/THYAO','/stocks/THYAO/history?days=2']){
-  const started=Date.now();try{const response=await network('https://api.burkutportfoy.com/api/public/v1'+path,{headers:{'X-API-Key':env.BURKUT_API_KEY.trim(),Accept:'application/json'},redirect:'error',signal:AbortSignal.timeout(12000)});
+  const started=Date.now();try{const response=await network('https://api.burkutportfoy.com/api/public/v1'+path,{headers:{'X-API-Key':env.BURKUT_API_KEY.trim(),Accept:'application/json'},redirect:'manual',signal:AbortSignal.timeout(12000)});
    if(!response.ok){await response.body?.cancel();report.requests.push({path,status:response.status,elapsed_ms:Date.now()-started});continue;}
    const data=await readJson(response);report.requests.push({path,status:response.status,elapsed_ms:Date.now()-started,summary:summarize(data),single_stock:path==='/stocks/THYAO'?summarize([data?.data||data]).samples:null});
   }catch(e){const message=String(e?.message||'');const error_code=/header|character|ByteString/i.test(message)?'INVALID_HEADER':/timeout|abort/i.test(message)?'TIMEOUT':/redirect/i.test(message)?'REDIRECT':/JSON|Unexpected token/i.test(message)?'NON_JSON':/network|fetch|connect|DNS/i.test(message)?'NETWORK':'RUNTIME';report.requests.push({path,status:'NETWORK_OR_FORMAT_ERROR',error_code,error_type:e?.name||'Error',elapsed_ms:Date.now()-started});}
