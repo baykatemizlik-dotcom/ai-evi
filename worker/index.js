@@ -1,5 +1,3 @@
-import {collectBurkut,burkutStatus} from './burkut-feed.mjs';
-import {burkutProbe} from './burkut-probe.mjs';
 import {rankCandidates,rankedQueue,rankStatus} from './candidate-ranker.mjs';
 import {DurableObject} from 'cloudflare:workers';
 import {newsRoute,newsScheduled} from './news.mjs';
@@ -1074,7 +1072,6 @@ document.querySelectorAll('[data-opp-engine]').forEach(b=>b.onclick=()=>{opportu
 document.querySelectorAll('[data-opp-stage]').forEach(b=>b.onclick=()=>{opportunityStage=b.dataset.oppStage;renderOpportunities();});
 document.getElementById('opportunityBasis').onchange=renderOpportunities;
 document.getElementById('opportunityDate').onchange=refreshOpportunities;
-async function refreshBurkutRadar(){}
 
 setInterval(()=>{if(!document.hidden&&document.getElementById('opportunities').classList.contains('active'))void refreshOpportunities();},30000);
 
@@ -1157,7 +1154,6 @@ initSectorControls();void refreshEdge();connectEdgeLive();setInterval(()=>{if(do
   if(request.method==='POST'&&request.headers.get('Origin')&&request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);
   try{return await newsRoute(request,env);}catch(e){return reply({error:'NEWS_MODULE_ERROR',message:String(e.message||e).slice(0,120)},503);}
  }
- if(u.pathname==='/bist/burkut'&&request.method==='GET')return reply(await burkutStatus(env));
  if(u.pathname==='/bist/sectors'&&request.method==='GET')return reply(BIST_SECTORS);
  if(u.pathname==='/bist/edge/live'&&request.method==='GET'){
   if(request.headers.get('Origin')!==u.origin)return reply({error:'INVALID_ORIGIN'},403);
