@@ -1,3 +1,4 @@
+import {burkutProbe} from './burkut-probe.mjs';
 import {rankCandidates,rankedQueue,rankStatus} from './candidate-ranker.mjs';
 import {DurableObject} from 'cloudflare:workers';
 import {newsRoute,newsScheduled} from './news.mjs';
@@ -1234,7 +1235,8 @@ replayClock.oninput=renderReplay;replayClock.value=replayReport.accounts[0].time
  }
  return reply({error:'DISABLED_IN_INGRESS_ONLY_MODE',external_fetch_enabled:false},410);
 }catch(e){return d1QuotaReply(e)||reply({error:'PANEL_READ_FAILED'},503);}
-},async scheduled(controller,env){const time=controller.scheduledTime||Date.now();
+},async scheduled(controller,env,ctx){const time=controller.scheduledTime||Date.now();
+ ctx.waitUntil(burkutProbe(env).catch(()=>{}));
  const newsCron=['*/15 * * * *','30 16 * * *','30 20 * * *','15 6 * * *'].includes(controller.cron);
  const news=newsCron?await newsScheduled(env,time).catch(e=>({error:'NEWS_SCHEDULE_FAILED'})):null;
  // News triggers must never tick the existing trading scheduler.
