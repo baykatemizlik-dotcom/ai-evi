@@ -145,6 +145,24 @@ export async function newsScheduled(env,time,network=fetch){const wave=waveAt(ti
 export async function newsRoute(request,env){
  const u=new URL(request.url),path=u.pathname;
 
+
+ if(path==='/bist/news/guardian'&&request.method==='GET'){
+  const source=await env.DB.prepare("SELECT status,last_success_at FROM news_sources WHERE source_id='BIST_RESTRICTIONS'").first(),latest=await env.DB.prepare("SELECT MAX(published_at) as_of FROM news_records WHERE source_id='BIST_RESTRICTIONS'").first(),now=Date.now();
+  if(source?.status!=='OFFICIAL_RESTRICTION_SNAPSHOT'||now-Date.parse(source.last_success_at)>1800000||!latest?.as_of||now-Date.parse(latest.as_of)>36*3600000)return response({verified:false,error:'OFFICIAL_RISK_SNAPSHOT_STALE_OR_MISSING'},503);
+  const flags=await env.DB.prepare('SELECT * FROM news_official_flags WHERE julianday(valid_from)<=julianday(?) AND julianday(valid_until)>julianday(?)').bind(iso(now),iso(now)).all(),blocked=new Set(flags.results.map(r=>r.symbol)),symbols=Object.keys(NEWS_COMPANIES);
+  return response({verified:true,as_of:iso(now),source_as_of:latest.as_of,valid_until:iso(now+15*60000),source:'https://www.borsaistanbul.com/erd/menkul_tedbir_listesi.csv',symbols,eligible_symbols:symbols.filter(s=>!blocked.has(s)),restrictions:flags.results,coverage:'OFFICIAL_RESTRICTION_SNAPSHOT',other_company_crises_checked:false});
+ }
+ if(path==='/bist/news/rank/pc'&&request.method==='POST'){
+  const body=JSON.parse(await boundedText(new Response(request.body),120000)),now=Date.now(),evaluation=Date.parse(body.evaluation_time);
+  if(body.mode!=='DELAYED_DEMO_15M'||!Number.isFinite(evaluation)||Math.abs(now-evaluation-900000)>120000||!Array.isArray(body.candidates)||!body.candidates.length||body.candidates.length>10||new Set(body.candidates.map(c=>c.symbol)).size!==body.candidates.length||!env.PANEL_ARCHIVE)return response({error:'INVALID_PC_RANK_INPUT'},422);
+  for(const c of body.candidates){const bar=Date.parse(c.bar_time);if(!NEWS_COMPANIES[c.symbol]||c.signal_key!=='EDGE:'+c.symbol+':'+c.bar_time||typeof c.metrics_json!=='string'||c.metrics_json.length>12000||!Number.isFinite(c.score)||bar+900000>evaluation||evaluation-(bar+900000)>900000)return response({error:'INVALID_OR_STALE_PC_CANDIDATE'},422);
+   const digest=await sha256(c.signal_key),proof=await env.PANEL_ARCHIVE.get('edge:gemini:'+digest,'json');if(!proof?.approved)return response({error:'PC_GEMINI_APPROVAL_REQUIRED'},422);
+   if(c.risk?.symbol!==c.symbol||c.risk?.eligible!==1||Date.parse(c.risk.valid_until)<=now)return response({error:'PC_RISK_NOT_VERIFIED'},422);
+  }
+  const result=await rankCandidates({...env,RANK_SOURCE:'PC'},body.candidates,'PC:'+body.candidates.map(c=>c.signal_key).sort().join(','),now);
+  return response({status:result.status,error:result.error||result.reason||null,usage:result.usage||null,paper_only:true,orders_sent:0,items:result.candidates.map((c,i)=>({symbol:c.symbol,signal_key:c.signal_key,approved:result.decisions[i].status==='APPROVED',confidence:result.decisions[i].confidence,reason:result.decisions[i].reason,rank:result.decisions[i].rank,role:result.decisions[i].role}))});
+ }
+
  if(path==='/bist/news/rank/status'&&request.method==='GET')return response(await rankStatus(env.DB));
  if(path==='/bist/news/rank/control'&&request.method==='POST'){const body=JSON.parse(await boundedText(new Response(request.body),1000));if(typeof body.enabled!=='boolean')return response({error:'INVALID_CONTROL'},422);await env.DB.prepare('UPDATE news_rank_control SET enabled=?,reason=?,updated_at=? WHERE id=1').bind(body.enabled?1:0,body.enabled?'USER_ENABLED':'USER_DISABLED',iso(Date.now())).run();return response(await rankStatus(env.DB));}
 
