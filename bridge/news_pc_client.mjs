@@ -9,9 +9,10 @@ export async function refreshNewsRisk(db,cloudCall,wall=Date.now()){
  return r;
 }
 export async function newsPcQueue(db,rows,evaluation,wall=Date.now()){
- const meta=await db.prepare('SELECT valid_until FROM news_pc_risk_meta WHERE id=1').first();if(!meta||Date.parse(meta.valid_until)<=wall)return [];
+ const meta=await db.prepare('SELECT valid_until FROM news_pc_risk_meta WHERE id=1').first();if(!meta||!Number.isFinite(Date.parse(meta.valid_until))||Date.parse(meta.valid_until)<=wall)return [];
+ const risk=await db.prepare('SELECT symbol FROM bist_funnel_risk WHERE eligible=1 AND julianday(valid_until)>julianday(?) AND julianday(as_of)<=julianday(?)').bind(iso(wall),iso(wall)).all(),safe=new Set(risk.results.map(r=>r.symbol));
  const choices=await db.prepare('SELECT * FROM news_pc_rank_choices WHERE expires_at>?').bind(iso(evaluation)).all(),map=new Map(choices.results.map(r=>[r.signal_key,r]));
- return rows.filter(r=>map.has(r.signal_key)&&map.get(r.signal_key).role!=='WATCH').sort((a,b)=>map.get(a.signal_key).rank-map.get(b.signal_key).rank).map(r=>({...r,news_role:map.get(r.signal_key).role,news_rank:map.get(r.signal_key).rank,reason:'Mini '+(map.get(r.signal_key).role==='PRIMARY'?'öncelikli':'yedek')+' #'+map.get(r.signal_key).rank+': '+map.get(r.signal_key).reason}));
+ return rows.filter(r=>safe.has(r.symbol)&&map.has(r.signal_key)&&map.get(r.signal_key).role!=='WATCH').sort((a,b)=>(map.get(a.signal_key).role==='PRIMARY'?0:1)-(map.get(b.signal_key).role==='PRIMARY'?0:1)||map.get(a.signal_key).rank-map.get(b.signal_key).rank).map(r=>({...r,news_role:map.get(r.signal_key).role,news_rank:map.get(r.signal_key).rank,reason:'Mini '+(map.get(r.signal_key).role==='PRIMARY'?'öncelikli':'yedek')+' #'+map.get(r.signal_key).rank+': '+map.get(r.signal_key).reason}));
 }
 export async function requestPcRanking(db,cloudCall,evaluation,wall=Date.now()){
  const rows=await db.prepare("SELECT * FROM edge_candidates WHERE status IN('GEMINI_APPROVED_AWAITING_RANK','APPROVED') AND bar_time>=? ORDER BY bar_time DESC,wall_observed_at ASC LIMIT 100").bind(iso(evaluation-30*60000)).all(),open=await db.prepare("SELECT symbol FROM virtual_trades WHERE strategy='SCALP' AND status='OPEN'").all(),held=new Set(open.results.map(r=>r.symbol)),seen=new Set(),candidates=[];
@@ -26,10 +27,12 @@ export async function requestPcRanking(db,cloudCall,evaluation,wall=Date.now()){
 export async function applyPcRanking(db,result,evaluation,wall=Date.now()){
  if(!result||result.error)return;const rows=result.items||[],byKey=new Map(rows.map(r=>[r.signal_key,r])),statements=[];
  for(const c of result.requested){const r=byKey.get(c.signal_key);if(evaluation-(Date.parse(c.bar_time)+900000)>900000)continue;
-  const approved=!!r&&r.approved&&r.confidence>=70&&r.role!=='WATCH',reason=r?.reason||'OFFICIAL_BLACKLIST',role=approved?r.role:'WATCH';
+  const risk=await db.prepare('SELECT symbol FROM bist_funnel_risk WHERE symbol=? AND eligible=1 AND julianday(valid_until)>julianday(?) AND julianday(as_of)<=julianday(?)').bind(c.symbol,iso(wall),iso(wall)).first();
+  const approved=!!risk&&!!r&&r.approved&&r.confidence>=70&&r.role!=='WATCH',reason=!risk?'RISK_BLOCKED_OR_STALE':r?.reason||'OFFICIAL_BLACKLIST',role=approved?r.role:'WATCH';
   statements.push(db.prepare('INSERT INTO news_pc_rank_choices VALUES(?,?,?,?,?,?) ON CONFLICT(signal_key) DO UPDATE SET rank=excluded.rank,role=excluded.role,confidence=excluded.confidence,reason=excluded.reason,expires_at=excluded.expires_at').bind(c.signal_key,r?.rank||10,role,r?.confidence||0,reason,iso(evaluation+900000)));
   statements.push(db.prepare('UPDATE edge_candidates SET status=?,reason=? WHERE signal_key=?').bind(approved?'APPROVED':'REJECTED','Mini '+role+': '+reason,c.signal_key));
   statements.push(db.prepare("INSERT INTO bist_ai_decisions(signal_key,run_id,symbol,bar_time,model,status,reason,created_at,completed_at) VALUES(?,'EDGE',?,?,'gpt-4o-mini',?,?,?,?) ON CONFLICT(signal_key) DO UPDATE SET status=excluded.status,reason=excluded.reason,completed_at=excluded.completed_at").bind(c.signal_key,c.symbol,c.bar_time,approved?'APPROVED':'REJECTED',reason,iso(evaluation),iso(evaluation)));
   if(approved)statements.push(db.prepare("INSERT OR IGNORE INTO scalp_sniper_queue VALUES(?,?,?,?,?,?,'READY',?,?)").bind(c.signal_key,c.symbol,c.bar_time,iso(evaluation),iso(evaluation+900000),JSON.parse(c.metrics_json).score,'MINI_'+role+': '+reason,c.metrics_json));
  }if(statements.length)await db.batch(statements);
 }
+

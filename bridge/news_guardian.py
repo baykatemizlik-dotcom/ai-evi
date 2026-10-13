@@ -41,8 +41,8 @@ def project_record(db,payload,now=None):
 def check_intelligence_filter(cursor,symbol,now=None):
     current=(now or dt.datetime.now(UTC)).astimezone(UTC).isoformat(timespec='seconds').replace('+00:00','Z')
     rows=cursor.execute('''SELECT action_flag,severity,reason,evidence_status,record_id
-        FROM stock_intelligence WHERE symbol=? AND is_active=1 AND valid_from<=?
-        AND valid_until>? ORDER BY CASE action_flag WHEN 'BLACKLIST' THEN 0
+        FROM stock_intelligence WHERE symbol=? AND is_active=1 AND julianday(valid_from)<=julianday(?)
+        AND julianday(valid_until)>julianday(?) ORDER BY CASE action_flag WHEN 'BLACKLIST' THEN 0
         WHEN 'PRIORITY_RADAR' THEN 1 ELSE 2 END,severity DESC,updated_at DESC''',
         (symbol,current,current)).fetchall()
     # NEW NEUTRAL does not override an older, still-active BLACKLIST.
@@ -66,3 +66,4 @@ def prioritize_candidates(candidates,cursor,now=None):
         intel=check_intelligence_filter(cursor,candidate['symbol'],now)
         if intel['action_flag']!='BLACKLIST':allowed.append({**candidate,'intelligence':intel})
     return sorted(allowed,key=lambda c:0 if c['intelligence']['action_flag']=='PRIORITY_RADAR' else 1)
+

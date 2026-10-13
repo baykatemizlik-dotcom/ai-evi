@@ -4,3 +4,22 @@ function database(){const sql=new DatabaseSync(':memory:');sql.exec('CREATE TABL
 const wall=Date.now(),evaluation=wall-900000,iso=n=>new Date(n).toISOString();
 test('PC Gemini approval waits for Mini; Mini-ranked reserves enter original queue in order',async()=>{const {db,sql}=database();await setupNewsSelection(db);sql.prepare('INSERT INTO news_pc_risk_meta VALUES(1,?,?)').run(iso(wall+60000),iso(wall));for(const symbol of ['THYAO','AKBNK']){const bar=iso(evaluation-900000),key='EDGE:'+symbol+':'+bar;sql.prepare('INSERT INTO bist_funnel_risk VALUES(?,1,?,?,?)').run(symbol,iso(wall),iso(wall+60000),'official');sql.prepare('INSERT INTO edge_candidates VALUES(?,?,?,?,?,?,?)').run(key,symbol,bar,'{"score":3}', 'GEMINI_APPROVED_AWAITING_RANK',null,iso(wall));}let calls=0;const cloud=async(path,body)=>{assert.equal(path,'/bist/news/rank/pc');calls++;return {status:'VALIDATED',items:body.candidates.map(c=>({symbol:c.symbol,signal_key:c.signal_key,rank:c.symbol==='AKBNK'?1:2,role:c.symbol==='AKBNK'?'PRIMARY':'BACKUP',approved:true,confidence:85,reason:'Haber ve teknik özeti'}))};};const result=await requestPcRanking(db,cloud,evaluation,wall);assert.equal(calls,1);assert.equal(sql.prepare('SELECT count(*) n FROM scalp_sniper_queue').get().n,0);await applyPcRanking(db,result,evaluation,wall);const queue=await newsPcQueue(db,sql.prepare('SELECT * FROM scalp_sniper_queue').all(),evaluation,wall);assert.deepEqual(queue.map(c=>c.symbol),['AKBNK','THYAO']);assert.equal(queue[0].news_role,'PRIMARY');assert.equal(sql.prepare('SELECT count(*) n FROM virtual_trades').get().n,0);sql.close();});
 test('stale official risk hides candidates and fabricated Mini symbols are rejected',async()=>{const {db,sql}=database();await setupNewsSelection(db);sql.prepare('INSERT INTO news_pc_risk_meta VALUES(1,?,?)').run(iso(wall-1),iso(wall-1000));assert.deepEqual(await newsPcQueue(db,[{signal_key:'x',symbol:'THYAO'}],evaluation,wall),[]);await assert.rejects(refreshNewsRisk(db,async()=>({verified:false}),wall));sql.close();});
+
+test('fresh global metadata cannot permit a blocked symbol; PRIMARY precedes BACKUP',async()=>{
+ const {db,sql}=database();await setupNewsSelection(db);sql.prepare('INSERT INTO news_pc_risk_meta VALUES(1,?,?)').run(iso(wall+60000),iso(wall));
+ for(const [symbol,role,rank,eligible] of [['THYAO','PRIMARY',3,1],['AKBNK','BACKUP',1,1],['TUPRS','PRIMARY',2,0]]){
+ sql.prepare('INSERT INTO bist_funnel_risk VALUES(?,?,?,?,?)').run(symbol,eligible,iso(wall),iso(wall+60000),'official');
+ sql.prepare('INSERT INTO news_pc_rank_choices VALUES(?,?,?,?,?,?)').run(symbol,rank,role,90,'test',iso(evaluation+60000));}
+ const queue=await newsPcQueue(db,['AKBNK','TUPRS','THYAO'].map(symbol=>({symbol,signal_key:symbol})),evaluation,wall);
+ assert.deepEqual(queue.map(r=>r.symbol),['THYAO','AKBNK']);
+ sql.prepare('UPDATE bist_funnel_risk SET valid_until=? WHERE symbol=?').run(iso(wall-1),'THYAO');
+ assert.deepEqual((await newsPcQueue(db,queue,evaluation,wall)).map(r=>r.symbol),['AKBNK']);sql.close();
+});
+test('restriction arriving while Mini runs vetoes READY queue insertion',async()=>{
+ const {db,sql}=database();await setupNewsSelection(db);const bar=iso(evaluation-900000),c={symbol:'THYAO',signal_key:'EDGE:THYAO:'+bar,bar_time:bar,metrics_json:'{"score":3}'};
+ sql.prepare('INSERT INTO bist_funnel_risk VALUES(?,?,?,?,?)').run('THYAO',0,iso(wall),iso(wall+60000),'official');
+ sql.prepare('INSERT INTO edge_candidates VALUES(?,?,?,?,?,?,?)').run(c.signal_key,c.symbol,bar,c.metrics_json,'GEMINI_APPROVED_AWAITING_RANK',null,iso(wall));
+ await applyPcRanking(db,{requested:[c],items:[{...c,rank:1,role:'PRIMARY',approved:true,confidence:90,reason:'Good news'}]},evaluation,wall);
+ assert.equal(sql.prepare('SELECT count(*) n FROM scalp_sniper_queue').get().n,0);
+ assert.equal(sql.prepare('SELECT status FROM edge_candidates').get().status,'REJECTED');sql.close();
+});
