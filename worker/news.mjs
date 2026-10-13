@@ -155,9 +155,9 @@ export async function newsRoute(request,env){
  if(path==='/bist/news/rank/pc'&&request.method==='POST'){
   const body=JSON.parse(await boundedText(new Response(request.body),120000)),now=Date.now(),evaluation=Date.parse(body.evaluation_time);
   if(body.mode!=='DELAYED_DEMO_15M'||!Number.isFinite(evaluation)||Math.abs(now-evaluation-900000)>120000||!Array.isArray(body.candidates)||!body.candidates.length||body.candidates.length>10||new Set(body.candidates.map(c=>c.symbol)).size!==body.candidates.length||!env.PANEL_ARCHIVE)return response({error:'INVALID_PC_RANK_INPUT'},422);
-  for(const c of body.candidates){const bar=Date.parse(c.bar_time);if(!NEWS_COMPANIES[c.symbol]||c.signal_key!=='EDGE:'+c.symbol+':'+c.bar_time||typeof c.metrics_json!=='string'||c.metrics_json.length>12000||!Number.isFinite(c.score)||bar+900000>evaluation||evaluation-(bar+900000)>900000)return response({error:'INVALID_OR_STALE_PC_CANDIDATE'},422);
+  for(const c of body.candidates){const bar=Date.parse(c.bar_time);if(!NEWS_COMPANIES[c.symbol]||c.signal_key!=='EDGE:'+c.symbol+':'+c.bar_time||typeof c.metrics_json!=='string'||c.metrics_json.length>12000||!Number.isFinite(c.score)||!Number.isFinite(bar)||bar+900000>evaluation||evaluation-(bar+900000)>900000)return response({error:'INVALID_OR_STALE_PC_CANDIDATE'},422);
    const digest=await sha256(c.signal_key),proof=await env.PANEL_ARCHIVE.get('edge:gemini:'+digest,'json');if(!proof?.approved)return response({error:'PC_GEMINI_APPROVAL_REQUIRED'},422);
-   if(c.risk?.symbol!==c.symbol||c.risk?.eligible!==1||Date.parse(c.risk.valid_until)<=now)return response({error:'PC_RISK_NOT_VERIFIED'},422);
+   if(c.risk?.symbol!==c.symbol||c.risk?.eligible!==1||!Number.isFinite(Date.parse(c.risk.valid_until))||Date.parse(c.risk.valid_until)<=now)return response({error:'PC_RISK_NOT_VERIFIED'},422);
   }
   const result=await rankCandidates({...env,RANK_SOURCE:'PC'},body.candidates,'PC:'+body.candidates.map(c=>c.signal_key).sort().join(','),now);
   return response({status:result.status,error:result.error||result.reason||null,usage:result.usage||null,paper_only:true,orders_sent:0,items:result.candidates.map((c,i)=>({symbol:c.symbol,signal_key:c.signal_key,approved:result.decisions[i].status==='APPROVED',confidence:result.decisions[i].confidence,reason:result.decisions[i].reason,rank:result.decisions[i].rank,role:result.decisions[i].role}))});
@@ -184,7 +184,7 @@ export async function newsRoute(request,env){
  if(path==='/bist/news/run'&&request.method==='POST'){
   const body=JSON.parse(await boundedText(new Response(request.body),2000));
   if(!['COLLECT','TEST','MINI'].includes(body.mode))return response({error:'INVALID_MODE'},422);
-  return response(await runNews(['TEST','MINI'].includes(body.mode)?{...env,NEWS_AI_ENABLED:'true',NEWS_TEST:'true',NEWS_PROVIDER:body.mode==='MINI'?'OPENAI':'GEMINI'}:env));
+  return response(await runNews(['TEST','MINI'].includes(body.mode)?{...env,NEWS_AI_ENABLED:'true',NEWS_TEST:'true',NEWS_PROVIDER:body.mode==='MINI'?'OPENAI':'GEMINI'}:{...env,NEWS_AI_ENABLED:'false'}));
  }
  return response({error:'METHOD_NOT_ALLOWED'},405);
 }
