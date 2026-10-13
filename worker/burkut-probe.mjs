@@ -1,6 +1,6 @@
 import {NEWS_COMPANIES} from './news-catalog.mjs';
 const ID='burkut-live-20261013';
-async function readJson(response){
+export async function readJson(response){
  const reader=response.body?.getReader();if(!reader)throw Error('EMPTY_BODY');let size=0;const chunks=[];
  try{while(true){const r=await reader.read();if(r.done)break;size+=r.value.length;if(size>2000000)throw Error('BODY_TOO_LARGE');chunks.push(r.value);}}catch(e){await reader.cancel();throw e;}
  const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}return JSON.parse(new TextDecoder().decode(bytes));
