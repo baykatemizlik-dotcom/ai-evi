@@ -1,3 +1,4 @@
+import {rankCandidates} from './candidate-ranker.mjs';
 import {saveMarketContext,captureOpportunity,scalpPremiumGuard,capturePremium,highMomentumRadar} from './opportunities.mjs';
 import {tickStrategies,fillStrategy,enqueueScalp,strategyMonitor,saveQuote} from './strategy_engines.mjs';
 // Market data is ingress-only. The only outbound request is the OpenAI paper referee.
@@ -298,13 +299,19 @@ export async function finalize(request,env,now=Date.now(),network=(...args)=>glo
  const rows=await env.DB.prepare(`SELECT c.* FROM bist_funnel_candidates c JOIN bist_funnel_risk r ON r.symbol=c.symbol
   WHERE c.run_id=? AND r.eligible=1 AND r.valid_until>? AND c.bar_time>=?
   ORDER BY c.score DESC,c.symbol ASC`).bind(b.run_id,new Date(now).toISOString(),new Date(now-50*60000).toISOString()).all();
- // No candidate-count cap: five concurrent calls are transport throttling only.
+ // Mini ranking mode considers the final ten technically eligible candidates in one call.
  const candidates=[];
  for(const c of rows.results||[]){const m=JSON.parse(c.metrics_json),q=await env.DB.prepare('SELECT * FROM strategy_quotes WHERE symbol=?').bind(c.symbol).first(),guard=await scalpPremiumGuard(env.DB,c.symbol,Math.max(m.last_candle?.close||0,q?.price||0),now);if(guard.blocked){await capturePremium(env.DB,c.symbol,c.symbol+':'+c.bar_time,c.bar_time,m,guard,now);continue;}if(fresh({bar_time:c.bar_time,feed_type:'INDICATIVE_INTRADAY'},now)&&Number.isFinite(m.daily_turnover_tl_estimate)&&m.daily_turnover_tl_estimate>=MIN_DAILY_TURNOVER_TL&&await env.DB.prepare("SELECT signal_key FROM bist_gemini_decisions WHERE signal_key=? AND status='APPROVED' AND model=?").bind(c.symbol+':'+c.bar_time,GEMINI_MODEL).first())candidates.push(c);}
- const decisions=new Array(candidates.length);let cursor=0;
- await Promise.all(Array.from({length:Math.min(5,candidates.length)},async()=>{
-  while(cursor<candidates.length){const index=cursor++;decisions[index]=await judgeCandidate(env,candidates[index],now,network);}
- }));
+ let decisions;let ranking=null;
+ if(env.NEWS_CANDIDATE_RANKER_ENABLED==='true'){
+  ranking=await rankCandidates(env,candidates,b.run_id,now,network);
+  candidates.splice(0,candidates.length,...ranking.candidates);decisions=ranking.decisions;
+ }else{
+  decisions=new Array(candidates.length);let cursor=0;
+  await Promise.all(Array.from({length:Math.min(5,candidates.length)},async()=>{
+   while(cursor<candidates.length){const index=cursor++;decisions[index]=await judgeCandidate(env,candidates[index],now,network);}
+  }));
+ }
  let created=0;const selected=[];
  for(let i=0;i<candidates.length;i++){
   const c=candidates[i],decision=decisions[i];if(decision?.status!=='APPROVED')continue;
@@ -316,7 +323,7 @@ export async function finalize(request,env,now=Date.now(),network=(...args)=>glo
   await enqueueScalp(env.DB,c,decision,observed);
  }
  return json({ok:true,run_id:b.run_id,model:AI_MODEL,candidates_reviewed:candidates.length,selected,signals_created:created,
-  rejected:decisions.filter(d=>d?.status==='REJECTED').length,errors:decisions.filter(d=>d?.status==='ERROR'||d?.status==='PENDING').length,orders_sent:0});
+  ranking_status:ranking?.status||'LEGACY_PER_CANDIDATE',ranking_usage:ranking?.usage||null,rejected:decisions.filter(d=>d?.status==='REJECTED').length,errors:decisions.filter(d=>d?.status==='ERROR'||d?.status==='PENDING').length,orders_sent:0});
 }
 export async function aiStatus(env) {
  const last=await env.DB.prepare("SELECT symbol,status,reason,completed_at FROM bist_ai_decisions WHERE status!='PENDING' ORDER BY completed_at DESC LIMIT 1").first();

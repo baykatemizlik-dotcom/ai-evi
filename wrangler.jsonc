@@ -7,7 +7,9 @@
     "OPENAI_MODEL": "gpt-4o-mini",
     "GEMINI_MODEL": "gemini-3.1-flash-lite",
     "ALLOWED_ORIGIN": "https://baykatemizlik-dotcom.github.io",
-    "NEWS_AI_ENABLED": "false"
+    "NEWS_AI_ENABLED": "false",
+    "NEWS_CANDIDATE_RANKER_ENABLED": "true",
+    "NEWS_WAVE_GEMINI_ENABLED": "true"
   },
   "d1_databases": [
     {
